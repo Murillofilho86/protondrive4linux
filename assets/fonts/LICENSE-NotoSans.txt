@@ -1,0 +1,2 @@
+Noto Sans (Regular, Bold) — SIL Open Font License 1.1.
+Bundled as the neutronsync GUI typeface. https://fonts.google.com/noto
