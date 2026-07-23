@@ -1,0 +1,82 @@
+# neutronsync configuration. Copy to ~/.config/neutronsync/neutronsync.toml
+# (or run `neutronsync init`), then edit. See README.md.
+
+[cli]
+# Path to the official proton-drive binary. Leave as-is to find it on $PATH.
+binary = "proton-drive"
+# Flags appended to `filesystem upload` so an existing remote file is overwritten
+# when the local copy changed. The exact spelling varies by CLI version - run
+# `neutronsync doctor` if uploads misbehave. Known variants:
+#   ["--conflict-strategy", "replace"]      (Proton blog example)
+#   ["-f", "replace", "-d", "merge"]        (early community wrapper)
+upload_flags = ["--conflict-strategy", "replace"]
+# Concurrent folder-listers for the remote tree scan (0 = auto, capped at 8).
+# scan_threads = 8
+# Concurrent file downloads during a sync (0 = auto, ~4). Downloads are
+# bandwidth-bound, so more isn't always faster and can hit rate limits.
+# download_threads = 4
+# download also prompts without a strategy; overwrite the local copy on download.
+download_flags = ["--conflict-strategy", "replace"]
+# Optional: force where the CLI stores your session credentials.
+# One of "keychain", "pass", "unsafe_file". Omit to use the CLI default.
+# credentials_store = "keychain"
+
+[options]
+# Proton's per-user root. Remote paths in [[pair]] are resolved under this
+# unless they start with "/".
+remote_root = "/my-files"
+
+# Propagate deletions across sides. When on, a file deleted on one side is
+# deleted on the other - but recoverably: the remote copy goes to Proton's
+# online trash and the local copy goes to your desktop trash (see local_delete).
+# A missing/blank baseline never triggers deletes (first run unions both sides).
+propagate_deletes = true
+
+# How a propagated deletion removes the LOCAL copy:
+#   trash   send it to the freedesktop trash via `gio` (recoverable)
+#   remove  unlink permanently (no recovery)
+local_delete = "trash"
+
+# Conflict policy when a file changed on BOTH sides since the last sync:
+#   keep-both  keep both versions (local copy is renamed) - never loses data
+#   newer      keep whichever has the newer mtime (falls back to keep-both)
+#   skip       leave both untouched and warn
+conflict = "keep-both"
+
+# How to detect a changed file:
+#   size        cheapest; misses a same-size edit
+#   size+mtime  reliable - Proton preserves the original mtime (claimedModificationTime)
+#   sha1        strictest; hashes local files and compares to Proton's claimedDigests.sha1
+compare = "size+mtime"
+
+# Watch mode (`neutronsync watch`). Two tiers catch remote changes:
+#   scan_interval - short: re-check only "hot" (recently active) folders often.
+#   poll_interval - long: full rescan of everything (the safety net).
+# debounce is how long a burst of local file events settles before syncing.
+poll_interval = 900
+scan_interval = 120
+debounce = 2
+
+# GUI preferences (also toggled from Settings; saved back here automatically).
+#   auto_sync    - start the watch daemon on launch and keep it running.
+#   run_in_tray  - keep a background tray daemon running (syncs when the window
+#                  is closed); the tray opens a window on demand.
+#   x11_compat   - render the window via XWayland (the X11 backend) instead of
+#                  native Wayland.
+# auto_sync = false
+# run_in_tray = false
+# x11_compat = false
+
+# One [[pair]] per folder you want kept in sync.
+# `auto` (default true) includes the pair when "Auto sync" (the watch daemon) is
+# on; set it false to keep a pair manual-only (sync it on demand from the GUI).
+[[pair]]
+name = "documents"
+local = "~/Documents"
+remote = "Documents"        # -> /my-files/Documents
+auto = true
+
+# [[pair]]
+# name = "photos"
+# local = "~/Pictures"
+# remote = "Pictures"

@@ -1,0 +1,65 @@
+//! Structured events emitted by the engine, for rich frontends.
+//!
+//! The CLI is happy with text logs, but a GUI wants typed progress: which pair
+//! is scanning, how many folders seen, the plan totals, per-operation
+//! start/finish (to drive a progress bar), and per-pair completion. The engine
+//! emits these to an optional [`EventSink`]; `service::Controller` turns them
+//! into observable [`crate::service::AppState`].
+
+/// A single structured event about sync progress.
+#[derive(Clone, Debug)]
+pub enum SyncEvent {
+    /// A pair's reconcile is starting.
+    PairStarted { pair: String },
+    /// The remote tree scan has begun for a pair.
+    ScanStarted { pair: String },
+    /// Progress while walking the remote tree (folders listed so far).
+    ScanProgress {
+        pair: String,
+        folders: usize,
+        current: String,
+    },
+    /// The plan has been computed: total actionable ops + a per-action breakdown.
+    Planned {
+        pair: String,
+        total_ops: usize,
+        counts: Vec<(String, usize)>,
+    },
+    /// An operation is about to run.
+    OpStarted {
+        pair: String,
+        action: String,
+        path: String,
+    },
+    /// An operation finished (ok=false means it errored).
+    OpFinished {
+        pair: String,
+        action: String,
+        path: String,
+        ok: bool,
+    },
+    /// A pair finished reconciling.
+    PairFinished {
+        pair: String,
+        applied: usize,
+        errors: usize,
+        tracked: usize,
+    },
+    /// Free-form informational line (mirrors a log line).
+    Info { text: String },
+    /// An error, optionally attributed to a pair.
+    Error { pair: Option<String>, text: String },
+}
+
+/// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:
+/// `emit` is called from the engine, including from concurrent scan workers.
+pub trait EventSink: Send + Sync {
+    fn emit(&self, ev: &SyncEvent);
+}
+
+/// A no-op sink (used when no frontend is observing).
+pub struct NullSink;
+
+impl EventSink for NullSink {
+    fn emit(&self, _ev: &SyncEvent) {}
+}

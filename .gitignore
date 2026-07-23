@@ -1,0 +1,18 @@
+# Local config with paths / secrets
+neutronsync.toml
+
+# Rust
+/target/
+
+# Logs
+*.log
+logs/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Non-redistributable reference assets (design refs, kept local only)
+/reference/

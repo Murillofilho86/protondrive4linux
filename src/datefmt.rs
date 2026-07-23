@@ -1,0 +1,95 @@
+//! Tiny date helpers (no chrono dependency) for the ISO-8601 timestamps the
+//! proton-drive CLI emits (`claimedModificationTime` etc.) and for trashinfo.
+//! Everything is treated as UTC; Proton returns "...Z" times.
+
+/// Days since the Unix epoch for a civil (proleptic Gregorian) date.
+/// Howard Hinnant's algorithm.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of `days_from_civil`: (year, month, day) from days since epoch.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Parse an ISO-8601 timestamp (UTC assumed) to epoch seconds. Fractional
+/// seconds and any timezone suffix are ignored. Returns None on malformed input.
+pub fn iso8601_to_epoch(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    // Expect YYYY-MM-DD[T ]HH:MM:SS
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: i64 = s.get(5..7)?.parse().ok()?;
+    let day: i64 = s.get(8..10)?.parse().ok()?;
+    let sep = bytes[10];
+    if sep != b'T' && sep != b' ' {
+        return None;
+    }
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let min: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Format epoch seconds as "YYYY-MM-DDTHH:MM:SS" (UTC).
+pub fn epoch_to_iso(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
+}
+
+/// Format epoch seconds as "YYYYMMDD-HHMMSS" (UTC), for conflict-copy names.
+pub fn epoch_to_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
+}
+
+/// Current time in epoch seconds (0 on the impossible clock error).
+pub fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        // 2026-07-22T12:31:42Z
+        let e = iso8601_to_epoch("2026-07-22T12:31:42.992Z").unwrap();
+        assert_eq!(epoch_to_iso(e), "2026-07-22T12:31:42");
+    }
+
+    #[test]
+    fn known_epoch() {
+        assert_eq!(iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso8601_to_epoch("2000-01-01T00:00:00Z"), Some(946684800));
+    }
+}
