@@ -84,4 +84,5 @@ debounce = 2
 # name = "documents"
 # local = "~/Documents"
 # remote = "Documents"        # -> /my-files/Documents
+# exclude = ["APPS"]          # sub-paths to skip; the Proton copy is never touched
 "#;

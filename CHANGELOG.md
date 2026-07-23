@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Per-pair selective sync: a pair can list `exclude` sub-paths to leave out of
+  sync. Excluded paths are ignored by the engine and **never touched on Proton**
+  — the cloud copy is always left intact. Excluding an already-synced folder
+  freezes both copies in place; its baseline is forgotten so a later re-include
+  simply re-downloads from the cloud rather than propagating a deletion.
+- `init` now writes an empty config (no sample "documents" pair).
+
 ## [0.1.0] - 2026-07-23
 
 ### Added

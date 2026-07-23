@@ -282,10 +282,16 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 
     // --- planning -----------------------------------------------------------
-    /// Returns the plan, the prospective new baseline, and whether the scan was
+    /// Returns the plan, the prospective new baseline, whether the scan was
     /// INCOMPLETE (some folders unreadable, or a side came back suspiciously
-    /// empty). On an incomplete scan the caller must suppress deletions.
-    fn plan(&self, pair: &Pair, resync: bool) -> Result<(Plan, BTreeMap<String, Entry>, bool)> {
+    /// empty), and the set of baseline rows to PRUNE because they now fall under
+    /// an excluded sub-path. On an incomplete scan the caller must suppress
+    /// deletions.
+    fn plan(
+        &self,
+        pair: &Pair,
+        resync: bool,
+    ) -> Result<(Plan, BTreeMap<String, Entry>, bool, HashSet<String>)> {
         // Load the baseline first so the local scan can reuse cached hashes.
         let base: BTreeMap<String, Entry> = if resync {
             BTreeMap::new()
@@ -358,6 +364,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             });
         }
 
+        if !pair.exclude.is_empty() {
+            self.log.info(&format!(
+                "excluding {} sub-path(s) from {:?}: {:?}",
+                pair.exclude.len(),
+                pair.name,
+                pair.exclude
+            ));
+        }
+
         let cmp = self.cfg.compare;
         let ls = classify(&local, &base, cmp);
         let rs = classify(&remote, &base, cmp);
@@ -374,6 +389,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         keys.dedup();
 
         for path in keys {
+            // Excluded sub-paths are invisible to the engine: no upload, no
+            // download, and crucially no delete on either side. They are not
+            // added to new_base, and their old baseline rows are pruned (below)
+            // so a later re-include can only ever re-download, never delete.
+            if pair.is_excluded(path) {
+                continue;
+            }
             let lc = *ls.get(path).unwrap_or(&Change::Absent);
             let rc = *rs.get(path).unwrap_or(&Change::Absent);
             self.decide(
@@ -388,6 +410,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             );
         }
 
+        // Baseline rows now under an excluded sub-path are forgotten. This is a
+        // pure DB cleanup (no filesystem or remote effect) that makes re-include
+        // behave like a fresh folder — union/redownload, never a delete.
+        let prune_excluded: HashSet<String> = base
+            .keys()
+            .filter(|k| pair.is_excluded(k))
+            .cloned()
+            .collect();
+
         // Collapse delete+create pairs of identical content into a single
         // rename/move (keeps large files from being re-uploaded on rename).
         // Skip on an incomplete scan: a "missing" source may just be in an
@@ -395,7 +426,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         if !incomplete {
             detect_renames(&mut plan, &base, &local, &remote);
         }
-        Ok((plan, new_base, incomplete))
+        Ok((plan, new_base, incomplete, prune_excluded))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -702,6 +733,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         pair: &Pair,
         plan: Plan,
         mut new_base: BTreeMap<String, Entry>,
+        prune_excluded: HashSet<String>,
     ) -> SyncResult {
         let mut result = SyncResult {
             pair: pair.name.clone(),
@@ -824,6 +856,17 @@ impl<'a, R: Remote> Engine<'a, R> {
         // written (as 'synced'); unseen rows are left intact, so a partial or
         // interrupted run still persists exactly the files that did complete.
         if !self.dry_run {
+            // Forget baseline rows now under an excluded sub-path (pure DB
+            // cleanup, no filesystem or remote effect) so a later re-include
+            // re-downloads rather than propagating a delete.
+            if !prune_excluded.is_empty() {
+                self.log.info(&format!(
+                    "pruning {} baseline row(s) now under an excluded path for {:?}",
+                    prune_excluded.len(),
+                    pair.name
+                ));
+                deleted_ok.extend(prune_excluded);
+            }
             if let Err(e) = crate::state::commit_baseline(
                 &self.cfg.state_dir,
                 &pair.name,
@@ -1107,7 +1150,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         self.emit(SyncEvent::PairStarted {
             pair: pair.name.clone(),
         });
-        let (mut plan, new_base, incomplete) = self.plan(pair, resync)?;
+        let (mut plan, new_base, incomplete, prune_excluded) = self.plan(pair, resync)?;
         if incomplete {
             // Safety: never delete or move based on a partial view of the remote.
             plan.ops.retain(|op| {
@@ -1138,7 +1181,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .collect(),
         });
         let tracked = new_base.len();
-        let result = self.apply(pair, plan, new_base);
+        let result = self.apply(pair, plan, new_base, prune_excluded);
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
             applied: result.applied,

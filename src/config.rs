@@ -43,6 +43,10 @@ pub struct Pair {
     /// Include this pair when "Auto sync" (the watch daemon) is on. Defaults to
     /// true; set false to keep a pair manual-only.
     pub auto: bool,
+    /// Sub-paths (relative to the pair root, POSIX-separated) excluded from sync.
+    /// Excluded paths are ignored by the engine entirely and never touched on
+    /// either side. See [`Pair::is_excluded`].
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +93,30 @@ impl Config {
     }
 }
 
+impl Pair {
+    /// Whether `rel` (a POSIX path relative to the pair root) falls under one of
+    /// this pair's excluded sub-paths, and so must be ignored by the engine.
+    pub fn is_excluded(&self, rel: &str) -> bool {
+        self.exclude
+            .iter()
+            .any(|e| rel == e || rel.starts_with(&format!("{e}/")))
+    }
+}
+
+/// Normalise a raw exclude list: trim, drop surrounding slashes, POSIX-ify,
+/// drop empties and duplicates.
+fn normalize_excludes(v: Option<Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in v.unwrap_or_default() {
+        let e = e.trim().replace('\\', "/");
+        let e = e.trim_matches('/').to_string();
+        if !e.is_empty() && !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 // --- raw TOML mirror --------------------------------------------------------
 #[derive(Deserialize, Default)]
 struct RawConfig {
@@ -132,6 +160,7 @@ struct RawPair {
     local: String,
     remote: String,
     auto: Option<bool>,
+    exclude: Option<Vec<String>>,
 }
 
 // --- XDG helpers ------------------------------------------------------------
@@ -331,6 +360,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
             remote: join_remote(&remote_root, &p.remote),
             name,
             auto: p.auto.unwrap_or(true),
+            exclude: normalize_excludes(p.exclude),
         });
     }
 
@@ -419,6 +449,8 @@ struct OutPair {
     local: String,
     remote: String,
     auto: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -497,6 +529,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| p.remote.clone()),
                 auto: p.auto,
+                exclude: p.exclude.clone(),
             })
             .collect(),
     };

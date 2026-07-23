@@ -168,6 +168,7 @@ fn cfg(root: &Path) -> Config {
             local: root.join("local"),
             remote: "/my-files/docs".into(),
             auto: true,
+            exclude: vec![],
         }],
         source_path: None,
     }
@@ -718,5 +719,93 @@ fn missing_local_root_refuses_delete() {
     assert!(
         rf.contains_key("/my-files/docs/a.txt") && rf.contains_key("/my-files/docs/b.txt"),
         "remote files must survive a vanished local root"
+    );
+}
+
+#[test]
+fn exclude_skips_subtree() {
+    // An excluded sub-path is never uploaded/downloaded; everything else syncs.
+    let t = Tmp::new("excl");
+    let mut c = cfg(t.path());
+    c.pairs[0].exclude = vec!["APPS".into()];
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/keep.txt"), "keep");
+    write(&t.path().join("local/APPS/app.bin"), "app");
+    run(&c, fake, false);
+    let rf = remote_files(&store);
+    assert!(
+        rf.contains_key("/my-files/docs/keep.txt"),
+        "non-excluded file should upload"
+    );
+    assert!(
+        !rf.keys().any(|k| k.contains("/APPS")),
+        "excluded APPS must never reach the remote"
+    );
+}
+
+#[test]
+fn excluding_after_sync_touches_neither_side() {
+    // Exclude = freeze: an already-synced subtree stays put on BOTH sides, with
+    // deletes on — the feature must never issue a delete for excluded paths.
+    let t = Tmp::new("exclafter");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/keep.txt"), "keep");
+    write(&t.path().join("local/APPS/app.bin"), "app");
+    run(&c, fake, false);
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/APPS/app.bin"),
+        "APPS should be synced before we exclude it"
+    );
+
+    // Now exclude APPS and sync again.
+    c.pairs[0].exclude = vec!["APPS".into()];
+    let (fake2, _s) = reuse(&store);
+    run(&c, fake2, false);
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/APPS/app.bin"),
+        "remote APPS must survive being excluded (never a Proton-side op)"
+    );
+    assert!(
+        t.path().join("local/APPS/app.bin").exists(),
+        "local APPS must survive being excluded (freeze, not delete)"
+    );
+}
+
+#[test]
+fn reinclude_after_local_removal_redownloads_never_deletes_remote() {
+    // The Dropbox "free up space" lifecycle: exclude, remove the local copy,
+    // then re-include -> it re-downloads from the cloud and NEVER deletes remote.
+    let t = Tmp::new("reincl");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/keep.txt"), "keep");
+    write(&t.path().join("local/APPS/app.bin"), "app");
+    run(&c, fake, false);
+
+    // Exclude APPS (prunes its baseline), then the user frees local space.
+    c.pairs[0].exclude = vec!["APPS".into()];
+    let (f2, _s) = reuse(&store);
+    run(&c, f2, false);
+    std::fs::remove_dir_all(t.path().join("local/APPS")).unwrap();
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/APPS/app.bin"),
+        "remote still holds APPS while it's excluded"
+    );
+
+    // Re-include: must re-download from the cloud, remote untouched.
+    c.pairs[0].exclude = vec![];
+    let (f3, _s) = reuse(&store);
+    run(&c, f3, false);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/APPS/app.bin")).unwrap(),
+        "app",
+        "re-include should restore the local copy from the cloud"
+    );
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/APPS/app.bin"),
+        "re-include must never delete the remote copy"
     );
 }

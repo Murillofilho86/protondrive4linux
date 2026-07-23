@@ -623,6 +623,7 @@ impl App {
                 local: dir,
                 remote: remote_path,
                 auto: true,
+                exclude: Vec::new(),
             });
             self.commit();
             self.dirty = true;
@@ -1349,6 +1350,7 @@ impl App {
                     local: dir,
                     remote,
                     auto: true,
+                    exclude: Vec::new(),
                 });
                 changed = true;
                 sync_one = Some(name); // auto-initialize: scan both sides + first sync

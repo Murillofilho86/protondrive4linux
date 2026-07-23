@@ -83,6 +83,9 @@ debounce = 2
 # local = "~/Documents"
 # remote = "Documents"        # -> /my-files/Documents
 # auto = true
+# Sub-paths (relative to this pair) to leave out of sync. Excluded folders are
+# ignored entirely and NEVER touched on Proton; the cloud copy always stays.
+# exclude = ["APPS", "caches"]
 
 # [[pair]]
 # name = "photos"
