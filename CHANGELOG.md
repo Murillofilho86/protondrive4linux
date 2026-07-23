@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-23
+
 ### Added
 - Bidirectional folder sync on the official `proton-drive` CLI, with a
   three-way-merge engine (per-pair baseline snapshot).
