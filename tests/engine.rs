@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use std::sync::atomic::AtomicBool;
 
-use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair};
+use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
@@ -160,6 +160,8 @@ fn cfg(root: &Path) -> Config {
         poll_interval_secs: 900,
         scan_interval_secs: 120,
         debounce_secs: 2,
+        update_channel: UpdateChannel::Stable,
+        check_on_launch: false,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

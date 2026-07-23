@@ -18,6 +18,8 @@ pub mod service;
 pub mod state;
 pub mod stats;
 pub mod trash;
+#[cfg(feature = "gui")]
+pub mod updater;
 pub mod watcher;
 
 /// Starter config written by `neutronsync init` (kept in sync with
@@ -70,6 +72,11 @@ compare = "size+mtime"
 # debounce window that lets a burst of local file events settle.
 poll_interval = 300
 debounce = 2
+
+# In-app updater (GUI): which release channel to follow, and whether to check
+# for a new version on launch (notify only - it never installs anything).
+# update_channel = "stable"    # or "prerelease"
+# check_on_launch = false
 
 # One [[pair]] per folder you want kept in sync.
 [[pair]]

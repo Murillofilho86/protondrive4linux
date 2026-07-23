@@ -26,6 +26,15 @@ pub enum ConflictPolicy {
     Skip,
 }
 
+/// Release channel the in-app updater follows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpdateChannel {
+    /// Only releases you've promoted (unticked "pre-release").
+    Stable,
+    /// The newest published release, including pre-releases.
+    Prerelease,
+}
+
 #[derive(Clone, Debug)]
 pub struct Pair {
     pub name: String,
@@ -65,6 +74,10 @@ pub struct Config {
     pub scan_interval_secs: u64,
     /// watch mode: seconds to let a burst of FS events settle before syncing.
     pub debounce_secs: u64,
+    /// Which release channel the in-app updater follows.
+    pub update_channel: UpdateChannel,
+    /// Check for updates when the GUI launches (notify only; never installs).
+    pub check_on_launch: bool,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -109,6 +122,8 @@ struct RawOptions {
     auto_sync: Option<bool>,
     run_in_tray: Option<bool>,
     x11_compat: Option<bool>,
+    update_channel: Option<String>,
+    check_on_launch: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +302,12 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         }
     };
 
+    let update_channel = match opts.update_channel.as_deref().unwrap_or("stable") {
+        "stable" => UpdateChannel::Stable,
+        "prerelease" => UpdateChannel::Prerelease,
+        other => bail!("options.update_channel must be stable|prerelease, got {other:?}"),
+    };
+
     let state_dir = match opts.state_dir {
         Some(s) => expand(&s),
         None => state_home().join("neutronsync"),
@@ -336,6 +357,8 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         poll_interval_secs: opts.poll_interval.unwrap_or(900),
         scan_interval_secs: opts.scan_interval.unwrap_or(120),
         debounce_secs: opts.debounce.unwrap_or(2),
+        update_channel,
+        check_on_launch: opts.check_on_launch.unwrap_or(false),
         state_dir,
         pairs,
         source_path: Some(path),
@@ -385,6 +408,8 @@ struct OutOptions {
     poll_interval: u64,
     scan_interval: u64,
     debounce: u64,
+    update_channel: String,
+    check_on_launch: bool,
     state_dir: String,
 }
 
@@ -426,6 +451,13 @@ fn compare_str(v: Compare) -> &'static str {
     }
 }
 
+fn update_channel_str(v: UpdateChannel) -> &'static str {
+    match v {
+        UpdateChannel::Stable => "stable",
+        UpdateChannel::Prerelease => "prerelease",
+    }
+}
+
 /// Serialise a Config back to TOML text.
 pub fn to_toml(cfg: &Config) -> Result<String> {
     let out = OutConfig {
@@ -450,6 +482,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             poll_interval: cfg.poll_interval_secs,
             scan_interval: cfg.scan_interval_secs,
             debounce: cfg.debounce_secs,
+            update_channel: update_channel_str(cfg.update_channel).to_string(),
+            check_on_launch: cfg.check_on_launch,
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg

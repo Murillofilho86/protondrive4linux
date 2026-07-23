@@ -33,6 +33,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 winit = { version = "0.30", optional = true }
 tray-icon = { version = "0.24", optional = true }
 gtk = { version = "0.18", optional = true }
+# Update check (GUI-only, notify): tiny HTTP client + semver compare.
+ureq = { version = "2", optional = true }
+semver = { version = "1", optional = true }
 
 [profile.release]
 opt-level = "z"   # optimise for size ("lite")
@@ -51,6 +54,8 @@ gui = [
     "dep:winit",
     "dep:tray-icon",
     "dep:gtk",
+    "dep:ureq",
+    "dep:semver",
 ]
 
 [[bin]]

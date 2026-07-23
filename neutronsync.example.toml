@@ -67,6 +67,14 @@ debounce = 2
 # run_in_tray = false
 # x11_compat = false
 
+# In-app updater (GUI). It only checks GitHub Releases and notifies you; it
+# never downloads or installs anything.
+#   update_channel  - "stable" follows releases that have been promoted off
+#                     pre-release; "prerelease" follows the newest build.
+#   check_on_launch - check quietly when the app starts.
+# update_channel = "stable"
+# check_on_launch = false
+
 # One [[pair]] per folder you want kept in sync.
 # `auto` (default true) includes the pair when "Auto sync" (the watch daemon) is
 # on; set it false to keep a pair manual-only (sync it on demand from the GUI).

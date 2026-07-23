@@ -19,10 +19,11 @@ use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, RichText, Sense, Stroke,
 };
 
-use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair};
+use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
+use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
 const NAV_BG: Color32 = Color32::from_rgb(0x16, 0x15, 0x1C);
@@ -440,6 +441,13 @@ fn spawn_daemon() {
     let _ = std::process::Command::new(self_exe()).arg("--tray").spawn();
 }
 
+/// State of the "Check for updates" flow, shared with the checker thread.
+enum UpdateState {
+    Idle,
+    Checking,
+    Done(std::result::Result<UpdateInfo, String>),
+}
+
 struct App {
     ctrl: Controller,
     cfg: Config,
@@ -449,6 +457,8 @@ struct App {
     nav_t: f32,
     dirty: bool,
     toast: Option<Toast>,
+    // Update check: shared with the background checker thread.
+    update: std::sync::Arc<std::sync::Mutex<UpdateState>>,
     show_signin: bool,
     confirm_logout: bool,
     confirm_reset: bool,
@@ -501,6 +511,7 @@ impl App {
             nav_t: 1.0,
             dirty: false,
             toast: None,
+            update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
             show_signin: false,
             confirm_logout: false,
             confirm_reset: false,
@@ -522,6 +533,14 @@ impl App {
             if !names.is_empty() {
                 app.ctrl.start_watch(names);
             }
+        }
+        // Optional quiet update check on launch (notify only).
+        if app.cfg.check_on_launch {
+            spawn_update_check(
+                app.update.clone(),
+                app.cfg.update_channel,
+                cc.egui_ctx.clone(),
+            );
         }
         app
     }
@@ -1429,6 +1448,29 @@ impl App {
                     }
                 });
 
+                settings_group(ui, "UPDATES", |ui| {
+                    if setting_row(
+                        ui,
+                        "Update channel",
+                        "Stable follows releases you've promoted; Pre-release follows \
+                         the newest published build.",
+                        |ui| combo_update_channel(ui, &mut self.cfg.update_channel),
+                    ) {
+                        self.dirty = true;
+                    }
+                    let col = self.cfg.check_on_launch;
+                    if setting_row(
+                        ui,
+                        "Check on launch",
+                        "Quietly check for a newer version when the app starts. \
+                         Notifies only; never installs anything.",
+                        |ui| switch(ui, col),
+                    ) {
+                        self.cfg.check_on_launch = !col;
+                        self.dirty = true;
+                    }
+                });
+
                 settings_group(ui, "CHANGE DETECTION", |ui| {
                     if setting_row(
                         ui,
@@ -1600,6 +1642,7 @@ impl App {
                 .color(ACCENT),
         );
         ui.add_space(8.0);
+        let channel = self.cfg.update_channel;
         ui.horizontal(|ui| {
             if button(
                 ui,
@@ -1611,21 +1654,72 @@ impl App {
             )
             .clicked()
             {
-                let ctx = ui.ctx().clone();
-                self.toast(&ctx, "Automatic updates aren't wired up yet.", false);
+                spawn_update_check(self.update.clone(), channel, ui.ctx().clone());
             }
             ui.add_space(10.0);
-            ui.label(
-                RichText::new(format!("You're on {}.", env!("CARGO_PKG_VERSION")))
-                    .size(12.0)
-                    .color(DIM),
-            );
+            let state = self.update.lock().unwrap();
+            match &*state {
+                UpdateState::Idle => {
+                    ui.label(
+                        RichText::new(format!("You're on {}.", updater::current_version()))
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                }
+                UpdateState::Checking => {
+                    ui.label(RichText::new("Checking…").size(12.0).color(DIM));
+                }
+                UpdateState::Done(Ok(info)) if info.newer => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Update available: {} (you have {})",
+                            info.latest, info.current
+                        ))
+                        .size(12.0)
+                        .color(ACCENT),
+                    );
+                }
+                UpdateState::Done(Ok(info)) => {
+                    ui.label(
+                        RichText::new(format!("Up to date ({}).", info.current))
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                }
+                UpdateState::Done(Err(e)) => {
+                    ui.label(
+                        RichText::new(format!("Couldn't check: {e}"))
+                            .size(12.0)
+                            .color(WARN),
+                    );
+                }
+            }
         });
+        // Offer to open the release page when a newer version is available.
+        let release_url = match &*self.update.lock().unwrap() {
+            UpdateState::Done(Ok(info)) if info.newer && !info.html_url.is_empty() => {
+                Some(info.html_url.clone())
+            }
+            _ => None,
+        };
+        if let Some(url) = release_url {
+            ui.add_space(6.0);
+            if button(ui, None, "Open release", Btn::Primary, false, true).clicked() {
+                open_url(&url);
+            }
+        }
         ui.add_space(4.0);
+        let chan = match channel {
+            UpdateChannel::Stable => "stable",
+            UpdateChannel::Prerelease => "pre-release",
+        };
         ui.label(
-            RichText::new("Releases will be delivered from GitHub.")
-                .size(11.5)
-                .color(DIM2),
+            RichText::new(format!(
+                "Following the {chan} channel. Releases come from GitHub; nothing is \
+                 installed without you choosing to."
+            ))
+            .size(11.5)
+            .color(DIM2),
         );
     }
 
@@ -1848,6 +1942,26 @@ enum Open {
 /// Open a local path with the desktop's default handler.
 fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Open a URL in the user's browser (e.g. a release page).
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Run an update check on a background thread, storing the outcome in `slot`
+/// and requesting a repaint when done. Never blocks the UI.
+fn spawn_update_check(
+    slot: std::sync::Arc<std::sync::Mutex<UpdateState>>,
+    channel: UpdateChannel,
+    ctx: egui::Context,
+) {
+    *slot.lock().unwrap() = UpdateState::Checking;
+    std::thread::spawn(move || {
+        let res = updater::check(channel).map_err(|e| e.to_string());
+        *slot.lock().unwrap() = UpdateState::Done(res);
+        ctx.request_repaint();
+    });
 }
 
 /// Base of the XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`).
@@ -2369,6 +2483,25 @@ fn combo_conflict(ui: &mut egui::Ui, v: &mut ConflictPolicy) -> bool {
         });
     changed
 }
+
+fn combo_update_channel(ui: &mut egui::Ui, v: &mut UpdateChannel) -> bool {
+    let text = match v {
+        UpdateChannel::Stable => "Stable",
+        UpdateChannel::Prerelease => "Pre-release",
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("update_channel")
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            for (val, lbl) in [
+                (UpdateChannel::Stable, "Stable"),
+                (UpdateChannel::Prerelease, "Pre-release"),
+            ] {
+                changed |= ui.selectable_value(v, val, lbl).clicked();
+            }
+        });
+    changed
+}
 fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
     let text = match v {
         Compare::Size => "Size",
@@ -2411,6 +2544,8 @@ fn starter_config(path: &PathBuf) -> Config {
         poll_interval_secs: 900,
         scan_interval_secs: 120,
         debounce_secs: 2,
+        update_channel: UpdateChannel::Stable,
+        check_on_launch: false,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
