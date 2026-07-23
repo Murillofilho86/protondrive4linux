@@ -1,0 +1,12 @@
+[Unit]
+Description=Run neutronsync periodically
+
+[Timer]
+# Shortly after login, then every 30 minutes. Proton Drive is rate-limited, so
+# avoid very frequent runs. Adjust to taste.
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

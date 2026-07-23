@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [rust]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # System libraries needed to build the egui/eframe GUI (glow/winit) and
+      # the rfd native file dialog.
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcb1-dev libgl1-mesa-dev
+
+      - name: Build (lib + CLI)
+        run: cargo build --workspace --all-targets
+
+      - name: Build (with GUI)
+        run: cargo build --features gui --bin neutronsync-gui
+
+      - name: Test
+        run: cargo test --all-features
+
+      # Informational: clippy shouldn't block a merge on style nits for now.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features || true

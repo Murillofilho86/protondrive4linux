@@ -1,0 +1,15 @@
+[Unit]
+Description=Proton Drive bidirectional sync (neutronsync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Uses the config at ~/.config/neutronsync/neutronsync.toml by default.
+# Adjust the path to wherever you installed the binary, e.g.
+#   cargo install --path .   -> %h/.cargo/bin/neutronsync
+#   manual copy              -> %h/.local/bin/neutronsync
+ExecStart=/usr/bin/neutronsync sync
+Nice=10
+IOSchedulingClass=idle
+# Credentials live in the user's secret store; keep this a --user unit.
