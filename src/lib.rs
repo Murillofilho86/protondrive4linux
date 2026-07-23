@@ -78,9 +78,10 @@ debounce = 2
 # update_channel = "stable"    # or "prerelease"
 # check_on_launch = false
 
-# One [[pair]] per folder you want kept in sync.
-[[pair]]
-name = "documents"
-local = "~/Documents"
-remote = "Documents"        # -> /my-files/Documents
+# Add one [[pair]] per folder you want kept in sync. None are created for you;
+# add them here or from the GUI. Example (uncomment and edit):
+# [[pair]]
+# name = "documents"
+# local = "~/Documents"
+# remote = "Documents"        # -> /my-files/Documents
 "#;

@@ -75,14 +75,14 @@ debounce = 2
 # update_channel = "stable"
 # check_on_launch = false
 
-# One [[pair]] per folder you want kept in sync.
-# `auto` (default true) includes the pair when "Auto sync" (the watch daemon) is
-# on; set it false to keep a pair manual-only (sync it on demand from the GUI).
-[[pair]]
-name = "documents"
-local = "~/Documents"
-remote = "Documents"        # -> /my-files/Documents
-auto = true
+# Add one [[pair]] per folder you want kept in sync. None exist by default;
+# uncomment and edit. `auto` (default true) includes the pair when "Auto sync"
+# (the watch daemon) is on; set it false to keep a pair manual-only.
+# [[pair]]
+# name = "documents"
+# local = "~/Documents"
+# remote = "Documents"        # -> /my-files/Documents
+# auto = true
 
 # [[pair]]
 # name = "photos"
