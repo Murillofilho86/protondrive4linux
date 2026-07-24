@@ -7,6 +7,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-25
+
+### Added
+- Streaming full walk. The full reconcile now walks the tree folder-by-folder
+  and transfers as it goes (a concurrent breadth-first walk of shallow,
+  direct-children reconciles), instead of scanning the whole tree and only then
+  applying. Uploads and downloads overlap the walk, so a large tree starts
+  syncing immediately rather than after a long scan. Each folder is reconciled by
+  the same scoped, positive-confirmation primitive, so containment and the
+  data-safety invariants hold per folder.
+
+### Fixed
+- Self-feeding watch loop. The daemon's own reconcile reads were firing
+  filesystem access/attribute events, which marked the just-read folders "hot"
+  and triggered endless re-scanning, so the watcher never settled. It now only
+  treats real content changes (create, write, delete, rename) as changes and
+  ignores access/metadata events.
+- Deletion safety (from an adversarial review of the folder-scoped reconcile): a
+  failed local directory read no longer reads as "everything deleted"; a
+  sub-folder's baseline rows are pruned only when its delete actually completed
+  (not on a cancelled or failed one); and a remote "not found" is treated as a
+  missing listing (deletes suppressed) rather than an empty one.
+- Packaging shipped no app icon, so the `.deb`/`.rpm` launcher fell back to a
+  generic system icon and a second, differently-named entry. The packages now
+  ship the NeutronSync icon, the desktop entry uses it (with a matching
+  `StartupWMClass`), and the app writes its user-level desktop file under the
+  same name so it shadows the packaged one instead of duplicating it.
+
+### Changed
+- Startup and change-event bursts reconcile their folders concurrently (a worker
+  pool), instead of one slow CLI cold-start at a time, so a batch of folders
+  syncs about as fast as the full walk rather than sequentially.
+- Change-triggered syncs process the newest change first, so a fresh edit is
+  never starved behind a backlog of older or no-op folder checks.
+- The Activity banner shows the folder currently being checked during a
+  single-folder (shallow) reconcile, instead of a generic "Scanning folder
+  pairs".
+
 ## [0.1.1] - 2026-07-24
 
 ### Fixed

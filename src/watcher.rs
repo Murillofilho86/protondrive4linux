@@ -6,7 +6,7 @@
 //! caught by the hot pass and by the full walk, which is paced to how long a
 //! walk actually takes (see `docs/SYNC_MODEL.md`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -19,7 +19,7 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
 use crate::config::{Config, Pair};
 use crate::datefmt::now_epoch;
-use crate::engine::{run_sync_shallow, run_sync_with};
+use crate::engine::{run_sync_shallow_many, run_sync_streaming};
 use crate::events::EventSink;
 use crate::logger::Logger;
 use crate::stats::Stats;
@@ -51,6 +51,21 @@ fn folder_of(rel: &str) -> String {
         Some((dir, _)) => dir.to_string(),
         None => String::new(),
     }
+}
+
+/// Whether a filesystem event is a real content/structure change worth syncing.
+/// We IGNORE access (reads) and metadata-only (attribute/mtime) events: our own
+/// reconcile READS folders and sets mtimes on downloads, and if those counted as
+/// changes they would mark the just-touched folders "hot" and drive an endless
+/// self-feeding re-scan loop. Everything else (create, write, delete, rename,
+/// or an unspecified modify) is treated as a real change, conservatively.
+fn is_content_change(kind: &notify_debouncer_full::notify::EventKind) -> bool {
+    use notify_debouncer_full::notify::event::ModifyKind;
+    use notify_debouncer_full::notify::EventKind;
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
 }
 
 /// Single-instance lock so a watch daemon and, say, a systemd timer don't run
@@ -160,16 +175,25 @@ pub fn watch_with(
     let watched: BTreeSet<String> = pairs.iter().map(|p| p.name.clone()).collect();
 
     // A full reconcile of every watched pair, reloading config first and timed
-    // so the next full walk can be paced to how long a walk actually takes.
+    // so the next full walk can be paced to how long a walk actually takes. Uses
+    // the STREAMING walk: it reconciles and transfers folder-by-folder as it
+    // discovers them, so uploads/downloads overlap the walk instead of waiting
+    // for the whole tree to be scanned first.
     let full_walk = |stop: &AtomicBool| -> u64 {
         let started = now_epoch();
         let live = reload_cfg(cfg, log);
-        let all = pick_pairs(&live, &watched);
-        let s = run_sync_with(&live, &all, false, false, log, events, Some(stop));
+        let (mut applied, mut errs) = (0usize, 0usize);
+        for p in pick_pairs(&live, &watched) {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let r = run_sync_streaming(&live, &p, log, events, Some(stop));
+            applied += r.applied;
+            errs += r.errors;
+        }
         let secs = (now_epoch() - started).max(0) as u64;
         log.info(&format!(
-            "watch: full walk done in {secs}s ({} applied, {} error(s))",
-            s.applied, s.errors
+            "watch: full walk done in {secs}s ({applied} applied, {errs} error(s))"
         ));
         secs
     };
@@ -202,6 +226,11 @@ pub fn watch_with(
             // change happened in, never the whole pair.
             let mut hit: BTreeSet<(usize, String)> = BTreeSet::new();
             for ev in events {
+                // Skip our own reads / mtime-touches so they can't mark folders
+                // hot and cause an endless re-scan loop.
+                if !is_content_change(&ev.kind) {
+                    continue;
+                }
                 for path in &ev.paths {
                     if let Some(i) = handler_roots.iter().position(|r| path.starts_with(r)) {
                         if let Ok(rel) = path.strip_prefix(&handler_roots[i]) {
@@ -263,56 +292,55 @@ pub fn watch_with(
     });
 
     // Prioritised startup (the watcher is already attached, so live changes
-    // queue meanwhile): 1) sync folders with fresh LOCAL changes first — a quick
-    // local scan finds them and uploads within seconds; 2) sync recently-active
-    // HOT folders; 3) then the full walk for everything else. Each step is a SAFE
-    // scoped sync that checks the remote for that folder, so an upload never
-    // blindly clobbers a remote copy.
+    // queue meanwhile): 1) sync folders with fresh LOCAL changes first; 2) sync
+    // recently-active HOT folders; 3) then the streaming full walk for the rest.
+    // Steps 1 and 2 reconcile their folders CONCURRENTLY (a worker pool) so a
+    // large set isn't a slow one-folder-at-a-time slog. Root ("") folders are
+    // left to the full walk. Each folder is a safe shallow reconcile.
     {
         let live = reload_cfg(cfg, log);
         let mut primed: BTreeSet<(String, String)> = BTreeSet::new();
-        let scoped = |p: &Pair, folder: &str, why: &str| {
-            let label = if folder.is_empty() { "(root)" } else { folder };
-            log.info(&format!("watch: startup {why} sync {:?} [{label}]", p.name));
-            let _ = run_sync_shallow(&live, p, folder, log, events, Some(stop));
-        };
         // 1) folders with fresh local changes
         for p in pick_pairs(&live, &watched) {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            for folder in crate::engine::local_change_folders(&live, &p) {
-                if stop.load(Ordering::Relaxed) {
-                    break;
+            let folders: Vec<String> = crate::engine::local_change_folders(&live, &p)
+                .into_iter()
+                .filter(|f| !f.is_empty())
+                .collect();
+            if !folders.is_empty() {
+                log.info(&format!(
+                    "watch: startup local-change sync {:?} ({} folder(s))",
+                    p.name,
+                    folders.len()
+                ));
+                let _ = run_sync_shallow_many(&live, &p, &folders, log, events, Some(stop));
+                for f in folders {
+                    primed.insert((p.name.clone(), f));
                 }
-                // Root-level ("") changes are left to the full walk (step 3) —
-                // an empty scope is a whole-pair sync, pointless to do twice.
-                if folder.is_empty() {
-                    continue;
-                }
-                scoped(&p, &folder, "local-change");
-                primed.insert((p.name.clone(), folder));
             }
         }
-        // 2) recently-active hot folders (skip any already synced above)
+        // 2) recently-active hot folders (skip root and any already synced above)
         if let Some(st) = &stats {
             let now = now_epoch();
             for p in pick_pairs(&live, &watched) {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let hot = st
+                let folders: Vec<String> = st
                     .hot_folders(&p.name, HOT_WINDOW_SECS, HOT_THRESHOLD, now)
-                    .unwrap_or_default();
-                for folder in hot {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if folder.is_empty() || primed.contains(&(p.name.clone(), folder.clone())) {
-                        continue;
-                    }
-                    scoped(&p, &folder, "hot");
-                    primed.insert((p.name.clone(), folder));
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| !f.is_empty() && !primed.contains(&(p.name.clone(), f.clone())))
+                    .collect();
+                if !folders.is_empty() {
+                    log.info(&format!(
+                        "watch: startup hot sync {:?} ({} folder(s))",
+                        p.name,
+                        folders.len()
+                    ));
+                    let _ = run_sync_shallow_many(&live, &p, &folders, log, events, Some(stop));
                 }
             }
         }
@@ -356,13 +384,13 @@ pub fn watch_with(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        // Accumulate changed sub-folders per pair index, plus the hot tick.
-        let mut subs: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        // Accumulate change events in arrival order (newest last), plus the hot
+        // tick. We process NEWEST changes first so a fresh edit is never starved
+        // behind a large backlog of older / no-op folder checks.
+        let mut order: Vec<(usize, String)> = Vec::new();
         let mut poll_hot = false;
         let mut take = |m: Msg| match m {
-            Msg::Sub { pair, sub } => {
-                subs.entry(pair).or_default().insert(sub);
-            }
+            Msg::Sub { pair, sub } => order.push((pair, sub)),
             Msg::PollHot => poll_hot = true,
         };
         take(first);
@@ -375,8 +403,8 @@ pub fn watch_with(
             take(m);
         }
 
-        // On the hot tick, add each pair's recently-active sub-folders so busy
-        // areas pick up remote changes between full walks.
+        // Hot sub-folders (lower priority than live changes).
+        let mut hot: Vec<(usize, String)> = Vec::new();
         if poll_hot {
             if let Some(st) = &stats {
                 let now = now_epoch();
@@ -384,51 +412,93 @@ pub fn watch_with(
                     if let Ok(folders) =
                         st.hot_folders(&p.name, HOT_WINDOW_SECS, HOT_THRESHOLD, now)
                     {
-                        if !folders.is_empty() {
-                            let set = subs.entry(i).or_default();
-                            set.extend(folders);
+                        for f in folders {
+                            hot.push((i, f));
                         }
                     }
                 }
             }
         }
 
-        if subs.is_empty() {
+        // Processing list: newest change events first (deduped), then hot
+        // folders, skipping anything already queued.
+        let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
+        let mut todo: Vec<(usize, String)> = Vec::new();
+        for item in order.into_iter().rev().chain(hot) {
+            if seen.insert(item.clone()) {
+                todo.push(item);
+            }
+        }
+        if todo.is_empty() {
             continue;
         }
 
-        // Reload config so live exclusion/setting edits apply, then run one
-        // SCOPED sync per (pair, sub-folder) — never the whole pair.
+        // Reload config so live exclusion/setting edits apply, then run the
+        // SHALLOW (direct-children-only) syncs, grouped by pair and reconciled
+        // CONCURRENTLY per pair so a burst of folders isn't a one-at-a-time slog.
         let live = reload_cfg(cfg, log);
-        for (i, folders) in &subs {
-            let name = match pairs.get(*i) {
+        let mut by_pair: Vec<(usize, Vec<String>)> = Vec::new();
+        for (i, sub) in todo {
+            match by_pair.iter_mut().find(|(pi, _)| *pi == i) {
+                Some((_, v)) => v.push(sub),
+                None => by_pair.push((i, vec![sub])),
+            }
+        }
+        for (i, folders) in by_pair {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let name = match pairs.get(i) {
                 Some(p) => p.name.clone(),
                 None => continue,
             };
             let pair = match live.pairs.iter().find(|p| p.name == name) {
                 Some(p) => p.clone(),
-                None => continue, // pair was removed from the config
+                None => continue, // pair removed from the config
             };
-            for sub in folders {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let label = if sub.is_empty() {
-                    "(root)"
-                } else {
-                    sub.as_str()
-                };
-                log.info(&format!(
-                    "watch: change -> shallow sync {:?} [{label}]",
-                    pair.name
-                ));
-                let s = run_sync_shallow(&live, &pair, sub, log, events, Some(stop));
-                log.info(&format!(
-                    "watch: shallow done ({} applied, {} error(s))",
-                    s.applied, s.errors
-                ));
-            }
+            log.info(&format!(
+                "watch: change -> shallow sync {:?} ({} folder(s))",
+                pair.name,
+                folders.len()
+            ));
+            let s = run_sync_shallow_many(&live, &pair, &folders, log, events, Some(stop));
+            log.info(&format!(
+                "watch: shallow done ({} applied, {} error(s))",
+                s.applied, s.errors
+            ));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_content_change;
+    use notify_debouncer_full::notify::event::{
+        AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+    };
+    use notify_debouncer_full::notify::EventKind;
+
+    #[test]
+    fn ignores_reads_and_metadata_keeps_real_changes() {
+        // Reads and attribute/mtime touches must NOT count (they self-trigger).
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_content_change(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!is_content_change(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        // Real content/structure changes must count.
+        assert!(is_content_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_content_change(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Any
+        ))));
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Any)));
+    }
 }

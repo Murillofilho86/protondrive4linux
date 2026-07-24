@@ -23,7 +23,7 @@ use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete
 use crate::datefmt::{epoch_to_stamp, now_epoch};
 use crate::logger::Logger;
 use crate::models::{same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan};
-use crate::protoncli::{ProtonCli, Remote};
+use crate::protoncli::{ListOutcome, ProtonCli, Remote};
 use crate::trash::trash_local;
 
 pub struct SyncResult {
@@ -235,10 +235,19 @@ pub fn run_sync_shallow(
             pairs: 0,
         };
     }
+    // Show which folder is being checked (so the banner isn't a generic
+    // "Scanning folder pairs" during a single-folder reconcile).
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::ScanProgress {
+            pair: pair.name.clone(),
+            folders: 0,
+            current: remote_join(&pair.remote, folder),
+        });
+    }
     let mut engine = Engine::new(cfg, proton, log, false);
     engine.set_observer(events, cancel);
     match engine.sync_pair_shallow(pair, folder) {
-        Ok(r) => RunSummary {
+        Ok((r, _children)) => RunSummary {
             applied: r.applied,
             errors: r.errors.len(),
             pairs: 1,
@@ -257,6 +266,252 @@ pub fn run_sync_shallow(
                 pairs: 1,
             }
         }
+    }
+}
+
+/// Streaming full walk: BFS the folder tree and shallow-reconcile each folder as
+/// it is discovered, transferring immediately, a bounded number of folders in
+/// parallel. Unlike the batch walk (`run_sync`) it does not scan the whole tree
+/// before acting, so uploads and downloads overlap the walk. Each folder is
+/// reconciled by the same scoped, positive-confirmation shallow primitive, so
+/// containment and every data-safety invariant hold per folder. Concurrent
+/// workers commit disjoint baseline rows (SQLite serialises the writes).
+pub fn run_sync_streaming(
+    cfg: &Config,
+    pair: &Pair,
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    cancel: Option<&AtomicBool>,
+) -> RunSummary {
+    let proton = ProtonCli::new(cfg);
+    if proton.resolve_binary().is_none() {
+        log.error("proton-drive not found on PATH");
+        if let Some(sink) = events {
+            sink.emit(&SyncEvent::Error {
+                pair: Some(pair.name.clone()),
+                text: "proton-drive not found on PATH".into(),
+            });
+        }
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 0,
+        };
+    }
+    // Refuse a vanished local root (unmounted drive) rather than walk into an
+    // empty mountpoint and read every remote file as a deletion.
+    if !pair.local.exists() {
+        log.error(&format!(
+            "local folder {} does not exist — refusing streaming walk",
+            pair.local.display()
+        ));
+        if let Some(sink) = events {
+            sink.emit(&SyncEvent::Error {
+                pair: Some(pair.name.clone()),
+                text: "local folder missing — refused".into(),
+            });
+        }
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 1,
+        };
+    }
+
+    // One shared baseline snapshot for the whole walk. Each folder reads only its
+    // own (disjoint) rows from it, and only its own reconcile writes them, so a
+    // snapshot taken now stays correct throughout.
+    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
+        Ok(b) => std::sync::Arc::new(b),
+        Err(e) => {
+            log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
+            return RunSummary {
+                applied: 0,
+                errors: 1,
+                pairs: 1,
+            };
+        }
+    };
+
+    let threads = if cfg.scan_threads > 0 {
+        cfg.scan_threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8)
+    };
+
+    let applied = AtomicUsize::new(0);
+    let errors = AtomicUsize::new(0);
+    let counter = AtomicUsize::new(0);
+    let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
+
+    let mut frontier: Vec<String> = vec![String::new()]; // start at the pair root
+    while !frontier.is_empty() && !is_cancelled() {
+        let queue: Mutex<std::collections::VecDeque<String>> =
+            Mutex::new(frontier.drain(..).collect());
+        let next: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    // One Engine (and CLI cache) per worker, reused across the
+                    // folders it handles this level to amortise CLI startup.
+                    let proton = ProtonCli::new(cfg);
+                    let mut eng = Engine::new(cfg, proton, log, false);
+                    eng.set_observer(events, cancel);
+                    loop {
+                        if is_cancelled() {
+                            break;
+                        }
+                        let folder = {
+                            let mut q = queue.lock().unwrap();
+                            q.pop_front()
+                        };
+                        let Some(folder) = folder else { break };
+                        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(sink) = events {
+                            sink.emit(&SyncEvent::ScanProgress {
+                                pair: pair.name.clone(),
+                                folders: n,
+                                current: remote_join(&pair.remote, &folder),
+                            });
+                        }
+                        match eng.sync_pair_shallow_with_base(pair, &folder, &base) {
+                            Ok((r, children)) => {
+                                applied.fetch_add(r.applied, Ordering::Relaxed);
+                                errors.fetch_add(r.errors.len(), Ordering::Relaxed);
+                                next.lock().unwrap().extend(children);
+                            }
+                            Err(e) => {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                log.error(&format!("pair {:?} <{folder}> failed: {e}", pair.name));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        frontier = next.into_inner().unwrap();
+        frontier.sort();
+        frontier.dedup();
+    }
+
+    if !is_cancelled() {
+        let _ = crate::state::set_last_synced(&cfg.state_dir, &pair.name, now_epoch());
+    }
+    RunSummary {
+        applied: applied.load(Ordering::Relaxed),
+        errors: errors.load(Ordering::Relaxed),
+        pairs: 1,
+    }
+}
+
+/// Reconcile a specific SET of folders in a pair concurrently (shallow, no
+/// descent). Used by the watch daemon for the startup local-change / hot phases
+/// and change-event bursts, so a batch of folders runs through a worker pool
+/// (like the streaming walk) instead of one slow CLI cold-start at a time. Each
+/// folder is the same scoped, positive-confirmation shallow reconcile; workers
+/// share one read-only baseline snapshot and commit disjoint rows.
+pub fn run_sync_shallow_many(
+    cfg: &Config,
+    pair: &Pair,
+    folders: &[String],
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    cancel: Option<&AtomicBool>,
+) -> RunSummary {
+    if folders.is_empty() {
+        return RunSummary {
+            applied: 0,
+            errors: 0,
+            pairs: 0,
+        };
+    }
+    let proton = ProtonCli::new(cfg);
+    if proton.resolve_binary().is_none() {
+        log.error("proton-drive not found on PATH");
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 0,
+        };
+    }
+    if !pair.local.exists() {
+        log.error(&format!(
+            "local folder {} does not exist — refusing shallow batch",
+            pair.local.display()
+        ));
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 1,
+        };
+    }
+    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
+        Ok(b) => std::sync::Arc::new(b),
+        Err(e) => {
+            log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
+            return RunSummary {
+                applied: 0,
+                errors: 1,
+                pairs: 1,
+            };
+        }
+    };
+    let threads = if cfg.scan_threads > 0 {
+        cfg.scan_threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8)
+    };
+    let queue: Mutex<std::collections::VecDeque<String>> =
+        Mutex::new(folders.iter().cloned().collect());
+    let applied = AtomicUsize::new(0);
+    let errors = AtomicUsize::new(0);
+    let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let proton = ProtonCli::new(cfg);
+                let mut eng = Engine::new(cfg, proton, log, false);
+                eng.set_observer(events, cancel);
+                loop {
+                    if is_cancelled() {
+                        break;
+                    }
+                    let folder = {
+                        let mut q = queue.lock().unwrap();
+                        q.pop_front()
+                    };
+                    let Some(folder) = folder else { break };
+                    if let Some(sink) = events {
+                        sink.emit(&SyncEvent::ScanProgress {
+                            pair: pair.name.clone(),
+                            folders: 0,
+                            current: remote_join(&pair.remote, &folder),
+                        });
+                    }
+                    match eng.sync_pair_shallow_with_base(pair, &folder, &base) {
+                        Ok((r, _children)) => {
+                            applied.fetch_add(r.applied, Ordering::Relaxed);
+                            errors.fetch_add(r.errors.len(), Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            log.error(&format!("pair {:?} <{folder}> failed: {e}", pair.name));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    RunSummary {
+        applied: applied.load(Ordering::Relaxed),
+        errors: errors.load(Ordering::Relaxed),
+        pairs: 1,
     }
 }
 
@@ -928,13 +1183,16 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 
     // --- execution ----------------------------------------------------------
+    /// Returns the result and the set of paths whose delete/rename actually
+    /// COMPLETED this run (a subset of what was planned — cancelled or failed
+    /// ops are absent), so callers can act only on confirmed deletions.
     fn apply(
         &mut self,
         pair: &Pair,
         plan: Plan,
         mut new_base: BTreeMap<String, Entry>,
         prune_excluded: HashSet<String>,
-    ) -> SyncResult {
+    ) -> (SyncResult, HashSet<String>) {
         let mut result = SyncResult {
             pair: pair.name.clone(),
             applied: 0,
@@ -964,7 +1222,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 let msg = format!("remote base {}: {e}", pair.remote);
                 self.log.error(&msg);
                 result.errors.push(msg);
-                return result;
+                return (result, HashSet::new());
             }
         }
 
@@ -1114,7 +1372,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 crate::datefmt::now_epoch(),
             );
         }
-        result
+        (result, deleted_ok)
     }
 
     /// Run the download ops through the backend's concurrent pool, emitting the
@@ -1425,7 +1683,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .collect(),
         });
         let tracked = new_base.len();
-        let result = self.apply(pair, plan, new_base, prune_excluded);
+        let (result, _deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
             applied: result.applied,
@@ -1441,7 +1699,71 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// into. Deeper changes arrive as their own watch events (recursive inotify),
     /// and remote-only changes are caught by the hot pass and the full walk — so
     /// a local change touches just its folder's listing, never a whole subtree.
-    pub fn sync_pair_shallow(&mut self, pair: &Pair, folder: &str) -> Result<SyncResult> {
+    pub fn sync_pair_shallow(
+        &mut self,
+        pair: &Pair,
+        folder: &str,
+    ) -> Result<(SyncResult, Vec<String>)> {
+        let base_all = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        self.sync_pair_shallow_with_base(pair, folder, &base_all)
+    }
+
+    /// Sequential streaming walk (BFS): shallow-reconcile each folder as it is
+    /// discovered, descending into the children it reports, transferring as it
+    /// goes. Same per-folder primitive and one shared baseline snapshot as the
+    /// concurrent [`run_sync_streaming`]; kept single-threaded here so it works
+    /// with any `Remote` (including the test fake) and is the tested reference
+    /// for the walk's semantics.
+    pub fn sync_pair_streaming(&mut self, pair: &Pair) -> Result<SyncResult> {
+        let base = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let mut applied = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut frontier: Vec<String> = vec![String::new()];
+        while !frontier.is_empty() {
+            if self.cancelled() {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for folder in frontier.drain(..) {
+                if self.cancelled() {
+                    break;
+                }
+                let (r, children) = self.sync_pair_shallow_with_base(pair, &folder, &base)?;
+                applied += r.applied;
+                errors.extend(r.errors);
+                next.extend(children);
+            }
+            next.sort();
+            next.dedup();
+            frontier = next;
+        }
+        if !self.dry_run && !self.cancelled() {
+            let _ = crate::state::set_last_synced(
+                &self.cfg.state_dir,
+                &pair.name,
+                crate::datefmt::now_epoch(),
+            );
+        }
+        Ok(SyncResult {
+            pair: pair.name.clone(),
+            applied,
+            was_in_sync: applied == 0 && errors.is_empty(),
+            errors,
+            plan_summary: String::new(),
+        })
+    }
+
+    /// Like [`sync_pair_shallow`] but with a pre-loaded baseline snapshot, so a
+    /// streaming walk can share one snapshot across many folders instead of
+    /// reloading it per folder. Returns the result plus the immediate sub-folders
+    /// to descend into (present on either side after the reconcile; a folder
+    /// deleted this run is not returned).
+    pub fn sync_pair_shallow_with_base(
+        &mut self,
+        pair: &Pair,
+        folder: &str,
+        base_all: &BTreeMap<String, Entry>,
+    ) -> Result<(SyncResult, Vec<String>)> {
         let folder = folder.trim_matches('/');
         let label = if folder.is_empty() {
             "(root)".to_string()
@@ -1470,7 +1792,6 @@ impl<'a, R: Remote> Engine<'a, R> {
             Some(rest) => !rest.is_empty() && !rest.contains('/'),
             None => false,
         };
-        let base_all = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
         let base_direct: BTreeMap<String, Entry> = base_all
             .iter()
             .filter(|(k, _)| is_direct(k) && !pair.is_excluded(k))
@@ -1485,70 +1806,95 @@ impl<'a, R: Remote> Engine<'a, R> {
             pair.local.join(folder)
         };
         let mut local_direct: BTreeMap<String, Entry> = BTreeMap::new();
-        if let Ok(rd) = std::fs::read_dir(&dir_path) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().replace('\\', "/");
-                let rel = format!("{prefix}{name}");
-                if pair.is_excluded(&rel) {
-                    continue;
-                }
-                let ft = match e.file_type() {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                if ft.is_dir() {
-                    local_direct.insert(
-                        rel.clone(),
-                        Entry {
-                            path: rel,
-                            is_dir: true,
-                            ..Default::default()
-                        },
-                    );
-                } else if ft.is_file() {
-                    let meta = e.metadata().ok();
-                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                    let mtime = meta
-                        .as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
-                    let sha1 = if want_sha1 {
-                        match base_direct.get(&rel) {
-                            Some(b)
-                                if !b.is_dir
-                                    && b.size == size
-                                    && b.mtime == mtime
-                                    && b.sha1.is_some() =>
-                            {
-                                b.sha1.clone()
-                            }
-                            _ => sha1_file(&e.path()),
-                        }
-                    } else {
-                        None
-                    };
-                    local_direct.insert(
-                        rel.clone(),
-                        Entry {
-                            path: rel,
-                            is_dir: false,
-                            size,
-                            mtime,
-                            sha1,
-                            remote_id: None,
-                        },
-                    );
-                }
+        // A local `read_dir` failure (a permissions blip, an I/O error, or fd
+        // exhaustion under the concurrent walk) must NOT be read as "everything
+        // here was deleted" — that would trash still-present remote files. Flag
+        // it and suppress deletes this run, exactly like a failed remote listing.
+        let local_failed = match std::fs::read_dir(&dir_path) {
+            Err(e) => {
+                self.log.warn(&format!(
+                    "shallow: local listing failed for {}: {e}; syncing without deletions",
+                    dir_path.display()
+                ));
+                true
             }
-        }
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().replace('\\', "/");
+                    let rel = format!("{prefix}{name}");
+                    if pair.is_excluded(&rel) {
+                        continue;
+                    }
+                    let ft = match e.file_type() {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    if ft.is_dir() {
+                        local_direct.insert(
+                            rel.clone(),
+                            Entry {
+                                path: rel,
+                                is_dir: true,
+                                ..Default::default()
+                            },
+                        );
+                    } else if ft.is_file() {
+                        match e.metadata() {
+                            Ok(m) => {
+                                let size = m.len();
+                                let mtime = m
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs() as i64);
+                                let sha1 = if want_sha1 {
+                                    match base_direct.get(&rel) {
+                                        Some(b)
+                                            if !b.is_dir
+                                                && b.size == size
+                                                && b.mtime == mtime
+                                                && b.sha1.is_some() =>
+                                        {
+                                            b.sha1.clone()
+                                        }
+                                        _ => sha1_file(&e.path()),
+                                    }
+                                } else {
+                                    None
+                                };
+                                local_direct.insert(
+                                    rel.clone(),
+                                    Entry {
+                                        path: rel,
+                                        is_dir: false,
+                                        size,
+                                        mtime,
+                                        sha1,
+                                        remote_id: None,
+                                    },
+                                );
+                            }
+                            // A transient stat failure must not look like a
+                            // delete: carry the baseline entry forward so the
+                            // file stays Unchanged and is retried, never trashed.
+                            Err(_) => {
+                                if let Some(b) = base_direct.get(&rel) {
+                                    local_direct.insert(rel.clone(), b.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        };
 
         // REMOTE direct children (single non-recursive listing). A transport
         // error means we can't see the folder — suppress deletes this run rather
         // than act on a blind listing. (A genuinely absent folder lists empty.)
         let remote_path = remote_join(&pair.remote, folder);
-        let (remote_direct, remote_failed) = match self.remote.list_dir(&remote_path) {
-            Ok(entries) => {
+        let (remote_direct, remote_failed) = match self.remote.list_dir_probe(&remote_path) {
+            Ok(ListOutcome::Listed(entries)) => {
                 let mut m = BTreeMap::new();
                 for mut e in entries {
                     let rel = format!("{prefix}{}", e.path);
@@ -1559,6 +1905,17 @@ impl<'a, R: Remote> Engine<'a, R> {
                     m.insert(rel, e);
                 }
                 (m, false)
+            }
+            // Not found: a folder the parent just listed as present now reports
+            // missing — a race (trashed elsewhere) or a transient error misread
+            // as not-found. Either way, don't propagate deletes on that basis;
+            // treat it as a failed listing (empty, deletes suppressed).
+            Ok(ListOutcome::NotFound) => {
+                self.log.warn(&format!(
+                    "shallow: remote folder {remote_path:?} not found; \
+                     syncing without deletions"
+                ));
+                (BTreeMap::new(), true)
             }
             Err(err) => {
                 self.log.warn(&format!(
@@ -1595,7 +1952,9 @@ impl<'a, R: Remote> Engine<'a, R> {
                 &mut new_base,
             );
         }
-        if remote_failed {
+        // Never delete or move on a blind view of either side: if the local
+        // read_dir OR the remote listing failed, strip all destructive ops.
+        if remote_failed || local_failed {
             plan.ops.retain(|op| {
                 !matches!(
                     op.action,
@@ -1606,9 +1965,12 @@ impl<'a, R: Remote> Engine<'a, R> {
                 )
             });
         }
-        let prune_excluded: HashSet<String> = base_direct
+        // Baseline rows for direct children that are now EXCLUDED. (`base_direct`
+        // already filters excludes out, so scan the full snapshot instead.) These
+        // are pruned so a later re-include re-downloads rather than deleting.
+        let prune_excluded: HashSet<String> = base_all
             .keys()
-            .filter(|k| pair.is_excluded(k))
+            .filter(|k| is_direct(k) && pair.is_excluded(k))
             .cloned()
             .collect();
 
@@ -1639,11 +2001,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             .collect();
 
         let tracked = new_base.len();
-        let result = self.apply(pair, plan, new_base, prune_excluded);
+        let (result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
 
-        if !self.dry_run && !deleted_dirs.is_empty() {
+        // Purge descendant baseline rows ONLY for sub-folders whose delete
+        // actually COMPLETED (in `deleted_ok`). A delete that was cancelled or
+        // failed leaves the folder in place, so its rows must survive — otherwise
+        // the baseline would diverge from reality and cause spurious re-work.
+        if !self.dry_run {
             let mut descendants: HashSet<String> = HashSet::new();
-            for d in &deleted_dirs {
+            for d in deleted_dirs.iter().filter(|d| deleted_ok.contains(*d)) {
                 let pfx = format!("{d}/");
                 for k in base_all.keys() {
                     if k.starts_with(&pfx) {
@@ -1667,7 +2033,19 @@ impl<'a, R: Remote> Engine<'a, R> {
             errors: result.errors.len(),
             tracked,
         });
-        Ok(result)
+
+        // Immediate sub-folders to descend into on a streaming walk: dirs present
+        // on either side after the reconcile, minus any deleted this run.
+        let deleted: HashSet<&String> = deleted_dirs.iter().collect();
+        let mut children: Vec<String> = local_direct
+            .iter()
+            .chain(remote_direct.iter())
+            .filter(|(k, e)| e.is_dir && !deleted.contains(k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        children.sort();
+        children.dedup();
+        Ok((result, children))
     }
 }
 

@@ -134,9 +134,11 @@ folders live and aims the work at where the activity actually is:
   active ("hot") folders, then everything else.
 - A full walk of both trees is the safety net that catches remote-side changes
   (edits made on your other devices, which the CLI only reveals by re-walking).
-  It is paced to how long a walk actually takes, roughly six times its own
-  duration, so a large tree is not re-walked constantly. Remote-only changes
-  therefore appear on the next hot or full pass, not instantly.
+  It **streams**: it reconciles and transfers folder-by-folder as it walks, so a
+  large tree starts syncing right away instead of after a full scan. It is paced
+  to how long a walk actually takes, roughly six times its own duration, so a
+  large tree is not re-walked constantly. Remote-only changes therefore appear on
+  the next hot or full pass, not instantly.
 
 When the background tray daemon is doing the work, an open window mirrors its
 live state, so scanning and per-file transfers show up in Activity in real time.

@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Neutron Sync
-GenericName=File Synchronizer
+Name=NeutronSync
+GenericName=Proton Drive sync
 Comment=Bidirectional Proton Drive folder sync
-Exec=neutronsync-gui
-Icon=folder-remote
+Exec=neutronsync-gui %U
+Icon=neutronsync
 Terminal=false
-Categories=Utility;Network;FileTransfer;
+Categories=Network;FileTransfer;
 Keywords=proton;drive;sync;backup;cloud;
+StartupWMClass=neutronsync

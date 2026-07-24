@@ -88,10 +88,21 @@ one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configure
 about every 90 minutes; small, active folders stay fresh in between through the
 shallow and hot syncs.
 
-The remote scan itself is concurrent: a pool of workers (`scan_threads`, auto =
-CPU cores clamped to 2..8) lists folders in parallel, each with its own cache dir.
-The reconcile/apply loop is single-threaded so two syncs of the same pair never
-overlap; downloads run through a small concurrent pool.
+The full walk **streams**: rather than scan the whole tree and only then apply,
+it walks folder-by-folder (a concurrent breadth-first walk, `run_sync_streaming`)
+and reconciles each folder as it is discovered, transferring immediately. So
+uploads and downloads overlap the walk instead of waiting for a full scan. Each
+folder is handled by the same shallow, direct-children primitive
+(`sync_pair_shallow_with_base`), and the walk descends into the child folders
+that reconcile reports (skipping any it just deleted or that are excluded).
+
+Concurrency is a pool of workers (`scan_threads`, auto = CPU cores clamped to
+2..8), each with its own Engine and cache dir. They share one read-only baseline
+snapshot and commit disjoint rows (SQLite serialises the writes), and the
+breadth-first, level-by-level structure means a parent folder is always created
+before its children are processed. A sequential reference implementation
+(`Engine::sync_pair_streaming`) is the tested oracle for the walk's semantics; an
+equivalence test asserts it reaches the same end state as the batch walk.
 
 ## Data-safety invariants
 

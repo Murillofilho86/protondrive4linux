@@ -14,7 +14,7 @@ use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
 use neutronsync::models::{Compare, Entry};
-use neutronsync::protoncli::Remote;
+use neutronsync::protoncli::{ListOutcome, Remote};
 
 // --- in-memory fake remote --------------------------------------------------
 #[derive(Default)]
@@ -23,6 +23,7 @@ struct Store {
     dirs: BTreeSet<String>,
     moves: usize,                  // count of rename/move calls
     fail_dir: Option<String>,      // absolute path whose listing should error
+    notfound_dir: Option<String>,  // absolute path whose probe reports NotFound
     fail_download: Option<String>, // absolute file path whose download should error
     fail_upload: Option<String>,   // absolute file path whose upload should error
 }
@@ -45,6 +46,13 @@ fn basename(p: &str) -> String {
 }
 
 impl Remote for FakeRemote {
+    fn list_dir_probe(&self, remote_path: &str) -> anyhow::Result<ListOutcome> {
+        if self.store.borrow().notfound_dir.as_deref() == Some(remote_path.trim_end_matches('/')) {
+            return Ok(ListOutcome::NotFound);
+        }
+        Ok(ListOutcome::Listed(self.list_dir(remote_path)?))
+    }
+
     fn list_dir(&self, remote_path: &str) -> anyhow::Result<Vec<Entry>> {
         let prefix = format!("{}/", remote_path.trim_end_matches('/'));
         let s = self.store.borrow();
@@ -1027,5 +1035,401 @@ fn shallow_sync_reconciles_only_direct_children() {
         remote.get("/my-files/docs/A/file1.txt").map(String::as_str),
         Some("one"),
         "unchanged direct file stays"
+    );
+}
+
+// ---- streaming full walk -------------------------------------------------
+
+// Run the sequential streaming walk (the tested reference for run_sync_streaming).
+fn run_streaming(cfg: &Config, remote: FakeRemote) {
+    let log = Logger::silent();
+    let mut eng = Engine::new(cfg, remote, &log, false);
+    eng.sync_pair_streaming(&cfg.pairs[0]).unwrap();
+}
+
+// Seed a remote directory + a file under /my-files/docs/<rel>.
+fn seed_remote_file(store: &Rc<RefCell<Store>>, rel: &str, body: &str) {
+    let mut s = store.borrow_mut();
+    // ensure every ancestor dir exists
+    let full = format!("/my-files/docs/{rel}");
+    let parent = &full[..full.rfind('/').unwrap()];
+    let mut acc = String::from("/my-files");
+    for comp in parent.trim_start_matches("/my-files/").split('/') {
+        if comp.is_empty() {
+            continue;
+        }
+        acc.push('/');
+        acc.push_str(comp);
+        s.dirs.insert(acc.clone());
+    }
+    s.files.insert(full, body.as_bytes().to_vec());
+}
+
+#[test]
+fn streaming_downloads_full_remote_tree() {
+    // Empty local, a nested remote tree -> streaming downloads every file at
+    // every depth, creating the intermediate folders.
+    let t = Tmp::new("stream-dl");
+    let c = cfg(t.path());
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    seed_remote_file(&store, "top.txt", "T");
+    seed_remote_file(&store, "A/a.txt", "A");
+    seed_remote_file(&store, "A/B/deep.txt", "D");
+    seed_remote_file(&store, "A/B/C/deeper.txt", "DD");
+
+    run_streaming(&c, fake);
+
+    for (rel, body) in [
+        ("top.txt", "T"),
+        ("A/a.txt", "A"),
+        ("A/B/deep.txt", "D"),
+        ("A/B/C/deeper.txt", "DD"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("local").join(rel)).ok(),
+            Some(body.to_string()),
+            "streaming must download {rel} (walking into every subfolder)"
+        );
+    }
+}
+
+#[test]
+fn streaming_uploads_full_local_tree() {
+    // A nested local tree, empty remote -> streaming uploads every file.
+    let t = Tmp::new("stream-up");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/top.txt"), "T");
+    write(&t.path().join("local/A/a.txt"), "A");
+    write(&t.path().join("local/A/B/deep.txt"), "D");
+    write(&t.path().join("local/A/B/C/deeper.txt"), "DD");
+
+    run_streaming(&c, fake);
+
+    let remote = remote_files(&store);
+    for (rel, body) in [
+        ("top.txt", "T"),
+        ("A/a.txt", "A"),
+        ("A/B/deep.txt", "D"),
+        ("A/B/C/deeper.txt", "DD"),
+    ] {
+        assert_eq!(
+            remote
+                .get(&format!("/my-files/docs/{rel}"))
+                .map(String::as_str),
+            Some(body),
+            "streaming must upload {rel}"
+        );
+    }
+}
+
+#[test]
+fn streaming_is_idempotent() {
+    // A second streaming run over an already-synced tree does nothing.
+    let t = Tmp::new("stream-idem");
+    let c = cfg(t.path());
+    write(&t.path().join("local/A/a.txt"), "A");
+    write(&t.path().join("local/A/B/deep.txt"), "D");
+    let (fake, store) = FakeRemote::new();
+    run_streaming(&c, fake); // first run uploads
+
+    let before = remote_files(&store);
+    let (fake2, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, fake2, &log, false);
+    let r = eng.sync_pair_streaming(&c.pairs[0]).unwrap();
+    assert_eq!(r.applied, 0, "second streaming run must be a no-op");
+    assert_eq!(
+        before,
+        remote_files(&store),
+        "remote unchanged on the second run"
+    );
+}
+
+#[test]
+fn streaming_propagates_nested_delete() {
+    // With deletes on, removing a nested local file trashes the remote copy;
+    // untouched siblings survive.
+    let t = Tmp::new("stream-del");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/keep.txt"), "K");
+    write(&t.path().join("local/A/gone.txt"), "G");
+    run_streaming(&c, fake); // both on remote + baseline
+
+    std::fs::remove_file(t.path().join("local/A/gone.txt")).unwrap();
+    let (fake2, _s) = reuse(&store);
+    run_streaming(&c, fake2);
+
+    let remote = remote_files(&store);
+    assert!(
+        !remote.contains_key("/my-files/docs/A/gone.txt"),
+        "deleted nested file must be trashed on the remote"
+    );
+    assert_eq!(
+        remote.get("/my-files/docs/A/keep.txt").map(String::as_str),
+        Some("K"),
+        "sibling must survive"
+    );
+}
+
+#[test]
+fn streaming_respects_excludes() {
+    // An excluded subtree is never walked or downloaded.
+    let t = Tmp::new("stream-excl");
+    let mut c = cfg(t.path());
+    c.pairs[0].exclude = vec!["Secret".into()];
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    let (fake, store) = FakeRemote::new();
+    seed_remote_file(&store, "Public/ok.txt", "OK");
+    seed_remote_file(&store, "Secret/private.txt", "NO");
+
+    run_streaming(&c, fake);
+
+    assert!(
+        t.path().join("local/Public/ok.txt").exists(),
+        "non-excluded file downloads"
+    );
+    assert!(
+        !t.path().join("local/Secret").exists(),
+        "excluded subtree must not be walked or created"
+    );
+}
+
+#[test]
+fn streaming_matches_batch_walk() {
+    // Equivalence: the streaming walk reaches the SAME end state as the batch
+    // full walk for a mixed tree (local-only, remote-only, identical-both).
+    let scenario = |root: &std::path::Path, store: &Rc<RefCell<Store>>| {
+        write(&root.join("local/both.txt"), "same");
+        write(&root.join("local/L/localonly.txt"), "L");
+        seed_remote_file(store, "both.txt", "same");
+        seed_remote_file(store, "R/remoteonly.txt", "R");
+    };
+
+    // Batch.
+    let tb = Tmp::new("equiv-batch");
+    let cb = cfg(tb.path());
+    let (fb, sb) = FakeRemote::new();
+    scenario(tb.path(), &sb);
+    run(&cb, fb, false);
+
+    // Streaming.
+    let ts = Tmp::new("equiv-stream");
+    let cs = cfg(ts.path());
+    let (fs, ss) = FakeRemote::new();
+    scenario(ts.path(), &ss);
+    run_streaming(&cs, fs);
+
+    // Same remote file set + contents.
+    assert_eq!(
+        remote_files(&sb),
+        remote_files(&ss),
+        "streaming and batch must produce the same remote state"
+    );
+    // Same local file set.
+    let local_set = |root: &std::path::Path| -> std::collections::BTreeMap<String, String> {
+        walkdir::WalkDir::new(root.join("local"))
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(root.join("local"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (rel, std::fs::read_to_string(e.path()).unwrap())
+            })
+            .collect()
+    };
+    assert_eq!(
+        local_set(tb.path()),
+        local_set(ts.path()),
+        "streaming and batch must produce the same local state"
+    );
+}
+
+#[test]
+fn shallow_root_reconciles_top_level_only() {
+    // A shallow sync of the root ("") handles top-level entries only, not deep
+    // ones — deep files stay for their own folder's reconcile.
+    let t = Tmp::new("shallow-root");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/toplevel.txt"), "T");
+    write(&t.path().join("local/Sub/deep.txt"), "D");
+
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.sync_pair_shallow(&c.pairs[0], "").unwrap();
+    }
+    let _ = fake; // original fake unused; we drove via reuse
+    let remote = remote_files(&store);
+    assert_eq!(
+        remote
+            .get("/my-files/docs/toplevel.txt")
+            .map(String::as_str),
+        Some("T"),
+        "top-level file uploads on a root shallow sync"
+    );
+    assert!(
+        !remote.contains_key("/my-files/docs/Sub/deep.txt"),
+        "deep file is NOT handled by a root shallow sync (its own folder does it)"
+    );
+}
+
+#[test]
+fn streaming_keeps_both_on_conflict() {
+    // Both sides have the same path with different content -> keep-both, and the
+    // streaming walk must not silently overwrite either.
+    let t = Tmp::new("stream-conflict");
+    let c = cfg(t.path()); // default conflict = keep-both
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/x.txt"), "LOCAL");
+    seed_remote_file(&store, "A/x.txt", "REMOTE");
+
+    let (f, _s) = reuse(&store);
+    run_streaming(&c, f);
+    let _ = fake;
+
+    let remote = remote_files(&store);
+    // The original name holds the remote copy; a conflict copy holds local.
+    assert_eq!(
+        remote.get("/my-files/docs/A/x.txt").map(String::as_str),
+        Some("REMOTE"),
+        "remote copy preserved under the original name"
+    );
+    let has_conflict_copy = remote
+        .keys()
+        .any(|k| k.starts_with("/my-files/docs/A/x") && k.contains("conflict"));
+    assert!(
+        has_conflict_copy,
+        "local copy preserved as a keep-both conflict file; remote keys: {:?}",
+        remote.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn shallow_remote_list_failure_suppresses_delete() {
+    // If a folder's remote listing fails, a locally-missing file must NOT be
+    // trashed on the remote (never act on a blind listing).
+    let t = Tmp::new("shallow-failsafe");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/keep.txt"), "K");
+    write(&t.path().join("local/A/gone.txt"), "G");
+    run(&c, fake, false); // both on remote + baseline
+
+    std::fs::remove_file(t.path().join("local/A/gone.txt")).unwrap();
+    store.borrow_mut().fail_dir = Some("/my-files/docs/A".into());
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.sync_pair_shallow(&c.pairs[0], "A").unwrap();
+    }
+    let remote = remote_files(&store);
+    assert!(
+        remote.contains_key("/my-files/docs/A/gone.txt"),
+        "a failed remote listing must not trash the locally-missing file"
+    );
+    assert!(
+        remote.contains_key("/my-files/docs/A/keep.txt"),
+        "and must not trash the surviving file either"
+    );
+}
+
+// ---- regressions for the streaming/shallow data-safety review ------------
+
+#[test]
+fn shallow_local_read_dir_failure_suppresses_delete() {
+    // If the local read_dir of the folder fails (here the path is a FILE, not a
+    // dir), the reconcile must NOT read it as "all children deleted" and trash
+    // the remote copies. Regression for a swallowed local read_dir error.
+    let t = Tmp::new("shallow-localfail");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/keep.txt"), "K");
+    run(&c, fake, false); // A/keep.txt on remote + baseline
+
+    // Replace local folder A with a FILE named A -> read_dir(local/A) errors.
+    std::fs::remove_dir_all(t.path().join("local/A")).unwrap();
+    write(&t.path().join("local/A"), "now a file");
+
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        let _ = eng.sync_pair_shallow(&c.pairs[0], "A");
+    }
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/A/keep.txt"),
+        "a failed local read_dir must not trash the remote copies"
+    );
+}
+
+#[test]
+fn shallow_cancelled_dir_delete_keeps_descendant_baseline() {
+    // A directory delete that is CANCELLED (never executed) must not purge the
+    // folder's descendant baseline rows. Regression: the descendant purge used
+    // to fire on a merely-planned (not confirmed) delete.
+    let t = Tmp::new("shallow-canceldel");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/sub/y.txt"), "Y");
+    run(&c, fake, false); // baseline: A, A/sub, A/sub/y.txt
+
+    std::fs::remove_dir_all(t.path().join("local/A")).unwrap();
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let cancel = AtomicBool::new(true); // pre-cancelled: no op runs
+        let mut eng = Engine::new(&c, f, &log, false);
+        eng.set_observer(None, Some(&cancel));
+        let _ = eng.sync_pair_shallow(&c.pairs[0], "");
+    }
+    let base = neutronsync::state::load_baseline(&c.state_dir, &c.pairs[0].name).unwrap();
+    assert!(
+        base.contains_key("A/sub/y.txt"),
+        "a cancelled dir-delete must leave descendant baseline rows intact"
+    );
+    assert!(
+        remote_files(&store).contains_key("/my-files/docs/A/sub/y.txt"),
+        "and must not have trashed the remote subtree"
+    );
+}
+
+#[test]
+fn shallow_remote_notfound_suppresses_delete() {
+    // A remote NotFound (a race, or a transient error misread as not-found) must
+    // not delete the still-present local children. Regression for NotFound
+    // collapsing to an empty listing without the delete-suppression guard.
+    let t = Tmp::new("shallow-notfound");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/x.txt"), "X");
+    run(&c, fake, false); // A/x.txt on both + baseline
+
+    store.borrow_mut().notfound_dir = Some("/my-files/docs/A".into());
+    {
+        let (f, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, f, &log, false);
+        let _ = eng.sync_pair_shallow(&c.pairs[0], "A");
+    }
+    assert!(
+        t.path().join("local/A/x.txt").exists(),
+        "a remote NotFound must not delete the still-present local file"
     );
 }

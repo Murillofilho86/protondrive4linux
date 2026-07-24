@@ -1,6 +1,6 @@
 [package]
 name = "neutronsync"
-version = "0.1.1"
+version = "0.2.1"
 edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"
@@ -83,6 +83,7 @@ assets = [
     ["target/release/neutronsync", "usr/bin/", "755"],
     ["target/release/neutronsync-gui", "usr/bin/", "755"],
     ["packaging/neutronsync-gui.desktop", "usr/share/applications/", "644"],
+    ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/neutronsync.png", "644"],
     ["systemd/neutronsync-watch.service", "usr/lib/systemd/user/", "644"],
     ["systemd/neutronsync.service", "usr/lib/systemd/user/", "644"],
     ["systemd/neutronsync.timer", "usr/lib/systemd/user/", "644"],
@@ -95,6 +96,7 @@ assets = [
     { source = "target/release/neutronsync", dest = "/usr/bin/neutronsync", mode = "755" },
     { source = "target/release/neutronsync-gui", dest = "/usr/bin/neutronsync-gui", mode = "755" },
     { source = "packaging/neutronsync-gui.desktop", dest = "/usr/share/applications/neutronsync-gui.desktop", mode = "644" },
+    { source = "assets/logo.png", dest = "/usr/share/icons/hicolor/256x256/apps/neutronsync.png", mode = "644" },
     { source = "systemd/neutronsync-watch.service", dest = "/usr/lib/systemd/user/neutronsync-watch.service", mode = "644" },
     { source = "systemd/neutronsync.service", dest = "/usr/lib/systemd/user/neutronsync.service", mode = "644" },
     { source = "systemd/neutronsync.timer", dest = "/usr/lib/systemd/user/neutronsync.timer", mode = "644" },

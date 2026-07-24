@@ -2350,10 +2350,15 @@ fn ensure_desktop_integration() {
     let desktop = format!(
         "[Desktop Entry]\nType=Application\nName=NeutronSync\nGenericName=Proton Drive sync\nComment=Bidirectional Proton Drive folder sync\nExec=\"{exe}\" %U\nIcon=neutronsync\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=neutronsync\n"
     );
+    // Write to the SAME basename the package ships, so this user copy SHADOWS
+    // the packaged one (one launcher entry) rather than adding a second.
     write_if_changed(
-        &data.join("applications/neutronsync.desktop"),
+        &data.join("applications/neutronsync-gui.desktop"),
         desktop.as_bytes(),
     );
+    // Remove the legacy duplicate from older builds (a different basename showed
+    // up as a second "NeutronSync" entry alongside the packaged one).
+    let _ = std::fs::remove_file(data.join("applications/neutronsync.desktop"));
 }
 
 /// Path of the XDG autostart entry for launch-at-login.

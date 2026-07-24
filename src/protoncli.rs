@@ -31,6 +31,17 @@ use crate::models::{DownloadJob, Entry, TreeScan};
 /// The remote operations the engine needs. A fake implements this in tests.
 pub trait Remote {
     fn list_dir(&self, remote_path: &str) -> Result<Vec<Entry>>;
+
+    /// Like [`list_dir`] but distinguishes a genuine "not found" from an empty
+    /// listing (a transport error is still `Err`). The default treats every
+    /// successful listing as `Listed` — backends with no not-found signal never
+    /// report `NotFound`. `ProtonCli` overrides it. Callers that would delete on
+    /// the strength of an empty listing should use this and suppress deletes on
+    /// `NotFound`, so a misclassified transient error can't drive a deletion.
+    fn list_dir_probe(&self, remote_path: &str) -> Result<ListOutcome> {
+        Ok(ListOutcome::Listed(self.list_dir(remote_path)?))
+    }
+
     fn create_folder(&self, parent: &str, name: &str) -> Result<()>;
     fn upload(&self, local_path: &str, remote_parent: &str) -> Result<()>;
     fn download(&self, remote_path: &str, local_dest: &str) -> Result<()>;
@@ -147,7 +158,7 @@ impl Drop for ProtonCli {
 /// Outcome of listing one remote directory: either it listed (possibly empty)
 /// or the CLI reported it as not found — distinct from a transport error, which
 /// is returned as `Err` so it can be retried/treated as a partial scan.
-enum ListOutcome {
+pub enum ListOutcome {
     Listed(Vec<Entry>),
     NotFound,
 }
@@ -248,7 +259,7 @@ impl ProtonCli {
     /// concurrent scanner so parallel CLI processes don't share one cache). A
     /// missing folder lists as empty — a not-yet-created folder is normal here.
     fn list_dir_cached(&self, remote_path: &str, cache: Option<&Path>) -> Result<Vec<Entry>> {
-        match self.list_dir_probe(remote_path, cache)? {
+        match self.probe_dir(remote_path, cache)? {
             ListOutcome::Listed(entries) => Ok(entries),
             ListOutcome::NotFound => Ok(Vec::new()),
         }
@@ -256,8 +267,9 @@ impl ProtonCli {
 
     /// Like [`list_dir_cached`] but distinguishes a genuine "not found" from an
     /// empty listing (both collapse to an empty vec in `list_dir_cached`). Real
-    /// transport failures are returned as `Err` so callers can retry.
-    fn list_dir_probe(&self, remote_path: &str, cache: Option<&Path>) -> Result<ListOutcome> {
+    /// transport failures are returned as `Err` so callers can retry. (Inherent,
+    /// cache-aware; the `Remote::list_dir_probe` trait method wraps it.)
+    fn probe_dir(&self, remote_path: &str, cache: Option<&Path>) -> Result<ListOutcome> {
         let (ok, out, err) =
             self.run_with(&["filesystem", "list", "-j", "--", remote_path], cache)?;
         if !ok {
@@ -383,6 +395,10 @@ impl Remote for ProtonCli {
         self.list_dir_cached(remote_path, None)
     }
 
+    fn list_dir_probe(&self, remote_path: &str) -> Result<ListOutcome> {
+        self.probe_dir(remote_path, None)
+    }
+
     /// Concurrent breadth-first tree walk. The CLI has no recursive list, so we
     /// spawn `scan_threads` workers that list folders in parallel, each with its
     /// own throwaway cache dir (parallel CLI processes must not share a cache).
@@ -424,7 +440,7 @@ impl Remote for ProtonCli {
                             // folder.
                             let mut attempt = 0u32;
                             let listed = loop {
-                                match self.list_dir_probe(&here, cache.as_deref()) {
+                                match self.probe_dir(&here, cache.as_deref()) {
                                     Ok(ListOutcome::Listed(entries)) => break Some(entries),
                                     // The pair's remote base folder itself is not
                                     // found. On a first sync that just means an
