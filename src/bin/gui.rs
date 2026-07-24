@@ -1639,6 +1639,34 @@ impl App {
 
         ui.add_space(20.0);
         ui.label(
+            RichText::new("HOW IT WORKS")
+                .font(FontId::new(11.0, ff_bold()))
+                .color(ACCENT),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "NeutronSync is an independent, unofficial tool with no access to your \
+                 Proton account. It simply drives Proton's official proton-drive CLI, which \
+                 you sign in yourself. Your password and Proton credentials are never seen, \
+                 stored, or sent by NeutronSync — the CLI keeps your session in your OS \
+                 keyring, and all encryption and decryption is done by Proton's own software.",
+            )
+            .size(12.5)
+            .color(DIM),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Not affiliated with, endorsed by, or sponsored by Proton AG. \"Proton\" and \
+                 \"Proton Drive\" are trademarks of Proton AG.",
+            )
+            .size(11.5)
+            .color(DIM2),
+        );
+
+        ui.add_space(20.0);
+        ui.label(
             RichText::new("UPDATES")
                 .font(FontId::new(11.0, ff_bold()))
                 .color(ACCENT),
@@ -1735,11 +1763,23 @@ impl App {
             ui.label(RichText::new(if found { "Sign in to Proton Drive" } else { "proton-drive not found" }).font(FontId::new(20.0, ff_bold())).color(TEXT));
             ui.add_space(8.0);
             let sub = if found {
-                "Connect neutronsync to your Proton account. Login opens in your browser."
+                "Log in signs the official proton-drive CLI into your Proton account, \
+                 in your browser. NeutronSync never sees your password or credentials."
             } else {
                 "Install the official proton-drive CLI and make sure it's on your PATH, then refresh."
             };
             ui.label(RichText::new(sub).size(13.0).color(DIM));
+            if found {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "NeutronSync just drives Proton's own CLI — your Proton login \
+                         stays strictly between you and Proton.",
+                    )
+                    .size(11.5)
+                    .color(DIM2),
+                );
+            }
             ui.add_space(22.0);
             let waiting = self.login_poll_until.is_some();
             ui.horizontal(|ui| {
