@@ -7,6 +7,47 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-24
+
+### Fixed
+- Data loss on an interrupted sync. A run that was cancelled (or killed) before
+  its transfers ran used to record the not-yet-transferred files in the baseline
+  as if they were synced. The next run then saw those files missing locally and
+  propagated a deletion of the remote copy. The baseline is now committed by
+  positive confirmation: a file is recorded only after its transfer actually
+  completes, so a failed or cancelled operation leaves the previous state intact
+  and is simply retried next run, never mistaken for a deletion.
+- Excluded folders were still walked during the scan (and only skipped later).
+  They are now pruned from the scan itself, on both the remote tree walk and the
+  local walk, so an excluded sub-tree is never listed, descended, or stat-walked.
+
+### Added
+- Sub-folder-scoped sync. A local change now syncs only the folder it happened
+  in, not the whole pair; the engine can scan/reconcile/commit a single sub-tree
+  (never seeing anything outside it, so it can't be mistaken for a deletion).
+- Live activity across processes. The background tray daemon publishes its state,
+  so an open GUI window shows what the daemon is doing (scanning, syncing,
+  per-file operations) in real time instead of appearing idle.
+- CLI syncs are recorded to the activity feed. Any `neutronsync sync` now writes
+  its operations to the same store the GUI reads, so a sync run from the command
+  line shows up in the GUI's Activity view (previously only GUI- and
+  tray-daemon-initiated syncs appeared there).
+
+### Changed
+- Watch scheduling, prioritized and cheap. A local change triggers a **shallow**
+  reconcile of just the folder whose direct contents changed (files merged,
+  immediate sub-folders created/removed but not descended into) — deeper changes
+  arrive as their own watch events, so touching a file never re-walks a subtree.
+  On startup, folders with fresh local changes sync first, then recently-active
+  ("hot") folders, then the full walk. The full walk is paced to how long a walk
+  actually takes (about six times its duration, floored at `poll_interval`), so a
+  large tree is not re-walked constantly while small/active folders stay fresh.
+- The watch daemon reloads the config file at the start of each reconcile, so
+  exclusion and setting changes take effect without restarting it.
+- Tray "Quit" now closes the open window as well as the background daemon, giving
+  one clean exit. Closing the window still leaves the tray syncing in the
+  background.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

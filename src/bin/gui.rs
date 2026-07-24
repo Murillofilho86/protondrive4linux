@@ -429,6 +429,24 @@ fn spawn_daemon() {
     let _ = std::process::Command::new(self_exe()).arg("--tray").spawn();
 }
 
+/// Terminate the open GUI window process, if any. Used by the tray "Quit" so a
+/// full quit closes the window too — not just the daemon — giving one coherent
+/// exit path (closing the window alone still leaves the tray syncing). A killed
+/// window can't corrupt state: the baseline is only committed at the end of a
+/// completed sync, so an aborted transfer is simply retried next run.
+fn terminate_window(state_dir: &std::path::Path) {
+    let lock = state_dir.join(WINDOW_LOCK);
+    if let Ok(s) = std::fs::read_to_string(&lock) {
+        if let Ok(pid) = s.trim().parse::<u32>() {
+            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.to_string())
+                    .status();
+            }
+        }
+    }
+}
+
 /// State of the "Check for updates" flow, shared with the checker thread.
 enum UpdateState {
     Idle,
@@ -923,7 +941,29 @@ impl eframe::App for App {
             }
         }
 
-        let snap = self.ctrl.snapshot();
+        // In tray mode the background daemon owns the watcher/sync in a separate
+        // process, so this window's own controller is idle. Display the daemon's
+        // published live state instead (scanning, syncing, per-file ops), keeping
+        // this window's own account check. Falls back to our own state if the
+        // daemon hasn't published yet.
+        let snap = {
+            let mine = self.ctrl.snapshot();
+            if self.mode_daemon {
+                match Controller::read_status(&self.cfg.state_dir) {
+                    Some(mut pubd) => {
+                        pubd.account = mine.account;
+                        pubd
+                    }
+                    None => mine,
+                }
+            } else {
+                mine
+            }
+        };
+        // Keep polling the daemon's published state while a window is open.
+        if self.mode_daemon {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         if snap.account.checked && snap.account.signed_in {
             self.show_signin = false;
         }
@@ -1239,9 +1279,16 @@ impl App {
     fn page_activity(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         let busy = snap.busy;
         let watching = snap.watching;
+        // A scan or sync is running (possibly in the background daemon, whose
+        // published state sets a pair's phase without setting `busy`).
+        let scanning = snap.pairs.iter().any(|p| p.phase == Phase::Scanning);
+        let syncing = snap.pairs.iter().any(|p| p.phase == Phase::Syncing);
+        let active = busy || scanning || syncing;
         self.page_header(ui, "Activity", |ui, app| {
-            if busy {
-                if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
+            if active {
+                // Only the window's OWN sync can be cancelled from here; a
+                // background daemon run just shows as busy.
+                if busy && button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
                     app.ctrl.cancel();
                 }
             } else {
@@ -1256,18 +1303,23 @@ impl App {
             }
         });
 
-        // banner
-        let initializing = snap.pairs.iter().any(|p| {
+        // banner. Reflect the LIVE phase: a pair mid-scan or mid-sync shows a
+        // working banner even when `busy` is false (a background scan doesn't set
+        // busy) and even for an already-synced pair — otherwise an active rescan
+        // wrongly reads as the idle "watching" state.
+        let never_synced = snap.pairs.iter().any(|p| {
             matches!(p.phase, Phase::Scanning | Phase::Syncing) && p.last_synced.is_none()
         });
-        let (bcol, bicon, btitle, bsub) = if busy {
+        let (bcol, bicon, btitle, bsub) = if active {
             (
                 ACCENT,
                 Icon::Sync,
-                if initializing {
+                if never_synced {
                     "Initializing…"
-                } else {
+                } else if syncing || busy {
                     "Syncing…"
+                } else {
+                    "Scanning…"
                 },
                 current_op_line(snap),
             )
@@ -1902,13 +1954,15 @@ impl App {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "Proton's CLI has no \"recently changed\" feed, and rebuilding Proton's \
-                 whole SDK just to get one isn't worth it. So NeutronSync watches your \
-                 local folders for changes as they happen (a \"hot\" cache of recently \
-                 active folders it checks often) and does a periodic full rescan to catch \
-                 everything else, including edits made on your other devices (the CLI only \
-                 lets us see those by re-walking). That's why remote-side changes can take \
-                 until the next rescan to appear.",
+                "Proton's CLI has no \"recently changed\" feed, so NeutronSync watches your \
+                 local folders live and aims the work where the activity is. A local change \
+                 reconciles just the folder that changed (not the whole tree); deeper changes \
+                 arrive as their own events. On startup it syncs folders with fresh local \
+                 changes first, then recently active folders, then everything else. A full \
+                 walk of both sides is the safety net that catches edits made on your other \
+                 devices (the CLI only reveals those by re-walking); it is paced to how long \
+                 a walk takes, so a big tree is not re-walked constantly. Remote-side changes \
+                 therefore appear on the next pass, not instantly.",
             )
             .size(12.5)
             .color(DIM),
@@ -2950,6 +3004,8 @@ fn run_daemon() {
                     ctrl_cb.sync(names, false);
                 }
             } else if id == &quit_id {
+                // Full quit: close the window too (if open), then end the daemon.
+                terminate_window(&state_dir);
                 gtk::main_quit();
             }
         }
@@ -2978,6 +3034,11 @@ fn run_daemon() {
                 }
             }
         }
+
+        // Publish our live state so an open window can display what the daemon
+        // is doing (scanning, syncing, per-file ops) — the window has no other
+        // view into this separate process.
+        ctrl_cb.publish_status();
 
         gtk::glib::ControlFlow::Continue
     });

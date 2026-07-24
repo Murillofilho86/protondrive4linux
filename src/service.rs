@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{self, Config, Pair};
 use crate::datefmt::now_epoch;
 use crate::engine::run_sync_with;
@@ -23,7 +25,7 @@ use crate::watcher;
 
 const ACTIVITY_CAP: usize = 500;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Phase {
     Idle,
     Scanning,
@@ -32,7 +34,7 @@ pub enum Phase {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Progress {
     pub done: usize,
     pub total: usize,
@@ -49,7 +51,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairState {
     pub name: String,
     pub local: String,
@@ -80,7 +82,7 @@ impl PairState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountState {
     pub checked: bool,
     pub binary_found: bool,
@@ -90,7 +92,7 @@ pub struct AccountState {
     pub checking: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ActivityKind {
     Info,
     Sync,
@@ -98,7 +100,7 @@ pub enum ActivityKind {
 }
 
 /// A per-file operation, for rendering a rich activity table.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivityOp {
     pub action: String, // "upload" | "download" | "delete" | ...
     pub path: String,
@@ -106,7 +108,7 @@ pub struct ActivityOp {
     pub ok: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivityItem {
     pub ts: i64,
     pub kind: ActivityKind,
@@ -115,7 +117,7 @@ pub struct ActivityItem {
     pub op: Option<ActivityOp>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AppState {
     pub pairs: Vec<PairState>,
     pub account: AccountState,
@@ -392,6 +394,36 @@ impl Controller {
     /// A cheap clone of the current state - call this each frame.
     pub fn snapshot(&self) -> AppState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// Publish a compact live snapshot to `<state_dir>/status.json` so a
+    /// separate process (an open GUI window) can display what THIS process is
+    /// doing. Used by the headless tray daemon, which owns the watcher/sync
+    /// while a window is open: without this the window has no live view of the
+    /// daemon's work. Best-effort and atomic (write-temp-then-rename); the
+    /// activity feed is trimmed to keep the file small.
+    pub fn publish_status(&self) {
+        let mut snap = self.snapshot();
+        const KEEP: usize = 100;
+        if snap.activity.len() > KEEP {
+            let drop = snap.activity.len() - KEEP;
+            snap.activity.drain(0..drop);
+        }
+        let dir = self.cfg.lock().unwrap().state_dir.clone();
+        let path = dir.join("status.json");
+        let tmp = dir.join("status.json.tmp");
+        if let Ok(json) = serde_json::to_vec(&snap) {
+            if std::fs::write(&tmp, &json).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Read a live snapshot published by another process (see
+    /// [`Controller::publish_status`]). `None` if absent or unparsable.
+    pub fn read_status(state_dir: &Path) -> Option<AppState> {
+        let data = std::fs::read(state_dir.join("status.json")).ok()?;
+        serde_json::from_slice(&data).ok()
     }
 
     /// The current config (the frontend edits a copy, then `commit_config`).

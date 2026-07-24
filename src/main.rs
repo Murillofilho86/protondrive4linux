@@ -7,9 +7,36 @@ use clap::{Parser, Subcommand};
 
 use neutronsync::config::{self, Config};
 use neutronsync::engine::Engine;
+use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
 use neutronsync::protoncli::ProtonCli;
+use neutronsync::stats::Stats;
 use neutronsync::EXAMPLE_CONFIG;
+
+/// Records each finished op into `stats.db` so a CLI sync shows up in the same
+/// activity feed the GUI reads (the GUI restores the feed from this table).
+/// Best-effort: a DB error is ignored and never interrupts the sync. `Stats`
+/// wraps a `Mutex<Connection>`, so this is `Sync` and safe to share across the
+/// concurrent download workers.
+struct DbSink {
+    stats: Stats,
+}
+
+impl EventSink for DbSink {
+    fn emit(&self, ev: &SyncEvent) {
+        if let SyncEvent::OpFinished {
+            pair,
+            action,
+            path,
+            ok,
+        } = ev
+        {
+            let _ =
+                self.stats
+                    .record_op(pair, action, path, *ok, neutronsync::datefmt::now_epoch());
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -245,7 +272,20 @@ fn cmd_sync(
         log.info("DRY RUN - no changes will be made.\n");
     }
 
+    // Record ops into stats.db so this CLI sync appears in the GUI activity
+    // feed too (not just sync.log). Skipped on a dry run (nothing happened) and
+    // declared before the engine so its borrow outlives the observer.
+    let db_sink = if dry_run {
+        None
+    } else {
+        Stats::open(&cfg.state_dir)
+            .ok()
+            .map(|stats| DbSink { stats })
+    };
     let mut engine = Engine::new(&cfg, proton, &log, dry_run);
+    if let Some(sink) = &db_sink {
+        engine.set_observer(Some(sink as &dyn EventSink), None);
+    }
     let mut total_errors = 0usize;
     let mut summaries: Vec<(String, usize, usize, String)> = Vec::new();
     for pair in &selected {
@@ -266,6 +306,11 @@ fn cmd_sync(
                 log.error(&format!("pair {:?} failed: {e}", pair.name));
             }
         }
+    }
+
+    // Keep the activity-feed table bounded, same cap the GUI uses.
+    if let Some(sink) = &db_sink {
+        let _ = sink.stats.prune_ops(1000);
     }
 
     if json {

@@ -110,6 +110,156 @@ pub fn run_sync_with(
     }
 }
 
+/// Reconcile a single pair restricted to one sub-folder (`scope`, relative to
+/// the pair root). Used by the watch daemon so a local change or a hot folder
+/// syncs just that sub-tree instead of re-walking the whole pair.
+pub fn run_sync_scoped(
+    cfg: &Config,
+    pair: &Pair,
+    scope: &str,
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    cancel: Option<&AtomicBool>,
+) -> RunSummary {
+    let proton = ProtonCli::new(cfg);
+    if proton.resolve_binary().is_none() {
+        log.error("proton-drive not found on PATH");
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 0,
+        };
+    }
+    let mut engine = Engine::new(cfg, proton, log, false);
+    engine.set_observer(events, cancel);
+    match engine.sync_pair_scoped(pair, false, Some(scope)) {
+        Ok(r) => RunSummary {
+            applied: r.applied,
+            errors: r.errors.len(),
+            pairs: 1,
+        },
+        Err(e) => {
+            log.error(&format!("pair {:?} [{scope}] failed: {e}", pair.name));
+            if let Some(sink) = events {
+                sink.emit(&SyncEvent::Error {
+                    pair: Some(pair.name.clone()),
+                    text: e.to_string(),
+                });
+            }
+            RunSummary {
+                applied: 0,
+                errors: 1,
+                pairs: 1,
+            }
+        }
+    }
+}
+
+/// Folders (POSIX paths relative to the pair root) that hold a local file which
+/// is new or changed versus the baseline. Local-only and fast (no network), so
+/// the watcher can upload fresh local work first, before the slow remote walk.
+/// Excluded sub-trees are skipped. Comparison is size+mtime (conservative: a
+/// false positive just triggers a scoped sync that reconciles correctly).
+pub fn local_change_folders(cfg: &Config, pair: &Pair) -> Vec<String> {
+    let base = crate::state::load_baseline(&cfg.state_dir, &pair.name).unwrap_or_default();
+    let root = &pair.local;
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(
+            |e| match e.path().strip_prefix(root).ok().and_then(|p| p.to_str()) {
+                Some(r) => !pair.is_excluded(&r.replace('\\', "/")),
+                None => true,
+            },
+        )
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = match entry
+            .path()
+            .strip_prefix(root)
+            .ok()
+            .and_then(|p| p.to_str())
+        {
+            Some(r) => r.replace('\\', "/"),
+            None => continue,
+        };
+        let changed = match base.get(&rel) {
+            None => true, // new local file
+            Some(b) => {
+                let meta = entry.metadata().ok();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                b.size != size || b.mtime != mtime
+            }
+        };
+        if changed {
+            let folder = rel
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            folders.insert(folder);
+        }
+    }
+    folders.into_iter().collect()
+}
+
+/// Reconcile only the direct children of one folder in a pair (non-recursive).
+/// Used by the watch daemon for change-triggered and hot-folder syncs, so a
+/// local change touches just that folder's listing rather than re-walking its
+/// whole subtree (recursive inotify delivers deeper changes as their own events).
+pub fn run_sync_shallow(
+    cfg: &Config,
+    pair: &Pair,
+    folder: &str,
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    cancel: Option<&AtomicBool>,
+) -> RunSummary {
+    let proton = ProtonCli::new(cfg);
+    if proton.resolve_binary().is_none() {
+        log.error("proton-drive not found on PATH");
+        return RunSummary {
+            applied: 0,
+            errors: 1,
+            pairs: 0,
+        };
+    }
+    let mut engine = Engine::new(cfg, proton, log, false);
+    engine.set_observer(events, cancel);
+    match engine.sync_pair_shallow(pair, folder) {
+        Ok(r) => RunSummary {
+            applied: r.applied,
+            errors: r.errors.len(),
+            pairs: 1,
+        },
+        Err(e) => {
+            log.error(&format!("pair {:?} <{folder}> failed: {e}", pair.name));
+            if let Some(sink) = events {
+                sink.emit(&SyncEvent::Error {
+                    pair: Some(pair.name.clone()),
+                    text: e.to_string(),
+                });
+            }
+            RunSummary {
+                applied: 0,
+                errors: 1,
+                pairs: 1,
+            }
+        }
+    }
+}
+
 pub struct Engine<'a, R: Remote> {
     cfg: &'a Config,
     remote: R,
@@ -164,16 +314,37 @@ impl<'a, R: Remote> Engine<'a, R> {
         &self,
         root: &Path,
         baseline: &BTreeMap<String, Entry>,
+        pair: &Pair,
+        scope: Option<&str>,
     ) -> BTreeMap<String, Entry> {
         let mut out = BTreeMap::new();
         if !root.exists() {
             return out;
         }
+        // A scoped sync walks only `root/<scope>` but still yields paths relative
+        // to `root`, so keys line up with the baseline. A missing scoped folder
+        // returns empty (the union vs the scoped baseline then handles it).
+        let start = match scope {
+            Some(s) => root.join(s),
+            None => root.to_path_buf(),
+        };
+        if !start.exists() {
+            return out;
+        }
         let want_sha1 = self.cfg.compare == Compare::Sha1;
-        for entry in walkdir::WalkDir::new(root)
+        // Prune excluded subtrees from the walk itself (`filter_entry` stops
+        // descent), so an excluded folder is never even stat-walked locally —
+        // matching the remote scan and keeping excludes truly invisible.
+        for entry in walkdir::WalkDir::new(&start)
             .min_depth(1)
             .follow_links(false)
             .into_iter()
+            .filter_entry(
+                |e| match e.path().strip_prefix(root).ok().and_then(|p| p.to_str()) {
+                    Some(r) => !pair.is_excluded(&r.replace('\\', "/")),
+                    None => true,
+                },
+            )
             .filter_map(|e| e.ok())
         {
             let rel = match entry
@@ -253,12 +424,18 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// itself was not found (a vanished/moved base, distinct from an empty one).
     fn scan_remote(
         &self,
-        base: &str,
-        pair_name: &str,
+        pair: &Pair,
+        scope: Option<&str>,
     ) -> Result<(BTreeMap<String, Entry>, Vec<String>, bool)> {
         // The concurrent tree walk lives in the Remote impl; here we supply a
-        // progress sink (log line + structured ScanProgress) and flatten the
-        // (relpath, entry) pairs into a map.
+        // progress sink (log line + structured ScanProgress), an exclude
+        // predicate (so excluded subtrees are never walked), and flatten the
+        // (relpath, entry) pairs into a map. When `scope` is set we walk only
+        // that remote sub-folder, but re-prefix every result with the scope so
+        // keys stay relative to the pair root and line up with the baseline.
+        let scoped_base = scope.map(|s| remote_join(&pair.remote, s));
+        let base = scoped_base.as_deref().unwrap_or(pair.remote.as_str());
+        let pair_name = pair.name.as_str();
         let log = self.log;
         let events = self.events;
         let counter = AtomicUsize::new(0);
@@ -273,10 +450,21 @@ impl<'a, R: Remote> Engine<'a, R> {
                 });
             }
         };
-        let scan = self.remote.list_tree(base, &progress)?;
+        // `list_tree` yields paths relative to `base`; map them back to
+        // pair-root-relative before checking excludes and keying the map.
+        let full_rel = |under_base: &str| -> String {
+            match scope {
+                Some(s) => format!("{s}/{under_base}"),
+                None => under_base.to_string(),
+            }
+        };
+        let exclude = |rel: &str| pair.is_excluded(&full_rel(rel));
+        let scan = self.remote.list_tree(base, &exclude, &progress)?;
         let mut out = BTreeMap::new();
-        for (rel, e) in scan.entries {
-            out.insert(rel, e);
+        for (rel, mut e) in scan.entries {
+            let key = full_rel(&rel);
+            e.path = key.clone();
+            out.insert(key, e);
         }
         Ok((out, scan.failed, scan.root_missing))
     }
@@ -291,12 +479,25 @@ impl<'a, R: Remote> Engine<'a, R> {
         &self,
         pair: &Pair,
         resync: bool,
+        scope: Option<&str>,
     ) -> Result<(Plan, BTreeMap<String, Entry>, bool, HashSet<String>)> {
-        // Load the baseline first so the local scan can reuse cached hashes.
+        // Load the baseline first so the local scan can reuse cached hashes. For
+        // a scoped sync, restrict the baseline to rows strictly UNDER the scope
+        // so nothing outside it is ever seen as missing (and thus deleted) — the
+        // scan, reconcile and additive commit all stay within the sub-tree.
         let base: BTreeMap<String, Entry> = if resync {
             BTreeMap::new()
         } else {
-            crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?
+            let full = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+            match scope {
+                Some(s) => {
+                    let prefix = format!("{s}/");
+                    full.into_iter()
+                        .filter(|(k, _)| k.starts_with(&prefix))
+                        .collect()
+                }
+                None => full,
+            }
         };
         if base.is_empty() && !resync {
             self.log.info(&format!(
@@ -321,9 +522,8 @@ impl<'a, R: Remote> Engine<'a, R> {
             );
         }
 
-        let local = self.scan_local(&pair.local, &base);
-        let (remote, remote_failed, remote_root_missing) =
-            self.scan_remote(&pair.remote, &pair.name)?;
+        let local = self.scan_local(&pair.local, &base, pair, scope);
+        let (remote, remote_failed, remote_root_missing) = self.scan_remote(pair, scope)?;
         let mut incomplete = !remote_failed.is_empty();
         if incomplete {
             self.log.warn(&format!(
@@ -768,13 +968,30 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
         }
 
-        // Per-file bookkeeping for the additive commit. Files whose transfer
-        // FAILED this run are dropped from `new_base` below, so their baseline
-        // row is left exactly as it was (or stays absent for a brand-new file)
-        // and the file is simply retried next run — never recorded with
-        // half-finished state. Genuine deletes/renames drop their old rows.
-        let mut failed_up: HashSet<String> = HashSet::new();
-        let mut failed_down: HashSet<String> = HashSet::new();
+        // Per-file bookkeeping for the additive commit, by POSITIVE
+        // confirmation: a row that `decide()` added to `new_base` at plan time
+        // is provisional until its op actually completes. `pending` is every
+        // such op's path (deletes/no-ops add no row — deletes drop theirs via
+        // `deleted_ok` — so they're excluded); `done` collects the ones that
+        // succeed. Any pending row NOT in `done` at commit time — a FAILED
+        // transfer OR an op the run never reached because it was CANCELLED — is
+        // dropped, so its previous baseline row is left exactly as it was (or
+        // stays absent for a brand-new file) and it is re-detected and retried
+        // next run. This stops a partial/cancelled run from recording a
+        // never-transferred file as 'synced', which the next run would otherwise
+        // read as a deletion and propagate.
+        let pending: HashSet<String> = downloads
+            .iter()
+            .chain(rest.iter())
+            .filter(|o| {
+                !matches!(
+                    o.action,
+                    Action::DeleteRemote | Action::DeleteLocal | Action::Noop
+                )
+            })
+            .map(|o| o.path.clone())
+            .collect();
+        let mut done: HashSet<String> = HashSet::new();
         let mut deleted_ok: HashSet<String> = HashSet::new();
 
         for op in &rest {
@@ -814,14 +1031,14 @@ impl<'a, R: Remote> Engine<'a, R> {
                         }
                         _ => {}
                     }
+                    // Confirm this op's provisional baseline row (harmless for
+                    // deletes/no-ops, which aren't in `pending`).
+                    done.insert(op.path.clone());
                 }
                 Err(e) => {
                     let msg = format!("{} {}: {e}", op.action.label(), op.path);
                     self.log.error(&msg);
                     result.errors.push(msg);
-                    if op.action == Action::Upload {
-                        failed_up.insert(op.path.clone());
-                    }
                 }
             }
             self.emit(SyncEvent::OpFinished {
@@ -839,17 +1056,22 @@ impl<'a, R: Remote> Engine<'a, R> {
                     self.log.info(&op.describe());
                 }
             } else {
-                self.run_downloads(pair, &downloads, &new_base, &mut result, &mut failed_down);
+                self.run_downloads(pair, &downloads, &new_base, &mut result, &mut done);
             }
         }
 
-        // A failed transfer must not alter that file's recorded state: drop it
-        // from the prospective baseline so its previous row survives untouched
-        // (or stays absent for a brand-new file). Next run re-detects the change
-        // and retries it in the correct direction — a timeout on one file never
-        // invalidates the rest of the sync.
-        for rel in failed_up.iter().chain(failed_down.iter()) {
-            new_base.remove(rel);
+        // Positive-confirmation commit: a provisional row survives ONLY if its
+        // op completed this run. Drop every pending row not in `done` — a failed
+        // transfer OR an op skipped because the run was cancelled before reaching
+        // it — so its previous baseline row survives untouched (or stays absent
+        // for a brand-new file). Next run re-detects the change and retries it in
+        // the correct direction — a timeout or a cancel never invalidates the
+        // rest of the sync, and a never-transferred file is never recorded as
+        // synced (which the next run would read as a deletion).
+        for rel in &pending {
+            if !done.contains(rel) {
+                new_base.remove(rel);
+            }
         }
 
         // Additive per-file commit: only files that fully synced this run are
@@ -878,10 +1100,11 @@ impl<'a, R: Remote> Engine<'a, R> {
                     pair.name
                 ));
             }
-            let retrying = failed_down.len() + failed_up.len();
+            let retrying = pending.iter().filter(|r| !done.contains(*r)).count();
             if retrying > 0 {
                 self.log.warn(&format!(
-                    "{retrying} file(s) failed for {:?}; they retry next run.",
+                    "{retrying} file(s) not completed for {:?} (failed or cancelled); \
+                     they retry next run.",
                     pair.name
                 ));
             }
@@ -904,7 +1127,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         downloads: &[Op],
         new_base: &BTreeMap<String, Entry>,
         result: &mut SyncResult,
-        failed_down: &mut HashSet<String>,
+        done_down: &mut HashSet<String>,
     ) {
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for op in downloads {
@@ -937,7 +1160,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         let local_root = &pair.local;
         let applied = AtomicUsize::new(0);
         let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let failed_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let done_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let fallback = AtomicBool::new(false);
         let cancel_ref: &AtomicBool = self.cancel.unwrap_or(&fallback);
 
@@ -957,12 +1180,12 @@ impl<'a, R: Remote> Engine<'a, R> {
                 Ok(()) => {
                     applied.fetch_add(1, Ordering::Relaxed);
                     match_mtime(&local_root.join(&j.rel), j.mtime);
+                    done_rels.lock().unwrap().push(j.rel.clone());
                 }
                 Err(e) => {
                     let msg = format!("download {}: {e}", j.rel);
                     log.error(&msg);
                     errs.lock().unwrap().push(msg);
-                    failed_rels.lock().unwrap().push(j.rel.clone());
                 }
             }
             if let Some(s) = events {
@@ -985,7 +1208,7 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         result.applied += applied.load(Ordering::Relaxed);
         result.errors.extend(errs.into_inner().unwrap());
-        failed_down.extend(failed_rels.into_inner().unwrap());
+        done_down.extend(done_rels.into_inner().unwrap());
     }
 
     fn apply_op(
@@ -1140,17 +1363,38 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 
     // --- top-level ----------------------------------------------------------
+    /// Reconcile a whole pair (local tree <-> remote tree).
     pub fn sync_pair(&mut self, pair: &Pair, resync: bool) -> Result<SyncResult> {
+        self.sync_pair_scoped(pair, resync, None)
+    }
+
+    /// Reconcile a pair, optionally restricted to a single sub-folder (`scope`,
+    /// a POSIX path relative to the pair root). A scoped run scans, reconciles,
+    /// and commits only within that sub-tree, so a local change can be synced
+    /// for just its folder instead of re-walking the whole pair. Nothing outside
+    /// the scope is looked at, so it can never be seen as deleted.
+    pub fn sync_pair_scoped(
+        &mut self,
+        pair: &Pair,
+        resync: bool,
+        scope: Option<&str>,
+    ) -> Result<SyncResult> {
+        // An empty scope means the pair ROOT — i.e. the whole pair, not a
+        // sub-folder called "". Normalise it to None so paths aren't prefixed
+        // with a stray leading "/" (which would misclassify every entry and
+        // mass-recreate folders). A root-level file change thus does a full sync.
+        let scope = scope.filter(|s| !s.is_empty());
         self.log.info(&format!(
-            "=== pair {:?} : {} <-> {} ===",
+            "=== pair {:?}{} : {} <-> {} ===",
             pair.name,
+            scope.map(|s| format!(" [{s}]")).unwrap_or_default(),
             pair.local.display(),
             pair.remote
         ));
         self.emit(SyncEvent::PairStarted {
             pair: pair.name.clone(),
         });
-        let (mut plan, new_base, incomplete, prune_excluded) = self.plan(pair, resync)?;
+        let (mut plan, new_base, incomplete, prune_excluded) = self.plan(pair, resync, scope)?;
         if incomplete {
             // Safety: never delete or move based on a partial view of the remote.
             plan.ops.retain(|op| {
@@ -1182,6 +1426,241 @@ impl<'a, R: Remote> Engine<'a, R> {
         });
         let tracked = new_base.len();
         let result = self.apply(pair, plan, new_base, prune_excluded);
+        self.emit(SyncEvent::PairFinished {
+            pair: pair.name.clone(),
+            applied: result.applied,
+            errors: result.errors.len(),
+            tracked,
+        });
+        Ok(result)
+    }
+
+    /// Reconcile ONLY the direct children of `folder` (POSIX path relative to
+    /// the pair root; "" = the root). Non-recursive: files in `folder` merge
+    /// normally, and immediate sub-folders are created/removed but NOT descended
+    /// into. Deeper changes arrive as their own watch events (recursive inotify),
+    /// and remote-only changes are caught by the hot pass and the full walk — so
+    /// a local change touches just its folder's listing, never a whole subtree.
+    pub fn sync_pair_shallow(&mut self, pair: &Pair, folder: &str) -> Result<SyncResult> {
+        let folder = folder.trim_matches('/');
+        let label = if folder.is_empty() {
+            "(root)".to_string()
+        } else {
+            folder.to_string()
+        };
+        self.log
+            .info(&format!("=== pair {:?} <{label}> shallow ===", pair.name));
+        self.emit(SyncEvent::PairStarted {
+            pair: pair.name.clone(),
+        });
+        if !pair.local.exists() {
+            anyhow::bail!(
+                "local folder {} does not exist — refusing shallow sync",
+                pair.local.display()
+            );
+        }
+
+        let prefix = if folder.is_empty() {
+            String::new()
+        } else {
+            format!("{folder}/")
+        };
+        // Direct children only: a key is "<prefix><name>" with no further '/'.
+        let is_direct = |k: &str| match k.strip_prefix(&prefix) {
+            Some(rest) => !rest.is_empty() && !rest.contains('/'),
+            None => false,
+        };
+        let base_all = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let base_direct: BTreeMap<String, Entry> = base_all
+            .iter()
+            .filter(|(k, _)| is_direct(k) && !pair.is_excluded(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // LOCAL direct children (depth 1, no recursion).
+        let want_sha1 = self.cfg.compare == Compare::Sha1;
+        let dir_path = if folder.is_empty() {
+            pair.local.clone()
+        } else {
+            pair.local.join(folder)
+        };
+        let mut local_direct: BTreeMap<String, Entry> = BTreeMap::new();
+        if let Ok(rd) = std::fs::read_dir(&dir_path) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().replace('\\', "/");
+                let rel = format!("{prefix}{name}");
+                if pair.is_excluded(&rel) {
+                    continue;
+                }
+                let ft = match e.file_type() {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    local_direct.insert(
+                        rel.clone(),
+                        Entry {
+                            path: rel,
+                            is_dir: true,
+                            ..Default::default()
+                        },
+                    );
+                } else if ft.is_file() {
+                    let meta = e.metadata().ok();
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let mtime = meta
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    let sha1 = if want_sha1 {
+                        match base_direct.get(&rel) {
+                            Some(b)
+                                if !b.is_dir
+                                    && b.size == size
+                                    && b.mtime == mtime
+                                    && b.sha1.is_some() =>
+                            {
+                                b.sha1.clone()
+                            }
+                            _ => sha1_file(&e.path()),
+                        }
+                    } else {
+                        None
+                    };
+                    local_direct.insert(
+                        rel.clone(),
+                        Entry {
+                            path: rel,
+                            is_dir: false,
+                            size,
+                            mtime,
+                            sha1,
+                            remote_id: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        // REMOTE direct children (single non-recursive listing). A transport
+        // error means we can't see the folder — suppress deletes this run rather
+        // than act on a blind listing. (A genuinely absent folder lists empty.)
+        let remote_path = remote_join(&pair.remote, folder);
+        let (remote_direct, remote_failed) = match self.remote.list_dir(&remote_path) {
+            Ok(entries) => {
+                let mut m = BTreeMap::new();
+                for mut e in entries {
+                    let rel = format!("{prefix}{}", e.path);
+                    if pair.is_excluded(&rel) {
+                        continue;
+                    }
+                    e.path = rel.clone();
+                    m.insert(rel, e);
+                }
+                (m, false)
+            }
+            Err(err) => {
+                self.log.warn(&format!(
+                    "shallow: remote listing failed for {remote_path:?}: {err}; \
+                     syncing without deletions"
+                ));
+                (BTreeMap::new(), true)
+            }
+        };
+
+        let cmp = self.cfg.compare;
+        let ls = classify(&local_direct, &base_direct, cmp);
+        let rs = classify(&remote_direct, &base_direct, cmp);
+        let mut plan = Plan::default();
+        let mut new_base: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut keys: Vec<&String> = local_direct
+            .keys()
+            .chain(remote_direct.keys())
+            .chain(base_direct.keys())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for path in keys {
+            let lc = *ls.get(path).unwrap_or(&Change::Absent);
+            let rc = *rs.get(path).unwrap_or(&Change::Absent);
+            self.decide(
+                path,
+                lc,
+                rc,
+                local_direct.get(path),
+                remote_direct.get(path),
+                base_direct.get(path),
+                &mut plan,
+                &mut new_base,
+            );
+        }
+        if remote_failed {
+            plan.ops.retain(|op| {
+                !matches!(
+                    op.action,
+                    Action::DeleteRemote
+                        | Action::DeleteLocal
+                        | Action::RenameRemote
+                        | Action::RenameLocal
+                )
+            });
+        }
+        let prune_excluded: HashSet<String> = base_direct
+            .keys()
+            .filter(|k| pair.is_excluded(k))
+            .cloned()
+            .collect();
+
+        if plan.is_empty() {
+            self.log
+                .info(&format!("shallow <{label}>: already in sync."));
+        } else {
+            self.log
+                .info(&format!("shallow <{label}> plan: {}", plan.summary()));
+        }
+        self.emit(SyncEvent::Planned {
+            pair: pair.name.clone(),
+            total_ops: plan.actionable().count(),
+            counts: plan
+                .counts()
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        });
+
+        // A deleted direct sub-folder has descendants in the baseline that the
+        // apply's per-key commit won't touch; collect them for cleanup after.
+        let deleted_dirs: Vec<String> = plan
+            .ops
+            .iter()
+            .filter(|o| matches!(o.action, Action::DeleteRemote | Action::DeleteLocal) && o.is_dir)
+            .map(|o| o.path.clone())
+            .collect();
+
+        let tracked = new_base.len();
+        let result = self.apply(pair, plan, new_base, prune_excluded);
+
+        if !self.dry_run && !deleted_dirs.is_empty() {
+            let mut descendants: HashSet<String> = HashSet::new();
+            for d in &deleted_dirs {
+                let pfx = format!("{d}/");
+                for k in base_all.keys() {
+                    if k.starts_with(&pfx) {
+                        descendants.insert(k.clone());
+                    }
+                }
+            }
+            if !descendants.is_empty() {
+                let _ = crate::state::commit_baseline(
+                    &self.cfg.state_dir,
+                    &pair.name,
+                    &BTreeMap::new(),
+                    &descendants,
+                );
+            }
+        }
+
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
             applied: result.applied,

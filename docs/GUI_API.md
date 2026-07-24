@@ -88,3 +88,9 @@ so the UI doesn't flicker when you tweak options.
   us the tree size up front).
 - The watch daemon feeds the same state, so a running watch shows pairs cycling
   Scanning → Synced with activity entries, and `watching == true`.
+- In tray mode the daemon and the window are **separate processes**. The process
+  running the work calls `publish_status()` to write a live snapshot to
+  `status.json`; a window reads it with `Controller::read_status(state_dir)` and
+  renders that instead of its own idle state. This is why an open window reflects
+  what the background daemon is doing. A CLI `neutronsync sync` also records its
+  ops into the shared activity store, so those runs appear in the feed too.

@@ -123,11 +123,24 @@ deleted) independently per side. Combining the two verdicts decides the action
 and which side wins.
 
 **Detecting changes.** Proton's CLI has no "recently changed" feed, and
-rebuilding its SDK just to get one isn't worthwhile. So NeutronSync watches your
-local folders live (a "hot" cache of recently active folders it checks often)
-and does a periodic full rescan to catch everything else, including edits made
-on other devices, which the CLI only surfaces by re-walking. Remote-side changes
-therefore appear at the next rescan interval, not instantly.
+rebuilding its SDK to add one isn't worthwhile. So NeutronSync watches your local
+folders live and aims the work at where the activity actually is:
+
+- A local change reconciles only the folder whose direct contents changed (one
+  shallow folder listing), not the whole tree. Because the watch is recursive,
+  a change deeper down arrives as its own event and reconciles its own folder,
+  so editing one file never re-walks a subtree.
+- On startup it syncs folders with fresh local changes first, then recently
+  active ("hot") folders, then everything else.
+- A full walk of both trees is the safety net that catches remote-side changes
+  (edits made on your other devices, which the CLI only reveals by re-walking).
+  It is paced to how long a walk actually takes, roughly six times its own
+  duration, so a large tree is not re-walked constantly. Remote-only changes
+  therefore appear on the next hot or full pass, not instantly.
+
+When the background tray daemon is doing the work, an open window mirrors its
+live state, so scanning and per-file transfers show up in Activity in real time.
+The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 
 **Safety model.**
 
@@ -139,8 +152,11 @@ therefore appear at the next rescan interval, not instantly.
 - If a folder's local root is missing (an unmounted drive) or its remote base
   folder has vanished, the pair is refused for that run instead of being read
   as "everything was deleted".
-- A failed transfer never poisons the wider sync: only files that fully synced
-  advance the baseline; the rest are retried next run in the correct direction.
+- A failed or interrupted run never poisons the wider sync: the baseline records
+  a file only after its transfer actually completes, so a timeout, an error, or a
+  run cancelled part-way leaves every other file's state untouched and retries the
+  rest next run in the correct direction. This is what stops a half-finished run
+  from later mistaking a not-yet-downloaded file for a deletion.
 - Conflicts keep both copies by default (`name (conflict <timestamp>).ext`).
 
 ## Selective sync
@@ -222,8 +238,10 @@ private to your user.
 
 ## Known limitations
 
-- Remote-side changes are only noticed on the periodic rescan (the CLI has no
-  event feed).
+- Remote-side changes (edits on another device) are only noticed on a hot or
+  full pass, not instantly, because the CLI has no event feed and must re-walk.
+  Actively-changed local folders sync immediately; see
+  [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 - Default `compare = "size+mtime"` can miss an in-place edit that keeps the same
   size and mtime; use `compare = "sha1"` to compare content exactly.
 - Renames look like a delete + create.

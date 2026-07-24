@@ -43,10 +43,18 @@ pub trait Remote {
     }
 
     /// List an entire subtree. `progress` is called with each remote path as it
-    /// is listed. The default is a sequential recursive walk; ProtonCli overrides
-    /// it with a concurrent, retrying one. A folder that can't be listed is
-    /// recorded in `TreeScan::failed` and the walk continues (partial result).
-    fn list_tree(&self, base: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<TreeScan> {
+    /// is listed. `exclude` is called with each child's relative path; a subtree
+    /// it accepts is skipped entirely — never listed, never descended — so
+    /// excluded folders cost nothing and can't contaminate the scan. The default
+    /// is a sequential recursive walk; ProtonCli overrides it with a concurrent,
+    /// retrying one. A folder that can't be listed is recorded in
+    /// `TreeScan::failed` and the walk continues (partial result).
+    fn list_tree(
+        &self,
+        base: &str,
+        exclude: &(dyn Fn(&str) -> bool + Sync),
+        progress: &(dyn Fn(&str) + Sync),
+    ) -> Result<TreeScan> {
         let mut out = Vec::new();
         let mut failed = Vec::new();
         let mut stack = vec![String::new()];
@@ -66,6 +74,9 @@ pub trait Remote {
                 } else {
                     format!("{rel}/{}", e.path)
                 };
+                if exclude(&child_rel) {
+                    continue;
+                }
                 let is_dir = e.is_dir;
                 out.push((
                     child_rel.clone(),
@@ -375,7 +386,12 @@ impl Remote for ProtonCli {
     /// Concurrent breadth-first tree walk. The CLI has no recursive list, so we
     /// spawn `scan_threads` workers that list folders in parallel, each with its
     /// own throwaway cache dir (parallel CLI processes must not share a cache).
-    fn list_tree(&self, base: &str, progress: &(dyn Fn(&str) + Sync)) -> Result<TreeScan> {
+    fn list_tree(
+        &self,
+        base: &str,
+        exclude: &(dyn Fn(&str) -> bool + Sync),
+        progress: &(dyn Fn(&str) + Sync),
+    ) -> Result<TreeScan> {
         let threads = self.scan_threads();
         let out: Mutex<Vec<(String, Entry)>> = Mutex::new(Vec::new());
         // Folders that couldn't be listed even after retries. We keep walking the
@@ -442,6 +458,11 @@ impl Remote for ProtonCli {
                                         } else {
                                             format!("{rel}/{}", e.path)
                                         };
+                                        // Excluded subtree: never record it and
+                                        // never queue it for descent.
+                                        if exclude(&child_rel) {
+                                            continue;
+                                        }
                                         if e.is_dir {
                                             nx.push(child_rel.clone());
                                         }

@@ -809,3 +809,223 @@ fn reinclude_after_local_removal_redownloads_never_deletes_remote() {
         "re-include must never delete the remote copy"
     );
 }
+
+#[test]
+fn cancelled_run_does_not_record_untransferred_as_synced() {
+    // Data-loss regression. A run cancelled before its transfers run must NOT
+    // record the never-transferred files in the baseline. Otherwise the next
+    // run sees them in the baseline but absent locally and "propagates" a bogus
+    // remote deletion. With the positive-confirmation commit, a cancelled
+    // download leaves the baseline untouched, so the next run RE-DOWNLOADS it
+    // and the remote copy survives — even with propagate_deletes on.
+    let t = Tmp::new("cancel-dl");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+
+    let (fake, store) = FakeRemote::new();
+    run(&c, fake, false); // establish an empty baseline
+
+    // A new remote file appears after the baseline was taken.
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/report.txt".into(), b"payload".to_vec());
+
+    // Run 1: cancelled up front, so the planned download never executes.
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let cancel = AtomicBool::new(true);
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        eng.set_observer(None, Some(&cancel));
+        let _ = eng.sync_pair(&c.pairs[0], false);
+    }
+    assert!(
+        !t.path().join("local/report.txt").exists(),
+        "cancelled run should not have downloaded anything"
+    );
+    assert!(
+        store
+            .borrow()
+            .files
+            .contains_key("/my-files/docs/report.txt"),
+        "cancelled run must never trash the remote file"
+    );
+
+    // Run 2: not cancelled. The file must DOWNLOAD (be treated as new-remote),
+    // never mistaken for a local deletion and trashed.
+    {
+        let (fake3, _s) = reuse(&store);
+        run(&c, fake3, false);
+    }
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/report.txt")).unwrap(),
+        "payload",
+        "file must download on the recovery run, not be deleted"
+    );
+    assert!(
+        store
+            .borrow()
+            .files
+            .contains_key("/my-files/docs/report.txt"),
+        "remote file must still exist after the recovery run"
+    );
+}
+
+#[test]
+fn excluded_subtree_is_not_synced() {
+    // An excluded sub-path must be invisible to the engine: never downloaded,
+    // never created locally, never recorded — while its siblings sync normally.
+    let t = Tmp::new("excl-walk");
+    let mut c = cfg(t.path());
+    c.pairs[0].exclude = vec!["sub".into()];
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+
+    let (fake, store) = FakeRemote::new();
+    {
+        let mut s = store.borrow_mut();
+        s.dirs.insert("/my-files/docs".into());
+        s.dirs.insert("/my-files/docs/sub".into());
+        s.files
+            .insert("/my-files/docs/top.txt".into(), b"top".to_vec());
+        s.files
+            .insert("/my-files/docs/sub/inner.txt".into(), b"inner".to_vec());
+    }
+    run(&c, fake, false);
+
+    assert!(
+        t.path().join("local/top.txt").exists(),
+        "non-excluded file should download"
+    );
+    assert!(
+        !t.path().join("local/sub/inner.txt").exists(),
+        "excluded file must NOT download"
+    );
+    assert!(
+        !t.path().join("local/sub").exists(),
+        "excluded folder must not even be created locally"
+    );
+}
+
+#[test]
+fn scoped_sync_only_touches_its_subtree() {
+    // A scoped sync reconciles ONLY files under the scope. Anything outside it
+    // is never scanned, so even a file that has gone missing locally must not be
+    // seen as a deletion and trashed remotely — proving scope containment.
+    let t = Tmp::new("scoped");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/keep.txt"), "a1");
+    write(&t.path().join("local/B/other.txt"), "b1");
+    run(&c, fake, false); // full sync: A/keep.txt and B/other.txt on both sides
+
+    // Add a file in A, and delete B/other.txt locally.
+    write(&t.path().join("local/A/new.txt"), "a2");
+    std::fs::remove_file(t.path().join("local/B/other.txt")).unwrap();
+
+    // Sync ONLY sub-folder A.
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        eng.sync_pair_scoped(&c.pairs[0], false, Some("A")).unwrap();
+    }
+
+    let remote = remote_files(&store);
+    assert_eq!(
+        remote.get("/my-files/docs/A/new.txt").map(String::as_str),
+        Some("a2"),
+        "new file inside the scope must upload"
+    );
+    assert!(
+        remote.contains_key("/my-files/docs/B/other.txt"),
+        "file OUTSIDE the scope must be untouched even though it's gone locally"
+    );
+    assert_eq!(
+        remote.get("/my-files/docs/A/keep.txt").map(String::as_str),
+        Some("a1"),
+        "unchanged in-scope file stays"
+    );
+}
+
+#[test]
+fn empty_scope_is_whole_pair_not_a_slash_folder() {
+    // Regression: a scoped sync with an empty scope ("") must behave as a normal
+    // whole-pair sync, NOT prefix paths with a stray "/" (which used to make
+    // every entry look new and mass-recreate folders on the remote).
+    let t = Tmp::new("emptyscope");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/keep.txt"), "a1");
+    write(&t.path().join("local/top.txt"), "t1");
+    run(&c, fake, false); // full sync: both on remote + baseline
+
+    // A no-op scoped sync with empty scope must NOT re-create/re-upload anything.
+    let before = remote_files(&store);
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        let r = eng.sync_pair_scoped(&c.pairs[0], false, Some("")).unwrap();
+        assert_eq!(
+            r.applied, 0,
+            "empty-scope sync of an in-sync pair must be a no-op"
+        );
+    }
+    let after = remote_files(&store);
+    assert_eq!(before, after, "empty-scope sync must not change the remote");
+    // No stray leading-slash keys were created.
+    assert!(
+        !store
+            .borrow()
+            .dirs
+            .iter()
+            .any(|d| d.contains("//") || d.ends_with('/')),
+        "no malformed remote dir paths"
+    );
+}
+
+#[test]
+fn shallow_sync_reconciles_only_direct_children() {
+    // A shallow sync of folder A uploads a new file placed directly in A, but
+    // does NOT descend into A/sub — a deeper local edit is left for that folder's
+    // own (recursive-inotify) event, so touching A never re-walks its subtree.
+    let t = Tmp::new("shallow");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/A/file1.txt"), "one");
+    write(&t.path().join("local/A/sub/file2.txt"), "two");
+    run(&c, fake, false); // full sync: both files + A + A/sub on remote & baseline
+
+    // Add a file directly in A, and (separately) change the deep file.
+    write(&t.path().join("local/A/new.txt"), "new");
+    write(&t.path().join("local/A/sub/file2.txt"), "two-EDITED");
+
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        eng.sync_pair_shallow(&c.pairs[0], "A").unwrap();
+    }
+
+    let remote = remote_files(&store);
+    assert_eq!(
+        remote.get("/my-files/docs/A/new.txt").map(String::as_str),
+        Some("new"),
+        "new direct file must upload"
+    );
+    assert_eq!(
+        remote
+            .get("/my-files/docs/A/sub/file2.txt")
+            .map(String::as_str),
+        Some("two"),
+        "deep file must be UNTOUCHED by a shallow sync of A (no recursion)"
+    );
+    assert_eq!(
+        remote.get("/my-files/docs/A/file1.txt").map(String::as_str),
+        Some("one"),
+        "unchanged direct file stays"
+    );
+}
