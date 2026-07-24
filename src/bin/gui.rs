@@ -1893,6 +1893,27 @@ impl App {
             .color(DIM2),
         );
 
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new("DETECTING CHANGES")
+                .font(FontId::new(11.0, ff_bold()))
+                .color(ACCENT),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Proton's CLI has no \"recently changed\" feed, and rebuilding Proton's \
+                 whole SDK just to get one isn't worth it. So NeutronSync watches your \
+                 local folders for changes as they happen (a \"hot\" cache of recently \
+                 active folders it checks often) and does a periodic full rescan to catch \
+                 everything else, including edits made on your other devices (the CLI only \
+                 lets us see those by re-walking). That's why remote-side changes can take \
+                 until the next rescan to appear.",
+            )
+            .size(12.5)
+            .color(DIM),
+        );
+
         ui.add_space(20.0);
         ui.label(
             RichText::new("UPDATES")
