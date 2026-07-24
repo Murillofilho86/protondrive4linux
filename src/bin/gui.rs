@@ -474,6 +474,15 @@ struct App {
     browser_error: Option<String>,
     browser_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
 
+    // exclude editor ("choose folders to sync" per pair)
+    excl_open: Option<usize>,
+    excl_entries: Vec<String>,
+    excl_loading: bool,
+    excl_error: Option<String>,
+    excl_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
+    excl_newly: Vec<String>,
+    confirm_remove_local: Option<(usize, Vec<String>)>,
+
     // When true (run_in_tray), a headless daemon owns the tray + watcher; this
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
@@ -523,6 +532,13 @@ impl App {
             browser_loading: false,
             browser_error: None,
             browser_rx: None,
+            excl_open: None,
+            excl_entries: Vec::new(),
+            excl_loading: false,
+            excl_error: None,
+            excl_rx: None,
+            excl_newly: Vec::new(),
+            confirm_remove_local: None,
             mode_daemon,
             _win_lock: win_lock,
         };
@@ -608,6 +624,175 @@ impl App {
             let _ = tx.send(proton.list_dir(&path).map_err(|e| e.to_string()));
         });
     }
+
+    // -- exclude editor ("choose folders to sync" for a pair) ---------------
+    fn open_exclude_editor(&mut self, i: usize) {
+        if i >= self.cfg.pairs.len() {
+            return;
+        }
+        self.excl_open = Some(i);
+        self.excl_entries.clear();
+        self.excl_error = None;
+        self.excl_newly.clear();
+        self.excl_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.excl_rx = Some(rx);
+        let cfg = self.cfg.clone();
+        let remote = self.cfg.pairs[i].remote.clone();
+        thread::spawn(move || {
+            let proton = ProtonCli::new(&cfg);
+            let _ = tx.send(proton.list_dir(&remote).map_err(|e| e.to_string()));
+        });
+    }
+
+    fn exclude_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.excl_open else {
+            return;
+        };
+        if i >= self.cfg.pairs.len() {
+            self.excl_open = None;
+            return;
+        }
+        let name = self.cfg.pairs[i].name.clone();
+        let mut win_open = true;
+        let mut done = false;
+        egui::Window::new(format!("Folders to sync — {name}"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .open(&mut win_open)
+            .show(ctx, |ui| {
+                ui.set_min_width(340.0);
+                if self.excl_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Loading folders…").color(DIM));
+                    });
+                } else if let Some(e) = self.excl_error.clone() {
+                    ui.label(RichText::new(e).size(12.0).color(WARN));
+                } else if self.excl_entries.is_empty() {
+                    ui.label(
+                        RichText::new("This Proton folder has no subfolders to choose from.")
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "Untick a folder to stop syncing it. Excluded folders are left \
+                             alone — the Proton copy is never touched.",
+                        )
+                        .size(12.0)
+                        .color(DIM),
+                    );
+                    ui.add_space(8.0);
+                    let entries = self.excl_entries.clone();
+                    for n in &entries {
+                        let mut on = !self.cfg.pairs[i].exclude.iter().any(|e| e == n);
+                        if ui.checkbox(&mut on, n).changed() {
+                            if on {
+                                self.cfg.pairs[i].exclude.retain(|e| e != n);
+                                self.excl_newly.retain(|x| x != n);
+                            } else {
+                                if !self.cfg.pairs[i].exclude.iter().any(|e| e == n) {
+                                    self.cfg.pairs[i].exclude.push(n.clone());
+                                }
+                                if self.cfg.pairs[i].local.join(n).exists()
+                                    && !self.excl_newly.contains(n)
+                                {
+                                    self.excl_newly.push(n.clone());
+                                }
+                            }
+                            self.dirty = true;
+                        }
+                    }
+                    ui.add_space(10.0);
+                    if button(ui, None, "Done", Btn::Primary, false, true).clicked() {
+                        done = true;
+                    }
+                }
+            });
+        if !win_open || done {
+            self.excl_open = None;
+            self.commit();
+            if !self.excl_newly.is_empty() {
+                let newly = std::mem::take(&mut self.excl_newly);
+                self.confirm_remove_local = Some((i, newly));
+            }
+        }
+    }
+
+    fn remove_local_dialog(&mut self, ctx: &egui::Context) {
+        let Some((i, folders)) = self.confirm_remove_local.clone() else {
+            return;
+        };
+        if i >= self.cfg.pairs.len() {
+            self.confirm_remove_local = None;
+            return;
+        }
+        let local = self.cfg.pairs[i].local.clone();
+        let mut choice: Option<bool> = None;
+        egui::Window::new("Free up local space?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    RichText::new("These folders will no longer sync:")
+                        .size(13.0)
+                        .color(TEXT),
+                );
+                for f in &folders {
+                    ui.label(RichText::new(format!("   • {f}")).size(12.0).color(DIM));
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Remove them from this computer to free up space? Your Proton copy \
+                         stays untouched, and they re-download if you include them again.",
+                    )
+                    .size(12.0)
+                    .color(DIM),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if button(
+                        ui,
+                        Some(Icon::Trash),
+                        "Remove locally",
+                        Btn::Danger,
+                        false,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        choice = Some(true);
+                    }
+                    if button(ui, None, "Keep files", Btn::Secondary, false, true).clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        if let Some(remove) = choice {
+            if remove {
+                let mut n = 0usize;
+                for f in &folders {
+                    let p = local.join(f);
+                    if p.exists() && neutronsync::trash::trash_local(&p, None).is_ok() {
+                        n += 1;
+                    }
+                }
+                self.toast(
+                    ctx,
+                    format!("Moved {n} folder(s) to trash — your Proton copy is untouched."),
+                    false,
+                );
+            }
+            self.confirm_remove_local = None;
+        }
+    }
+
     fn add_remote(&mut self, ctx: &egui::Context, remote_path: String) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title(format!("Local folder to sync with {remote_path}"))
@@ -714,6 +899,25 @@ impl eframe::App for App {
                 }
             }
         }
+        // pump the exclude-editor folder list
+        if let Some(rx) = &self.excl_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.excl_rx = None;
+                self.excl_loading = false;
+                match res {
+                    Ok(entries) => {
+                        let mut dirs: Vec<String> = entries
+                            .into_iter()
+                            .filter(|e| e.is_dir)
+                            .map(|e| e.path)
+                            .collect();
+                        dirs.sort_by_key(|s| s.to_lowercase());
+                        self.excl_entries = dirs;
+                    }
+                    Err(e) => self.excl_error = Some(e),
+                }
+            }
+        }
 
         let snap = self.ctrl.snapshot();
         if snap.account.checked && snap.account.signed_in {
@@ -767,6 +971,8 @@ impl eframe::App for App {
         });
 
         self.browser_window(ctx);
+        self.exclude_window(ctx);
+        self.remove_local_dialog(ctx);
         self.logout_dialog(ctx);
         self.reset_dialog(ctx);
         self.toast_overlay(ctx);
@@ -1213,6 +1419,7 @@ impl App {
 
         let mut remove: Option<usize> = None;
         let mut sync_one: Option<String> = None;
+        let mut open_excl: Option<usize> = None;
         let mut changed = false;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1321,11 +1528,27 @@ impl App {
                             ui.add_space(2.0);
                             chip(ui, Icon::Cloud, &self.cfg.pairs[i].remote.clone(), each);
                         });
+
+                        ui.add_space(8.0);
+                        let nx = self.cfg.pairs[i].exclude.len();
+                        let flabel = if nx == 0 {
+                            "Choose folders to sync…".to_string()
+                        } else {
+                            format!("Choose folders to sync…  ({nx} excluded)")
+                        };
+                        if button(ui, Some(Icon::Folder), &flabel, Btn::Ghost, true, !busy)
+                            .clicked()
+                        {
+                            open_excl = Some(i);
+                        }
                     });
                     ui.add_space(10.0);
                 }
             });
 
+        if let Some(idx) = open_excl {
+            self.open_exclude_editor(idx);
+        }
         if let Some(i) = remove {
             // Purge the folder's stored data too, so re-adding a same-named
             // folder later starts fresh instead of inheriting a stale baseline.
