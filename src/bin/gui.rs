@@ -9,14 +9,13 @@
 //!
 //! Build/run: `cargo run --features gui --bin neutronsync-gui`.
 
-use std::f32::consts::{PI, TAU};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, RichText, Sense, Stroke,
+    self, pos2, vec2, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke,
 };
 
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
@@ -102,26 +101,15 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     );
 }
 
-/// The hexagon logo mark (filled), with a white "N" glyph for NeutronSync.
-fn draw_logo(painter: &egui::Painter, rect: Rect) {
-    let c = rect.center();
-    let r = rect.width() * 0.5;
-    let pts: Vec<Pos2> = (0..6)
-        .map(|i| {
-            let a = -PI / 2.0 + i as f32 * TAU / 6.0;
-            pos2(c.x + r * a.cos(), c.y + r * a.sin())
-        })
-        .collect();
-    painter.add(egui::Shape::convex_polygon(pts, ACCENT_LO, Stroke::NONE));
-    let w = rect.width();
-    let h = rect.height();
-    let p = |fx: f32, fy: f32| rect.min + vec2(fx * w, fy * h);
-    let st = Stroke::new((w * 0.10).max(1.7), TEXT);
-    // an "N" for NeutronSync
-    painter.add(egui::Shape::line(
-        vec![p(0.34, 0.72), p(0.34, 0.30), p(0.66, 0.72), p(0.66, 0.30)],
-        st,
-    ));
+/// Paint the NeutronSync logo (the atom mark from `assets/logo.png`) into `rect`.
+/// Falls back to a filled disc if the texture isn't loaded yet.
+fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHandle>) {
+    if let Some(tex) = tex {
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        painter.image(tex.id(), rect, uv, Color32::WHITE);
+    } else {
+        painter.circle_filled(rect.center(), rect.width() * 0.5, ACCENT);
+    }
 }
 
 // ============================================================================
@@ -474,6 +462,9 @@ struct App {
     browser_error: Option<String>,
     browser_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
 
+    // app logo texture (lazy-loaded from assets/logo.png)
+    logo_tex: Option<egui::TextureHandle>,
+
     // exclude editor ("choose folders to sync" per pair)
     excl_open: Option<usize>,
     excl_entries: Vec<String>,
@@ -532,6 +523,7 @@ impl App {
             browser_loading: false,
             browser_error: None,
             browser_rx: None,
+            logo_tex: None,
             excl_open: None,
             excl_entries: Vec::new(),
             excl_loading: false,
@@ -882,6 +874,18 @@ impl eframe::App for App {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let ctx = &ctx;
+        if self.logo_tex.is_none() {
+            if let Ok(ic) =
+                eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png"))
+            {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [ic.width as usize, ic.height as usize],
+                    &ic.rgba,
+                );
+                self.logo_tex =
+                    Some(ctx.load_texture("neutron-logo", img, egui::TextureOptions::LINEAR));
+            }
+        }
         self.pump_tray(ctx);
         // pump the remote browser channel
         if let Some(rx) = &self.browser_rx {
@@ -995,6 +999,7 @@ fn ease_out(t: f32) -> f32 {
 // -- nav rail ----------------------------------------------------------------
 impl App {
     fn nav_rail(&mut self, root_ui: &mut egui::Ui, snap: &AppState) {
+        let logo = self.logo_tex.clone();
         let frame = egui::Frame::default()
             .fill(NAV_BG)
             .inner_margin(egui::Margin::same(10));
@@ -1007,7 +1012,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let (lr, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-                    draw_logo(ui.painter(), lr);
+                    draw_logo(ui.painter(), lr, logo.as_ref());
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.label(
@@ -1978,10 +1983,11 @@ impl App {
 
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         let found = snap.account.binary_found;
+        let logo = self.logo_tex.clone();
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.22).max(20.0));
             let (lr, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-            draw_logo(ui.painter(), lr);
+            draw_logo(ui.painter(), lr, logo.as_ref());
             ui.add_space(16.0);
             ui.label(RichText::new(if found { "Sign in to Proton Drive" } else { "proton-drive not found" }).font(FontId::new(20.0, ff_bold())).color(TEXT));
             ui.add_space(8.0);
