@@ -347,6 +347,15 @@ pub fn run_sync_streaming(
     let counter = AtomicUsize::new(0);
     let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
 
+    // One pair-level scan for the whole walk (the per-folder reconciles are
+    // silent at the pair level), so the GUI shows a single stable "scanning …"
+    // with a climbing folder count instead of flapping Scanning<->Synced.
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::ScanStarted {
+            pair: pair.name.clone(),
+        });
+    }
+
     let mut frontier: Vec<String> = vec![String::new()]; // start at the pair root
     while !frontier.is_empty() && !is_cancelled() {
         let queue: Mutex<std::collections::VecDeque<String>> =
@@ -400,9 +409,19 @@ pub fn run_sync_streaming(
     if !is_cancelled() {
         let _ = crate::state::set_last_synced(&cfg.state_dir, &pair.name, now_epoch());
     }
+    let applied = applied.load(Ordering::Relaxed);
+    let errors = errors.load(Ordering::Relaxed);
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::PairFinished {
+            pair: pair.name.clone(),
+            applied,
+            errors,
+            tracked: counter.load(Ordering::Relaxed),
+        });
+    }
     RunSummary {
-        applied: applied.load(Ordering::Relaxed),
-        errors: errors.load(Ordering::Relaxed),
+        applied,
+        errors,
         pairs: 1,
     }
 }
@@ -471,7 +490,16 @@ pub fn run_sync_shallow_many(
         Mutex::new(folders.iter().cloned().collect());
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
+    let counter = AtomicUsize::new(0);
     let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
+    // One pair-level scan for the whole batch (per-folder reconciles are silent
+    // at the pair level), so the GUI shows one stable "scanning …" with a
+    // climbing folder count rather than flapping per folder.
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::ScanStarted {
+            pair: pair.name.clone(),
+        });
+    }
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -487,10 +515,11 @@ pub fn run_sync_shallow_many(
                         q.pop_front()
                     };
                     let Some(folder) = folder else { break };
+                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if let Some(sink) = events {
                         sink.emit(&SyncEvent::ScanProgress {
                             pair: pair.name.clone(),
-                            folders: 0,
+                            folders: n,
                             current: remote_join(&pair.remote, &folder),
                         });
                     }
@@ -508,9 +537,19 @@ pub fn run_sync_shallow_many(
             });
         }
     });
+    let applied = applied.load(Ordering::Relaxed);
+    let errors = errors.load(Ordering::Relaxed);
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::PairFinished {
+            pair: pair.name.clone(),
+            applied,
+            errors,
+            tracked: counter.load(Ordering::Relaxed),
+        });
+    }
     RunSummary {
-        applied: applied.load(Ordering::Relaxed),
-        errors: errors.load(Ordering::Relaxed),
+        applied,
+        errors,
         pairs: 1,
     }
 }
@@ -1772,9 +1811,12 @@ impl<'a, R: Remote> Engine<'a, R> {
         };
         self.log
             .info(&format!("=== pair {:?} <{label}> shallow ===", pair.name));
-        self.emit(SyncEvent::PairStarted {
-            pair: pair.name.clone(),
-        });
+        // NOTE: no PairStarted/Planned/PairFinished here. This runs per-folder,
+        // often hundreds of times inside one streaming walk; emitting pair-level
+        // events per folder would flap the GUI (Scanning<->Synced, path blanked)
+        // and never show a stable progress line. The callers (run_sync_shallow,
+        // run_sync_shallow_many, run_sync_streaming) emit ONE ScanStarted, a
+        // per-folder ScanProgress, and ONE PairFinished around the whole batch.
         if !pair.local.exists() {
             anyhow::bail!(
                 "local folder {} does not exist — refusing shallow sync",
@@ -1981,15 +2023,6 @@ impl<'a, R: Remote> Engine<'a, R> {
             self.log
                 .info(&format!("shallow <{label}> plan: {}", plan.summary()));
         }
-        self.emit(SyncEvent::Planned {
-            pair: pair.name.clone(),
-            total_ops: plan.actionable().count(),
-            counts: plan
-                .counts()
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-        });
 
         // A deleted direct sub-folder has descendants in the baseline that the
         // apply's per-key commit won't touch; collect them for cleanup after.
@@ -2027,12 +2060,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
         }
 
-        self.emit(SyncEvent::PairFinished {
-            pair: pair.name.clone(),
-            applied: result.applied,
-            errors: result.errors.len(),
-            tracked,
-        });
+        let _ = tracked; // pair-level events are emitted by the caller, not here
 
         // Immediate sub-folders to descend into on a streaming walk: dirs present
         // on either side after the reconcile, minus any deleted this run.

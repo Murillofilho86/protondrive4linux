@@ -49,6 +49,11 @@ pub enum SyncEvent {
     Info { text: String },
     /// An error, optionally attributed to a pair.
     Error { pair: Option<String>, text: String },
+    /// The proton-drive session's sign-in state changed. Emitted by the watch
+    /// daemon when it detects the session has expired (signed out) or come back,
+    /// so a logged-out state surfaces as one clear banner instead of a pile of
+    /// per-folder transfer errors.
+    Auth { signed_in: bool },
 }
 
 /// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:

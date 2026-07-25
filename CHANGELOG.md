@@ -7,6 +7,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-25
+
+### Added
+- Built-in junk-file ignore. Files that should never be synced are now skipped
+  automatically, wherever they appear: office and editor lock/temp files
+  (`~$…`, `.~lock.*`, `*.tmp`, `*.laccdb`, vim/emacs swap and backup files),
+  partial downloads (`*.part`, `*.crdownload`, `*.filepart`), OS metadata
+  (`.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`), and the
+  private state folders of other sync clients (`.sync`, `.stfolder`,
+  `.stversions`, `.dropbox*`, `*.unison`, …). Patterns match on any path
+  component, so a junk *directory* is pruned whole. It reuses the exclude path,
+  so it is non-destructive: a match that was already uploaded is simply forgotten
+  from tracking, never deleted from either side.
+- Signed-out handling. When the `proton-drive` session expires, the watch daemon
+  now detects it, surfaces a single clear "Signed out of Proton — sign in to
+  resume" banner (instead of a pile of per-folder transfer errors), pauses
+  syncing, and resumes automatically the moment the session is back. A logout is
+  distinguished from a genuine transfer error, so an unrelated failure never
+  trips it.
+
+### Changed
+- The periodic full walk now runs on a background thread. A file changed while a
+  walk is in progress is reconciled within seconds instead of waiting for the
+  whole walk to finish; previously the (single-threaded) walk blocked the change
+  queue for its entire duration. Only one walk runs at a time and it winds down
+  promptly on shutdown or sign-out. Overlapping a change sync with the walk is
+  safe — it is the same scoped, positive-confirmation reconcile the walk already
+  runs concurrently per folder.
+
 ## [0.2.1] - 2026-07-25
 
 ### Added

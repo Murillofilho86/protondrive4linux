@@ -1310,7 +1310,16 @@ impl App {
         let never_synced = snap.pairs.iter().any(|p| {
             matches!(p.phase, Phase::Scanning | Phase::Syncing) && p.last_synced.is_none()
         });
-        let (bcol, bicon, btitle, bsub) = if active {
+        let (bcol, bicon, btitle, bsub) = if snap.signed_out {
+            // A signed-out session is surfaced explicitly — everything else is
+            // blocked on it, so it takes priority over scan/sync/idle states.
+            (
+                DANGER,
+                Icon::Info,
+                "Signed out of Proton",
+                "Sign in on the Account tab to resume syncing".into(),
+            )
+        } else if active {
             (
                 ACCENT,
                 Icon::Sync,

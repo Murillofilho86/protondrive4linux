@@ -94,12 +94,17 @@ impl Config {
 }
 
 impl Pair {
-    /// Whether `rel` (a POSIX path relative to the pair root) falls under one of
-    /// this pair's excluded sub-paths, and so must be ignored by the engine.
+    /// Whether `rel` (a POSIX path relative to the pair root) must be ignored by
+    /// the engine — either a built-in junk pattern (an office/editor lock or temp
+    /// file, OS metadata, another sync client's state folder; see
+    /// [`crate::ignore`]) or one of this pair's user-configured excluded
+    /// sub-paths. Ignored paths are never touched on either side.
     pub fn is_excluded(&self, rel: &str) -> bool {
-        self.exclude
-            .iter()
-            .any(|e| rel == e || rel.starts_with(&format!("{e}/")))
+        crate::ignore::is_ignored_junk(rel)
+            || self
+                .exclude
+                .iter()
+                .any(|e| rel == e || rel.starts_with(&format!("{e}/")))
     }
 }
 

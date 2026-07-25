@@ -11,6 +11,7 @@ pub mod config;
 pub mod datefmt;
 pub mod engine;
 pub mod events;
+pub mod ignore;
 pub mod logger;
 pub mod models;
 pub mod protoncli;

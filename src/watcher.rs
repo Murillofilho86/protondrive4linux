@@ -20,8 +20,9 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use crate::config::{Config, Pair};
 use crate::datefmt::now_epoch;
 use crate::engine::{run_sync_shallow_many, run_sync_streaming};
-use crate::events::EventSink;
+use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
+use crate::protoncli::{is_not_logged_in, ProtonCli, Remote};
 use crate::stats::Stats;
 
 /// A sub-folder counts as "hot" if it saw >= this many changes in the window.
@@ -34,6 +35,41 @@ const HOT_THRESHOLD: i64 = 1;
 /// folders stay fresh via the change- and hot-folder-triggered scoped syncs.
 const FULL_WALK_MULTIPLIER: u64 = 6;
 const FULL_WALK_MAX_SECS: u64 = 6 * 3600;
+/// While signed out, re-probe the proton-drive session no more often than this,
+/// so a logged-out daemon idles cheaply instead of spawning a probe every tick.
+const AUTH_REPROBE_SECS: i64 = 20;
+
+/// Outcome of a cheap auth probe. `Unknown` (a non-auth error, e.g. a network
+/// blip) is deliberately distinct from `SignedOut` so a transient failure never
+/// flips the "signed out" banner.
+enum AuthProbe {
+    SignedIn,
+    SignedOut,
+    Unknown,
+}
+
+/// Probe whether the proton-drive session is authenticated by listing the remote
+/// root — the same check the GUI's Account panel uses. Cheap (one CLI call).
+fn probe_auth(cfg: &Config) -> AuthProbe {
+    match ProtonCli::new(cfg).list_dir(&cfg.remote_root) {
+        Ok(_) => AuthProbe::SignedIn,
+        Err(e) if is_not_logged_in(&e.to_string()) => AuthProbe::SignedOut,
+        Err(_) => AuthProbe::Unknown,
+    }
+}
+
+/// Announce a sign-in state change: emit a structured event (so the GUI banner
+/// flips) and log it once.
+fn note_auth(events: Option<&dyn EventSink>, log: &Logger, signed_in: bool) {
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::Auth { signed_in });
+    }
+    if signed_in {
+        log.info("watch: signed back in to Proton — resuming");
+    } else {
+        log.warn("watch: proton-drive session signed out — pausing sync until you sign in");
+    }
+}
 
 enum Msg {
     /// A debounced local change under pair index `usize`, in sub-folder `sub`
@@ -60,12 +96,18 @@ fn folder_of(rel: &str) -> String {
 /// self-feeding re-scan loop. Everything else (create, write, delete, rename,
 /// or an unspecified modify) is treated as a real change, conservatively.
 fn is_content_change(kind: &notify_debouncer_full::notify::EventKind) -> bool {
-    use notify_debouncer_full::notify::event::ModifyKind;
+    use notify_debouncer_full::notify::event::{AccessKind, AccessMode, ModifyKind};
     use notify_debouncer_full::notify::EventKind;
-    !matches!(
-        kind,
-        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
-    )
+    match kind {
+        // A completed WRITE (file closed after being written, IN_CLOSE_WRITE) is a
+        // real change — many tools only signal a save this way, so we must keep it.
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        // Other access (reads, opens, read-closes) and metadata/mtime touches are
+        // our own reconcile's footprint; counting them self-triggers a re-scan.
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        // Create / delete / data-modify / rename / unspecified modify = real.
+        _ => true,
+    }
 }
 
 /// Single-instance lock so a watch daemon and, say, a systemd timer don't run
@@ -179,15 +221,15 @@ pub fn watch_with(
     // the STREAMING walk: it reconciles and transfers folder-by-folder as it
     // discovers them, so uploads/downloads overlap the walk instead of waiting
     // for the whole tree to be scanned first.
-    let full_walk = |stop: &AtomicBool| -> u64 {
+    let full_walk = |cancel: &AtomicBool| -> u64 {
         let started = now_epoch();
         let live = reload_cfg(cfg, log);
         let (mut applied, mut errs) = (0usize, 0usize);
         for p in pick_pairs(&live, &watched) {
-            if stop.load(Ordering::Relaxed) {
+            if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let r = run_sync_streaming(&live, &p, log, events, Some(stop));
+            let r = run_sync_streaming(&live, &p, log, events, Some(cancel));
             applied += r.applied;
             errs += r.errors;
         }
@@ -291,13 +333,24 @@ pub fn watch_with(
         }
     });
 
+    // Auth state. When the proton-drive session is signed out every remote call
+    // fails; rather than hammer every folder and bury it as per-folder errors, we
+    // detect it, surface ONE clear signed-out event (a GUI banner), and pause
+    // real work — re-probing on a throttle until the session is back.
+    let mut signed_out = matches!(probe_auth(&reload_cfg(cfg, log)), AuthProbe::SignedOut);
+    let mut last_auth_probe = now_epoch();
+    if signed_out {
+        note_auth(events, log, false);
+    }
+
     // Prioritised startup (the watcher is already attached, so live changes
     // queue meanwhile): 1) sync folders with fresh LOCAL changes first; 2) sync
     // recently-active HOT folders; 3) then the streaming full walk for the rest.
     // Steps 1 and 2 reconcile their folders CONCURRENTLY (a worker pool) so a
     // large set isn't a slow one-folder-at-a-time slog. Root ("") folders are
-    // left to the full walk. Each folder is a safe shallow reconcile.
-    {
+    // left to the full walk. Each folder is a safe shallow reconcile. Skipped
+    // while signed out; the main loop resumes them once the session is back.
+    if !signed_out {
         let live = reload_cfg(cfg, log);
         let mut primed: BTreeSet<(String, String)> = BTreeSet::new();
         // 1) folders with fresh local changes
@@ -346,128 +399,174 @@ pub fn watch_with(
         }
     }
 
-    // 3) Catch-up FULL reconcile (seeds baselines, catches remote-only changes).
-    //    The next full walk is paced off this walk's measured duration.
-    log.info("watch: initial full reconcile of all pairs");
-    let last = full_walk(stop);
-    let mut next_full_at = now_epoch() + next_full_delay(last) as i64;
-    log.info(&format!(
-        "watch: next full walk in ~{}s",
-        (next_full_at - now_epoch()).max(0)
-    ));
+    // 3) The initial full reconcile runs as a BACKGROUND walk (see the loop
+    //    below), so local changes made while it runs sync immediately instead of
+    //    waiting the whole walk out. Schedule it to start right away.
+    log.info("watch: initial full reconcile of all pairs (background)");
+    let mut next_full_at = now_epoch();
 
-    // 4) Main loop: coalesce a burst of change events into a set of (pair,
-    //    sub-folder) SCOPED syncs; on the hot tick, add recently-active
-    //    sub-folders; and run a FULL walk when the adaptive timer is due. Single
-    //    threaded, so syncs never overlap. Our own writes re-fire events, but the
-    //    follow-up scoped sync is an idempotent no-op, so it converges.
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            log.info("watch: stopped");
-            break;
-        }
+    // A cancel flag for the BACKGROUND full walk, distinct from `stop` (the
+    // global shutdown / GUI-toggle flag). We trip it on shutdown or when we
+    // detect a sign-out, so a walk in flight winds down promptly instead of
+    // churning through a whole tree of failing calls.
+    let walk_cancel = Arc::new(AtomicBool::new(false));
 
-        // Adaptive full walk: due when the paced timer elapses.
-        if now_epoch() >= next_full_at {
-            let last = full_walk(stop);
-            next_full_at = now_epoch() + next_full_delay(last) as i64;
-            log.info(&format!(
-                "watch: next full walk in ~{}s",
-                (next_full_at - now_epoch()).max(0)
-            ));
-            continue;
-        }
+    // 4) Main loop. The full walk runs on a BACKGROUND thread so change-triggered
+    //    shallow syncs are serviced CONCURRENTLY with it — a fresh save no longer
+    //    waits out a long walk. Only one walk runs at a time. Overlapping a
+    //    change sync with the walk is safe: concurrent per-folder reconciles
+    //    already happen inside a single walk, and each is the same scoped,
+    //    positive-confirmation primitive (SQLite serialises the baseline writes).
+    thread::scope(|s| {
+        let mut walk: Option<thread::ScopedJoinHandle<'_, u64>> = None;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                walk_cancel.store(true, Ordering::Relaxed);
+                log.info("watch: stopped");
+                break;
+            }
 
-        // Timed recv so the stop flag and the full-walk timer are checked often.
-        let first = match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(m) => m,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        // Accumulate change events in arrival order (newest last), plus the hot
-        // tick. We process NEWEST changes first so a fresh edit is never starved
-        // behind a large backlog of older / no-op folder checks.
-        let mut order: Vec<(usize, String)> = Vec::new();
-        let mut poll_hot = false;
-        let mut take = |m: Msg| match m {
-            Msg::Sub { pair, sub } => order.push((pair, sub)),
-            Msg::PollHot => poll_hot = true,
-        };
-        take(first);
-        while let Ok(m) = rx.try_recv() {
-            take(m);
-        }
-        // brief settle to catch stragglers from the same burst
-        thread::sleep(Duration::from_millis(300));
-        while let Ok(m) = rx.try_recv() {
-            take(m);
-        }
+            // Reap a finished background walk; pace the next off its duration.
+            if walk.as_ref().is_some_and(|h| h.is_finished()) {
+                let secs = walk.take().unwrap().join().unwrap_or(0);
+                next_full_at = now_epoch() + next_full_delay(secs) as i64;
+                log.info(&format!(
+                    "watch: next full walk in ~{}s",
+                    (next_full_at - now_epoch()).max(0)
+                ));
+            }
 
-        // Hot sub-folders (lower priority than live changes).
-        let mut hot: Vec<(usize, String)> = Vec::new();
-        if poll_hot {
-            if let Some(st) = &stats {
-                let now = now_epoch();
-                for (i, p) in pairs.iter().enumerate() {
-                    if let Ok(folders) =
-                        st.hot_folders(&p.name, HOT_WINDOW_SECS, HOT_THRESHOLD, now)
-                    {
-                        for f in folders {
-                            hot.push((i, f));
+            // Auth gate: while signed out, do no sync work; re-probe on a
+            // throttle and resume the moment the session is back.
+            if signed_out {
+                walk_cancel.store(true, Ordering::Relaxed);
+                if now_epoch() - last_auth_probe >= AUTH_REPROBE_SECS {
+                    last_auth_probe = now_epoch();
+                    if let AuthProbe::SignedIn = probe_auth(&reload_cfg(cfg, log)) {
+                        signed_out = false;
+                        note_auth(events, log, true);
+                        // Re-walk soon so anything missed while out is reconciled.
+                        next_full_at = now_epoch();
+                    }
+                }
+                if signed_out {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+
+            // Start a background full walk when due and none is running.
+            if walk.is_none() && now_epoch() >= next_full_at {
+                walk_cancel.store(false, Ordering::Relaxed);
+                walk = Some(s.spawn(|| full_walk(&walk_cancel)));
+            }
+
+            // Timed recv so the stop flag and timers are checked often.
+            let first = match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(m) => m,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            // Accumulate change events in arrival order (newest last), plus the
+            // hot tick. We process NEWEST changes first so a fresh edit is never
+            // starved behind a backlog of older / no-op folder checks.
+            let mut order: Vec<(usize, String)> = Vec::new();
+            let mut poll_hot = false;
+            let mut take = |m: Msg| match m {
+                Msg::Sub { pair, sub } => order.push((pair, sub)),
+                Msg::PollHot => poll_hot = true,
+            };
+            take(first);
+            while let Ok(m) = rx.try_recv() {
+                take(m);
+            }
+            // brief settle to catch stragglers from the same burst
+            thread::sleep(Duration::from_millis(300));
+            while let Ok(m) = rx.try_recv() {
+                take(m);
+            }
+
+            // Hot sub-folders (lower priority than live changes).
+            let mut hot: Vec<(usize, String)> = Vec::new();
+            if poll_hot {
+                if let Some(st) = &stats {
+                    let now = now_epoch();
+                    for (i, p) in pairs.iter().enumerate() {
+                        if let Ok(folders) =
+                            st.hot_folders(&p.name, HOT_WINDOW_SECS, HOT_THRESHOLD, now)
+                        {
+                            for f in folders {
+                                hot.push((i, f));
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // Processing list: newest change events first (deduped), then hot
-        // folders, skipping anything already queued.
-        let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
-        let mut todo: Vec<(usize, String)> = Vec::new();
-        for item in order.into_iter().rev().chain(hot) {
-            if seen.insert(item.clone()) {
-                todo.push(item);
+            // Processing list: newest change events first (deduped), then hot
+            // folders, skipping anything already queued.
+            let mut seen: BTreeSet<(usize, String)> = BTreeSet::new();
+            let mut todo: Vec<(usize, String)> = Vec::new();
+            for item in order.into_iter().rev().chain(hot) {
+                if seen.insert(item.clone()) {
+                    todo.push(item);
+                }
             }
-        }
-        if todo.is_empty() {
-            continue;
-        }
+            if todo.is_empty() {
+                continue;
+            }
 
-        // Reload config so live exclusion/setting edits apply, then run the
-        // SHALLOW (direct-children-only) syncs, grouped by pair and reconciled
-        // CONCURRENTLY per pair so a burst of folders isn't a one-at-a-time slog.
-        let live = reload_cfg(cfg, log);
-        let mut by_pair: Vec<(usize, Vec<String>)> = Vec::new();
-        for (i, sub) in todo {
-            match by_pair.iter_mut().find(|(pi, _)| *pi == i) {
-                Some((_, v)) => v.push(sub),
-                None => by_pair.push((i, vec![sub])),
+            // Reload config so live exclusion/setting edits apply, then run the
+            // SHALLOW (direct-children-only) syncs, grouped by pair and
+            // reconciled CONCURRENTLY per pair so a burst isn't a one-at-a-time
+            // slog.
+            let live = reload_cfg(cfg, log);
+            let mut by_pair: Vec<(usize, Vec<String>)> = Vec::new();
+            for (i, sub) in todo {
+                match by_pair.iter_mut().find(|(pi, _)| *pi == i) {
+                    Some((_, v)) => v.push(sub),
+                    None => by_pair.push((i, vec![sub])),
+                }
+            }
+            let mut cycle_errors = 0usize;
+            for (i, folders) in by_pair {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let name = match pairs.get(i) {
+                    Some(p) => p.name.clone(),
+                    None => continue,
+                };
+                let pair = match live.pairs.iter().find(|p| p.name == name) {
+                    Some(p) => p.clone(),
+                    None => continue, // pair removed from the config
+                };
+                log.info(&format!(
+                    "watch: change -> shallow sync {:?} ({} folder(s))",
+                    pair.name,
+                    folders.len()
+                ));
+                let r = run_sync_shallow_many(&live, &pair, &folders, log, events, Some(stop));
+                cycle_errors += r.errors;
+                log.info(&format!(
+                    "watch: shallow done ({} applied, {} error(s))",
+                    r.applied, r.errors
+                ));
+            }
+
+            // A cycle that errored may mean the session expired. Probe once
+            // (cheap); only a genuine "not logged in" flips the gate — a
+            // transient/other error is left to retry normally.
+            if cycle_errors > 0 && !signed_out {
+                last_auth_probe = now_epoch();
+                if let AuthProbe::SignedOut = probe_auth(&reload_cfg(cfg, log)) {
+                    signed_out = true;
+                    walk_cancel.store(true, Ordering::Relaxed);
+                    note_auth(events, log, false);
+                }
             }
         }
-        for (i, folders) in by_pair {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let name = match pairs.get(i) {
-                Some(p) => p.name.clone(),
-                None => continue,
-            };
-            let pair = match live.pairs.iter().find(|p| p.name == name) {
-                Some(p) => p.clone(),
-                None => continue, // pair removed from the config
-            };
-            log.info(&format!(
-                "watch: change -> shallow sync {:?} ({} folder(s))",
-                pair.name,
-                folders.len()
-            ));
-            let s = run_sync_shallow_many(&live, &pair, &folders, log, events, Some(stop));
-            log.info(&format!(
-                "watch: shallow done ({} applied, {} error(s))",
-                s.applied, s.errors
-            ));
-        }
-    }
+    });
     Ok(())
 }
 
@@ -475,7 +574,8 @@ pub fn watch_with(
 mod tests {
     use super::is_content_change;
     use notify_debouncer_full::notify::event::{
-        AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
     };
     use notify_debouncer_full::notify::EventKind;
 
@@ -484,6 +584,13 @@ mod tests {
         // Reads and attribute/mtime touches must NOT count (they self-trigger).
         assert!(!is_content_change(&EventKind::Access(AccessKind::Read)));
         assert!(!is_content_change(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        // But a completed write (IN_CLOSE_WRITE) IS a real change.
+        assert!(is_content_change(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
         assert!(!is_content_change(&EventKind::Modify(
             ModifyKind::Metadata(MetadataKind::Any)
         )));

@@ -754,6 +754,24 @@ fn parse_time(v: Option<&Value>) -> Option<i64> {
     None
 }
 
+/// Whether a proton-drive error/output string is the "not authenticated" signal
+/// — the session has expired or the user is logged out — as opposed to a genuine
+/// transfer failure (a bad path, a network blip, a rate limit). Callers use this
+/// to surface a single clear "signed out, sign in to resume" state instead of
+/// treating a logout as a pile of per-file errors. Kept conservative: only the
+/// phrasings proton-drive actually uses for "log in first", so an unrelated 4xx
+/// never trips it.
+pub fn is_not_logged_in(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    s.contains("login first")
+        || s.contains("need to login")
+        || s.contains("need to log in")
+        || s.contains("not logged in")
+        || s.contains("please login")
+        || s.contains("please log in")
+        || s.contains("no active session")
+}
+
 // --- process/env helpers ----------------------------------------------------
 fn first_nonempty(a: &str, b: &str) -> String {
     let a = a.trim();
@@ -822,7 +840,21 @@ fn is_executable(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_component;
+    use super::{is_not_logged_in, is_safe_component};
+
+    #[test]
+    fn detects_not_logged_in_signal() {
+        // The phrasing proton-drive actually returns when the session is gone.
+        assert!(is_not_logged_in("You need to login first"));
+        assert!(is_not_logged_in("Error: not logged in"));
+        assert!(is_not_logged_in("Please log in to continue"));
+        assert!(is_not_logged_in("no active session"));
+        // Genuine transfer failures must NOT read as a logout.
+        assert!(!is_not_logged_in("Node not found"));
+        assert!(!is_not_logged_in("upload /x failed: connection reset"));
+        assert!(!is_not_logged_in("rate limited, try again"));
+        assert!(!is_not_logged_in(""));
+    }
 
     #[test]
     fn rejects_unsafe_node_names() {

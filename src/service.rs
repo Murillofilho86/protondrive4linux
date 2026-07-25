@@ -126,6 +126,10 @@ pub struct AppState {
     pub active: Vec<ActivityOp>,
     pub busy: bool,
     pub watching: bool,
+    /// The watch daemon has detected the proton-drive session is signed out.
+    /// Surfaced as a distinct "sign in to resume" banner instead of error spam.
+    #[serde(default)]
+    pub signed_out: bool,
 }
 
 impl AppState {
@@ -301,6 +305,20 @@ impl EventSink for StateSink {
                         format!("{pair}: {applied} applied")
                     };
                     s.push(kind, msg);
+                }
+            }
+            SyncEvent::Auth { signed_in } => {
+                s.signed_out = !*signed_in;
+                if *signed_in {
+                    s.push(
+                        ActivityKind::Info,
+                        "Signed back in to Proton — resuming sync".to_string(),
+                    );
+                } else {
+                    s.push(
+                        ActivityKind::Error,
+                        "Signed out of Proton — sign in on the Account tab to resume".to_string(),
+                    );
                 }
             }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
