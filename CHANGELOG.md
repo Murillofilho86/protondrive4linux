@@ -7,6 +7,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-27
+
+### Fixed
+- First-run onboarding actually appears. The sign-in page was gated on the
+  `proton-drive` binary being present, so a machine without the CLI (the case
+  that needs onboarding most) went straight to the main window with no hint
+  that anything was missing. The page now shows unless a working, signed-in
+  CLI is confirmed.
+- A signed-out session is no longer misread as an empty Proton Drive. When the
+  system keyring is unreachable (locked, headless session, no D-Bus), the CLI
+  fails with a message ending in "No such file or directory", which the
+  listing classifier treated as "folder not found". The app then reported
+  "Signed in" while every sync errored, and the watcher's signed-out detection
+  never fired. Session-load failures are now classified as "not signed in":
+  the GUI shows the sign-in page and the watch daemon pauses until the session
+  is back.
+- An idle window no longer shows a stale frame while the startup account probe
+  runs; the result could otherwise go unseen until the next click.
+- The GNOME dock icon no longer shows Proton's logo. Old builds installed
+  Proton Drive's own artwork as the scalable icon and newer builds never
+  replaced it; the desktop integration now installs the NeutronSync atom mark
+  as both the raster and scalable icon (healing machines that ran an old
+  build), and the packages ship the scalable icon too.
+
+### Changed
+- The sign-in page was redesigned. Without the CLI it now walks through two
+  concrete steps (a link to Proton's download page and a copyable
+  `proton-drive --version` check) with a single "Check again" action; with the
+  CLI present it offers "Sign in with Proton" and shows the probe result
+  instead of a raw status string.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

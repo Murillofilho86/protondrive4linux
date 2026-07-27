@@ -274,6 +274,12 @@ impl ProtonCli {
             self.run_with(&["filesystem", "list", "-j", "--", remote_path], cache)?;
         if !ok {
             let low = format!("{err}{out}").to_lowercase();
+            // Auth failures FIRST: the keyring message ends in "No such file or
+            // directory", which the not-found classifier below would swallow,
+            // turning "signed out" into "remote folder is empty".
+            if is_not_logged_in(&low) {
+                return Err(anyhow!("not signed in: {}", first_nonempty(&err, &out)));
+            }
             if ["not found", "no such", "does not exist"]
                 .iter()
                 .any(|w| low.contains(w))
@@ -770,6 +776,10 @@ pub fn is_not_logged_in(s: &str) -> bool {
         || s.contains("please login")
         || s.contains("please log in")
         || s.contains("no active session")
+        // The keyring/secret-service is unreachable (locked, headless, no D-Bus):
+        // the CLI has no session, which for us means "not signed in", NOT "node
+        // not found" (the message ends in "No such file or directory").
+        || s.contains("failed to load session")
 }
 
 // --- process/env helpers ----------------------------------------------------
@@ -849,6 +859,11 @@ mod tests {
         assert!(is_not_logged_in("Error: not logged in"));
         assert!(is_not_logged_in("Please log in to continue"));
         assert!(is_not_logged_in("no active session"));
+        assert!(is_not_logged_in(
+            "Failed to load session from secrets (ensure you have secrets \
+             available, read the README for more information): Could not \
+             connect: No such file or directory (code: 1)"
+        ));
         // Genuine transfer failures must NOT read as a logout.
         assert!(!is_not_logged_in("Node not found"));
         assert!(!is_not_logged_in("upload /x failed: connection reset"));

@@ -69,6 +69,7 @@ enum Icon {
     Arrow,
     Upload,
     Download,
+    Copy,
 }
 
 fn icon_glyph(icon: Icon) -> &'static str {
@@ -88,6 +89,7 @@ fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Arrow => ph::ARROW_RIGHT,
         Icon::Upload => ph::ARROW_UP,
         Icon::Download => ph::ARROW_DOWN,
+        Icon::Copy => ph::COPY,
     }
 }
 
@@ -465,7 +467,6 @@ struct App {
     toast: Option<Toast>,
     // Update check: shared with the background checker thread.
     update: std::sync::Arc<std::sync::Mutex<UpdateState>>,
-    show_signin: bool,
     confirm_logout: bool,
     confirm_reset: bool,
     // after launching browser login, poll the account until signed in (or deadline)
@@ -530,7 +531,6 @@ impl App {
             dirty: false,
             toast: None,
             update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
-            show_signin: false,
             confirm_logout: false,
             confirm_reset: false,
             login_poll_until: None,
@@ -964,10 +964,6 @@ impl eframe::App for App {
         if self.mode_daemon {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
-        if snap.account.checked && snap.account.signed_in {
-            self.show_signin = false;
-        }
-
         // after a browser login, poll the account until signed in (or deadline),
         // so the app returns to itself without a manual Refresh.
         if let Some(until) = self.login_poll_until {
@@ -987,8 +983,18 @@ impl eframe::App for App {
             self.nav_t = (self.nav_t + dt / 0.26).min(1.0);
         }
 
-        let signin = self.show_signin
-            || (snap.account.checked && snap.account.binary_found && !snap.account.signed_in);
+        // The startup account probe lands on a background thread and egui only
+        // repaints on input, so an idle window would show a stale pre-probe
+        // frame forever (and never flip to the sign-in gate below). Keep
+        // painting until the probe result has arrived.
+        if !snap.account.checked || snap.account.checking {
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+
+        // First-run / broken-prereq gate: show the sign-in page unless we have
+        // CONFIRMED a working, signed-in CLI. Covers both "proton-drive missing"
+        // (page_signin renders install guidance) and "present but signed out".
+        let signin = snap.account.checked && !(snap.account.binary_found && snap.account.signed_in);
 
         if !signin {
             self.nav_rail(root_ui, &snap);
@@ -2068,53 +2074,162 @@ impl App {
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         let found = snap.account.binary_found;
         let logo = self.logo_tex.clone();
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.22).max(20.0));
-            let (lr, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-            draw_logo(ui.painter(), lr, logo.as_ref());
-            ui.add_space(16.0);
-            ui.label(RichText::new(if found { "Sign in to Proton Drive" } else { "proton-drive not found" }).font(FontId::new(20.0, ff_bold())).color(TEXT));
-            ui.add_space(8.0);
-            let sub = if found {
-                "Log in signs the official proton-drive CLI into your Proton account, \
-                 in your browser. NeutronSync never sees your password or credentials."
-            } else {
-                "Install the official proton-drive CLI and make sure it's on your PATH, then refresh."
-            };
-            ui.label(RichText::new(sub).size(13.0).color(DIM));
-            if found {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "NeutronSync just drives Proton's own CLI — your Proton login \
-                         stays strictly between you and Proton.",
-                    )
-                    .size(11.5)
-                    .color(DIM2),
-                );
-            }
-            ui.add_space(22.0);
-            let waiting = self.login_poll_until.is_some();
+        let col_w: f32 = 470.0;
+
+        // A numbered step row: circled number, then a bold title.
+        let step = |ui: &mut egui::Ui, n: &str, title: &str| {
             ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 200.0).max(0.0) / 2.0);
-                if found && button(ui, Some(Icon::User), "Log in", Btn::Primary, false, !waiting).clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.start_login(&ctx);
-                }
-                if button(ui, Some(Icon::Sync), "Refresh", Btn::Secondary, false, true).clicked() {
-                    self.last_account_poll = ui.ctx().input(|i| i.time);
-                    self.ctrl.refresh_account();
-                }
+                let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 10.0, SEL);
+                ui.painter().text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    n,
+                    FontId::new(11.5, ff_bold()),
+                    ACCENT_HI,
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::new(13.5, ff_bold()))
+                        .color(TEXT),
+                );
             });
-            if waiting {
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("Waiting for sign-in…").color(DIM));
+        };
+
+        // Center the whole block vertically as one unit.
+        let est_h = if found { 300.0 } else { 470.0 };
+        ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
+        let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(side);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.vertical_centered(|ui| {
+                    let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
+                    draw_logo(ui.painter(), lr, logo.as_ref());
+                    ui.add_space(20.0);
+                    let title = if found {
+                        "Sign in to Proton Drive"
+                    } else {
+                        "Get the proton-drive CLI"
+                    };
+                    ui.label(
+                        RichText::new(title)
+                            .font(FontId::new(24.0, ff_bold()))
+                            .color(TEXT),
+                    );
+                    ui.add_space(10.0);
+                    let sub = if found {
+                        "Signing in opens Proton's own login in your browser and signs in \
+                         the official CLI. NeutronSync never sees your password or \
+                         credentials."
+                    } else {
+                        "NeutronSync drives Proton's official command-line client, which \
+                         isn't installed yet (or isn't on your PATH). Two steps and you're \
+                         syncing:"
+                    };
+                    ui.label(RichText::new(sub).size(13.5).color(TEXT));
                 });
-            }
-            ui.add_space(14.0);
-            ui.label(RichText::new(&snap.account.version).size(11.5).color(DIM2));
+
+                if !found {
+                    ui.add_space(20.0);
+                    card_frame().show(ui, |ui| {
+                        ui.set_width(col_w - 34.0);
+                        step(ui, "1", "Install the CLI");
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            ui.hyperlink_to(
+                                "proton.me/blog/proton-drive-cli",
+                                "https://proton.me/blog/proton-drive-cli",
+                            );
+                        });
+                        ui.add_space(16.0);
+                        step(ui, "2", "Confirm it works in a terminal");
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            egui::Frame::default()
+                                .fill(NAV_BG)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::symmetric(10, 6))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("proton-drive --version")
+                                            .font(FontId::new(12.5, egui::FontFamily::Monospace))
+                                            .color(TEXT),
+                                    );
+                                });
+                            ui.add_space(6.0);
+                            if button(ui, Some(Icon::Copy), "Copy", Btn::Ghost, true, true)
+                                .clicked()
+                            {
+                                ui.ctx().copy_text("proton-drive --version".to_owned());
+                                let ctx = ui.ctx().clone();
+                                self.toast(&ctx, "Command copied", false);
+                            }
+                        });
+                    });
+                }
+
+                ui.add_space(22.0);
+                let waiting = self.login_poll_until.is_some();
+                ui.vertical_centered(|ui| {
+                    if found {
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 290.0).max(0.0) / 2.0);
+                            if button(
+                                ui,
+                                Some(Icon::User),
+                                "Sign in with Proton",
+                                Btn::Primary,
+                                false,
+                                !waiting,
+                            )
+                            .clicked()
+                            {
+                                let ctx = ui.ctx().clone();
+                                self.start_login(&ctx);
+                            }
+                            ui.add_space(8.0);
+                            if button(ui, Some(Icon::Sync), "Refresh", Btn::Secondary, false, true)
+                                .clicked()
+                            {
+                                self.last_account_poll = ui.ctx().input(|i| i.time);
+                                self.ctrl.refresh_account();
+                            }
+                        });
+                    } else if button(
+                        ui,
+                        Some(Icon::Sync),
+                        "Check again",
+                        Btn::Primary,
+                        false,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        self.last_account_poll = ui.ctx().input(|i| i.time);
+                        self.ctrl.refresh_account();
+                    }
+                    if waiting {
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
+                            ui.spinner();
+                            ui.label(RichText::new("Waiting for sign-in…").color(DIM));
+                        });
+                    }
+                    ui.add_space(14.0);
+                    let caption = if found {
+                        snap.account.version.clone()
+                    } else {
+                        format!("Checked for \"{}\" on your PATH.", self.cfg.binary)
+                    };
+                    ui.label(RichText::new(caption).size(11.5).color(DIM2));
+                });
+            });
         });
     }
 
@@ -2351,6 +2466,14 @@ fn ensure_desktop_integration() {
     write_if_changed(
         &data.join("icons/hicolor/256x256/apps/neutronsync.png"),
         include_bytes!("../../assets/logo.png"),
+    );
+    // Scalable icon too — GNOME Shell prefers scalable over the raster sizes,
+    // and old builds installed Proton's OWN gradient-folder SVG here; writing
+    // our atom mark over it also heals those machines (we may not ship
+    // Proton's artwork).
+    write_if_changed(
+        &data.join("icons/hicolor/scalable/apps/neutronsync.svg"),
+        include_bytes!("../../assets/neutron-logo.svg"),
     );
 
     // Quote the exec path: it may contain spaces (dev builds under a path like
