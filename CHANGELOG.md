@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-28
+
+### Fixed
+- Files whose names contain `[`, `*`, `?`, `{` or `\` now transfer. The
+  `proton-drive` CLI expands every local path argument as a glob, so a real
+  file called `[RTA06]_Change_of_bond_contributors_....pdf` was read as a
+  one-character class, matched nothing, and failed with "No paths matched" on
+  every retry forever. Local paths are now quoted (each metacharacter wrapped
+  in a single-character class) before being handed to the CLI, for uploads and
+  for the download destination folder, which the CLI globs as well.
+
 ## [0.3.1] - 2026-07-27
 
 ### Fixed

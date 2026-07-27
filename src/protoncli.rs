@@ -240,11 +240,14 @@ impl ProtonCli {
         local_dest: &str,
         cache: Option<&Path>,
     ) -> Result<()> {
+        // The CLI globs the local destination too (and demands exactly one
+        // match), so quote it. Callers create the folder before downloading.
+        let quoted_dest = glob_quote_local(local_dest);
         let mut args: Vec<&str> = vec!["filesystem", "download"];
         args.extend(self.download_flags.iter().map(|s| s.as_str()));
         args.push("--"); // end of options: never treat a path as a flag
         args.push(remote_path);
-        args.push(local_dest);
+        args.push(&quoted_dest);
         let (ok, out, err) = self.run_with(&args, cache)?;
         if !ok {
             bail!(
@@ -590,10 +593,11 @@ impl Remote for ProtonCli {
     }
 
     fn upload(&self, local_path: &str, remote_parent: &str) -> Result<()> {
+        let quoted = glob_quote_local(local_path);
         let mut args: Vec<&str> = vec!["filesystem", "upload"];
         args.extend(self.upload_flags.iter().map(|s| s.as_str()));
         args.push("--"); // end of options: never treat a path as a flag
-        args.push(local_path);
+        args.push(&quoted); // and never as a glob
         args.push(remote_parent);
         let (ok, out, err) = self.run(&args)?;
         if !ok {
@@ -804,6 +808,43 @@ fn is_safe_component(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// Quote a LOCAL path so proton-drive treats it literally instead of as a glob.
+///
+/// The CLI expands every local path argument itself: if the path matches
+/// `/[*?\[{]/` it is handed to `fs/promises` glob, and a pattern that matches
+/// nothing is a hard error ("No paths matched: ..."). A real file called
+/// `[RTA06]_Change_of_bond_contributors_....pdf` therefore never uploads — the
+/// `[RTA06]` is read as a one-character class, matching nothing. Passing `--`
+/// does not help; this is glob expansion, not flag parsing.
+///
+/// Each metacharacter is wrapped in a single-character class (`[` -> `[[]`), and
+/// a literal backslash is doubled inside one (`\` -> `[\\]`) so it isn't read as
+/// an escape. The result matches exactly the original path, so the CLI resolves
+/// it back to the real name (the remote node keeps the correct name). Verified
+/// against cli-drive 0.6.0 for all of `\ * ? [ {`.
+///
+/// A quoted path is a pattern, so it must EXIST — a path with no metacharacters
+/// is returned untouched and stays literal, and every caller here passes a path
+/// that is already on disk (download destinations are created first).
+fn glob_quote_local(path: &str) -> String {
+    if !path.contains(['*', '?', '[', '{', '\\']) {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + 8);
+    for ch in path.chars() {
+        match ch {
+            '\\' => out.push_str("[\\\\]"),
+            '*' | '?' | '[' | '{' => {
+                out.push('[');
+                out.push(ch);
+                out.push(']');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn make_cache_dir() -> Option<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let nanos = SystemTime::now()
@@ -850,7 +891,34 @@ fn is_executable(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_logged_in, is_safe_component};
+    use super::{glob_quote_local, is_not_logged_in, is_safe_component};
+
+    #[test]
+    fn glob_quotes_local_metacharacters() {
+        // Ordinary paths are passed through byte-for-byte: no metacharacter
+        // means the CLI never globs them, and quoting would only add risk.
+        let plain = "/home/w/ProtonDrive/Documents/Summary.pdf";
+        assert_eq!(glob_quote_local(plain), plain);
+
+        // The real-world case: a bracketed prefix read as a character class.
+        assert_eq!(
+            glob_quote_local("/d/1. Agreements/[RTA06]_Change_of_bond.pdf"),
+            "/d/1. Agreements/[[]RTA06]_Change_of_bond.pdf"
+        );
+        // A closing bracket on its own is literal to the CLI, so it is left be.
+        assert_eq!(glob_quote_local("/d/no] class.txt"), "/d/no] class.txt");
+
+        // Every character the CLI's glob trigger looks for, plus backslash
+        // (doubled so it is not read as an escape of the character after it).
+        assert_eq!(glob_quote_local("/d/a*b"), "/d/a[*]b");
+        assert_eq!(glob_quote_local("/d/a?b"), "/d/a[?]b");
+        assert_eq!(glob_quote_local("/d/{a,b}"), "/d/[{]a,b}");
+        assert_eq!(glob_quote_local("/d/back\\slash"), "/d/back[\\\\]slash");
+        assert_eq!(
+            glob_quote_local("/d/x[1]*?{y}\\z"),
+            "/d/x[[]1][*][?][{]y}[\\\\]z"
+        );
+    }
 
     #[test]
     fn detects_not_logged_in_signal() {

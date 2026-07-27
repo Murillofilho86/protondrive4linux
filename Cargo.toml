@@ -1,6 +1,6 @@
 [package]
 name = "neutronsync"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"
