@@ -155,8 +155,14 @@ fi
 # tag.gpgsign is set in this repo, so -a signs.
 git tag -a "v$ver" -F <(printf 'NeutronSync v%s\n\n%s\n' "$ver" "$notes")
 
+if git cat-file tag "v$ver" | grep -q 'BEGIN PGP SIGNATURE'; then
+	signed='signed'
+else
+	signed='UNSIGNED, tag.gpgsign is off'
+fi
+
 echo
-echo "Committed $(git rev-parse --short HEAD) and tagged v$ver (signed)."
+echo "Committed $(git rev-parse --short HEAD) and tagged v$ver ($signed)."
 echo
 echo "Nothing has been pushed. To ship it:"
 echo "    git push origin $(git branch --show-current) && git push origin v$ver"
