@@ -78,6 +78,7 @@ jobs:
       - name: Release notes from the changelog
         run: |
           mkdir -p dist
+          git fetch --tags --force --quiet
           ver="${GITHUB_REF_NAME#v}"
           awk -v v="$ver" '
             $0 == "## [" v "]" || index($0, "## [" v "] ") == 1 { inside = 1; next }
@@ -89,6 +90,12 @@ jobs:
             printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
               "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > dist/notes.md
           fi
+          prev="$(git tag --sort=-creatordate --list 'v*' \
+                  | grep -vFx "$GITHUB_REF_NAME" | head -1)"
+          if [ -n "$prev" ]; then
+            printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' \
+              "$GITHUB_REPOSITORY" "$prev" "$GITHUB_REF_NAME" >> dist/notes.md
+          fi
           echo '--- notes ---'
           cat dist/notes.md
 
@@ -99,11 +106,15 @@ jobs:
           # release is invisible to the app until someone publishes it by hand.
           # Pushing a tag is the decision to release; nothing else is needed.
           draft: false
-          # A plain tag (v0.3.3) is a stable release; a tag with a pre-release
-          # suffix (v0.4.0-rc1) is flagged as a pre-release. The updater's
-          # stable channel follows the former, its prerelease channel the newest
-          # of either.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Every tag ships as a pre-release. Promotion to stable is a separate,
+          # deliberate decision made once a build has proven itself:
+          #   gh release edit vX.Y.Z --prerelease=false --latest
+          # That release then carries GitHub's "Latest" badge, which only ever
+          # sits on one release at a time, and the updater's stable channel
+          # starts offering it. The prerelease channel sees every tag as it lands.
+          prerelease: true
+          # Never move the "Latest" badge onto a fresh build; promotion does that.
+          make_latest: false
           name: NeutronSync ${{ github.ref_name }}
           body_path: dist/notes.md
           files: |

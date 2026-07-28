@@ -153,7 +153,7 @@ The packaged units target `/usr/bin/neutronsync`. If you installed with `cargo i
 
 ## Updates
 
-Releases come from GitHub. Every release starts as a pre-release; a stable release is one that has been promoted. Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config), and it will tell you when a newer version is available. It only notifies; you install via your package manager or the release page.
+Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and the newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the checksum GitHub publishes and installs it through your package manager (one `pkexec` prompt), then offers to restart.
 
 ## Privacy and trust
 
