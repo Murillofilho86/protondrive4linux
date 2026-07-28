@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- `scripts/release.sh` cuts a release in one command: it bumps the version in `Cargo.toml` and `Cargo.lock`, closes the changelog's `[Unreleased]` section as `## [x.y.z] - <date>`, commits, and creates the signed tag. It refuses to run on a dirty tree, on a version that already exists, or on an empty `[Unreleased]`, and it stops before pushing, so nothing reaches GitHub without a deliberate `git push`. `--dry-run` prints the release body it would publish.
+
 ### Changed
+- A release fails fast rather than shipping notes nobody can read. The workflow now checks, before the eight-minute build, that the tag matches the version in `Cargo.toml` and that `CHANGELOG.md` has a non-empty section for it. Previously a missing section only warned, and the release shipped with a bare "see CHANGELOG" link as its body.
 - Every tag ships as a pre-release, and promotion to stable is a separate decision. 0.3.3 made a plain tag a stable release, which meant a build was declared stable at the moment it was cut, before it had run anywhere. The release workflow now always publishes as a pre-release and never moves the "Latest" badge; a build is promoted once it has proven itself, with `gh release edit vX.Y.Z --prerelease=false --latest`. The updater's `prerelease` channel still sees every tag as it lands, and its `stable` channel only ever offers a promoted one.
 - Release notes on GitHub now carry the changelog section for each version. Earlier releases had GitHub's generated body, a bare compare link, so the release page said nothing about what changed. The 0.1.1 through 0.3.2 notes were rewritten from this file, and titles read `NeutronSync vX.Y.Z`.
 

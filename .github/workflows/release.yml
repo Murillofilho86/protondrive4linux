@@ -18,6 +18,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail before spending 8 minutes on a build that would ship a release
+      # nobody can read. Both of these are things a hurried tag gets wrong.
+      - name: Check the tag against Cargo.toml and the changelog
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+
+          crate="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)"
+          if [ "$crate" != "$ver" ]; then
+            echo "::error::tag is ${GITHUB_REF_NAME} but Cargo.toml says ${crate}."
+            echo "Bump the version and re-tag (scripts/release.sh does both)."
+            exit 1
+          fi
+
+          if ! grep -qE "^## \[${ver//./\\.}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${ver}]' section."
+            echo "The release body comes from that section, so a release"
+            echo "without one says nothing about what changed."
+            exit 1
+          fi
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -86,9 +106,8 @@ jobs:
             inside { print }
           ' CHANGELOG.md | sed -e '/./,$!d' > dist/notes.md
           if [ ! -s dist/notes.md ]; then
-            echo "::warning::no CHANGELOG.md section for ${ver}; falling back"
-            printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
-              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > dist/notes.md
+            echo "::error::the '## [${ver}]' section of CHANGELOG.md is empty."
+            exit 1
           fi
           prev="$(git tag --sort=-creatordate --list 'v*' \
                   | grep -vFx "$GITHUB_REF_NAME" | head -1)"
