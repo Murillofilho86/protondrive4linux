@@ -72,15 +72,40 @@ jobs:
           cp target/generate-rpm/*.rpm dist/ 2>/dev/null || true
           ls -l dist/
 
+      # Release notes come from CHANGELOG.md, not GitHub's generated commit list:
+      # the changelog says what changed and why, the commit list just repeats the
+      # subject lines. Pull out the section for this tag's version.
+      - name: Release notes from the changelog
+        run: |
+          mkdir -p dist
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '
+            $0 == "## [" v "]" || index($0, "## [" v "] ") == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > dist/notes.md
+          if [ ! -s dist/notes.md ]; then
+            echo "::warning::no CHANGELOG.md section for ${ver}; falling back"
+            printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > dist/notes.md
+          fi
+          echo '--- notes ---'
+          cat dist/notes.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true          # review the draft, then publish manually
-          # Every release starts life as a pre-release. Promote one to the
-          # stable channel by unticking "Set as a pre-release" on the published
-          # release; the updater's stable channel then picks it up.
-          prerelease: true
-          generate_release_notes: true
+          # Published, not a draft: the updater skips drafts, so a draft
+          # release is invisible to the app until someone publishes it by hand.
+          # Pushing a tag is the decision to release; nothing else is needed.
+          draft: false
+          # A plain tag (v0.3.3) is a stable release; a tag with a pre-release
+          # suffix (v0.4.0-rc1) is flagged as a pre-release. The updater's
+          # stable channel follows the former, its prerelease channel the newest
+          # of either.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: NeutronSync ${{ github.ref_name }}
+          body_path: dist/notes.md
           files: |
             dist/*.deb
             dist/*.rpm

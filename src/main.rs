@@ -29,11 +29,17 @@ impl EventSink for DbSink {
             action,
             path,
             ok,
+            error,
         } = ev
         {
-            let _ =
-                self.stats
-                    .record_op(pair, action, path, *ok, neutronsync::datefmt::now_epoch());
+            let _ = self.stats.record_op(
+                pair,
+                action,
+                path,
+                *ok,
+                error.as_deref(),
+                neutronsync::datefmt::now_epoch(),
+            );
         }
     }
 }

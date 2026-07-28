@@ -1,6 +1,6 @@
 [package]
 name = "neutronsync"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"
@@ -33,9 +33,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 winit = { version = "0.30", optional = true }
 tray-icon = { version = "0.24", optional = true }
 gtk = { version = "0.18", optional = true }
-# Update check (GUI-only, notify): tiny HTTP client + semver compare.
+# In-app updates (GUI-only): tiny HTTP client, semver compare, and SHA-256 to
+# verify a downloaded package against the digest the release API publishes.
 ureq = { version = "2", optional = true }
 semver = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [profile.release]
 opt-level = "z"   # optimise for size ("lite")
@@ -56,6 +58,7 @@ gui = [
     "dep:gtk",
     "dep:ureq",
     "dep:semver",
+    "dep:sha2",
 ]
 
 [[bin]]

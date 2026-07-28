@@ -27,6 +27,8 @@ pub struct OpRecord {
     pub action: String,
     pub path: String,
     pub ok: bool,
+    /// Why it failed, when it did. `None` for successful ops.
+    pub error: Option<String>,
 }
 
 impl Stats {
@@ -50,7 +52,8 @@ impl Stats {
                  action TEXT    NOT NULL,
                  path   TEXT    NOT NULL,
                  ok     INTEGER NOT NULL,
-                 ts     INTEGER NOT NULL
+                 ts     INTEGER NOT NULL,
+                 error  TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_ops_ts ON ops(ts);
              CREATE TABLE IF NOT EXISTS baseline (
@@ -76,6 +79,10 @@ impl Stats {
             "ALTER TABLE baseline ADD COLUMN state TEXT NOT NULL DEFAULT 'synced'",
             [],
         );
+        // Migrate DBs whose ops table predates the error column. Older failed
+        // rows keep a NULL reason: the message was never recorded, and the only
+        // copy is the text log.
+        let _ = conn.execute("ALTER TABLE ops ADD COLUMN error TEXT", []);
         // Drop any rows a previous build left in a transient "pending" state:
         // their stored metadata reflected a transfer that had not completed, so
         // it can't be trusted. Deleting them makes the next run re-detect and
@@ -95,7 +102,7 @@ impl Stats {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "CREATE TABLE events (pair TEXT NOT NULL, folder TEXT NOT NULL, ts INTEGER NOT NULL);
-             CREATE TABLE ops (pair TEXT NOT NULL, action TEXT NOT NULL, path TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL);",
+             CREATE TABLE ops (pair TEXT NOT NULL, action TEXT NOT NULL, path TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL, error TEXT);",
         )?;
         Ok(Stats {
             conn: Mutex::new(conn),
@@ -142,21 +149,42 @@ impl Stats {
         Ok(())
     }
 
-    /// Persist a completed file operation for the activity history.
-    pub fn record_op(&self, pair: &str, action: &str, path: &str, ok: bool, ts: i64) -> Result<()> {
+    /// Persist a completed file operation for the activity history. `error` is
+    /// the reason a failed op failed, so "what broke and why" is one query.
+    pub fn record_op(
+        &self,
+        pair: &str,
+        action: &str,
+        path: &str,
+        ok: bool,
+        error: Option<&str>,
+        ts: i64,
+    ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO ops(pair, action, path, ok, ts) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![pair, action, path, ok as i64, ts],
+            "INSERT INTO ops(pair, action, path, ok, error, ts) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![pair, action, path, ok as i64, error, ts],
         )?;
         Ok(())
     }
 
     /// The most recent `limit` operations, newest first.
     pub fn recent_ops(&self, limit: usize) -> Result<Vec<OpRecord>> {
+        self.query_ops("SELECT ts, pair, action, path, ok, error FROM ops", limit)
+    }
+
+    /// The most recent `limit` FAILED operations, newest first. This is the
+    /// "what is broken right now" query.
+    pub fn recent_failures(&self, limit: usize) -> Result<Vec<OpRecord>> {
+        self.query_ops(
+            "SELECT ts, pair, action, path, ok, error FROM ops WHERE ok = 0",
+            limit,
+        )
+    }
+
+    fn query_ops(&self, select: &str, limit: usize) -> Result<Vec<OpRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT ts, pair, action, path, ok FROM ops ORDER BY rowid DESC LIMIT ?1")?;
+        let mut stmt = conn.prepare(&format!("{select} ORDER BY rowid DESC LIMIT ?1"))?;
         let rows = stmt.query_map(params![limit as i64], |r| {
             Ok(OpRecord {
                 ts: r.get(0)?,
@@ -164,6 +192,7 @@ impl Stats {
                 action: r.get(2)?,
                 path: r.get(3)?,
                 ok: r.get::<_, i64>(4)? != 0,
+                error: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

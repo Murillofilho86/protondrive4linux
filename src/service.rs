@@ -106,6 +106,10 @@ pub struct ActivityOp {
     pub path: String,
     pub pair: String,
     pub ok: bool,
+    /// Why a failed op failed. `None` for successes, and for failures recorded
+    /// by a build that predates this field.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,7 +157,7 @@ impl AppState {
         } else {
             ActivityKind::Error
         };
-        let text = format!("{} {}", op.action, op.path);
+        let text = op_text(&op);
         self.activity.push_back(ActivityItem {
             ts: now_epoch(),
             kind,
@@ -167,6 +171,15 @@ impl AppState {
         while self.activity.len() > ACTIVITY_CAP {
             self.activity.pop_front();
         }
+    }
+}
+
+/// One activity line for an operation: "upload path" when it worked, and
+/// "upload path: reason" when it didn't, so the feed says why on its own.
+fn op_text(op: &ActivityOp) -> String {
+    match &op.error {
+        Some(e) if !e.is_empty() => format!("{} {}: {e}", op.action, op.path),
+        _ => format!("{} {}", op.action, op.path),
     }
 }
 
@@ -242,6 +255,7 @@ impl EventSink for StateSink {
                     path: path.clone(),
                     pair: pair.clone(),
                     ok: true,
+                    error: None,
                 });
             }
             SyncEvent::OpFinished {
@@ -249,12 +263,18 @@ impl EventSink for StateSink {
                 action,
                 path,
                 ok,
+                error,
             } => {
                 let ok = *ok;
                 if let Some(p) = s.pair_mut(pair) {
                     p.progress.done += 1;
                     if !ok {
-                        p.last_error = Some("an operation failed".into());
+                        // The real reason, so the banner and the tray tooltip
+                        // say what broke instead of "an operation failed".
+                        p.last_error = Some(match error {
+                            Some(e) if !e.is_empty() => format!("{action} {path}: {e}"),
+                            _ => format!("{action} {path} failed"),
+                        });
                     }
                 }
                 s.active
@@ -264,10 +284,11 @@ impl EventSink for StateSink {
                     path: path.clone(),
                     pair: pair.clone(),
                     ok,
+                    error: error.clone(),
                 });
                 drop(s);
                 if let Some(st) = &self.stats {
-                    let _ = st.record_op(pair, action, path, ok, now_epoch());
+                    let _ = st.record_op(pair, action, path, ok, error.as_deref(), now_epoch());
                 }
             }
             SyncEvent::PairFinished {
@@ -377,22 +398,22 @@ impl Controller {
                     } else {
                         ActivityKind::Error
                     };
-                    let text = format!("{} {}", r.action, r.path);
+                    let op = ActivityOp {
+                        action: r.action,
+                        path: r.path,
+                        pair: r.pair,
+                        ok: r.ok,
+                        error: r.error,
+                    };
                     activity.push_back(ActivityItem {
                         ts: r.ts,
                         kind,
-                        text,
-                        op: Some(ActivityOp {
-                            action: r.action,
-                            path: r.path,
-                            pair: r.pair,
-                            ok: r.ok,
-                        }),
+                        text: op_text(&op),
+                        op: Some(op),
                     });
                 }
             }
         }
-
         let c = Controller {
             cfg: Mutex::new(cfg),
             state: Arc::new(Mutex::new(AppState {
@@ -691,8 +712,32 @@ mod tests {
             action: "upload".into(),
             path: "a".into(),
             ok: true,
+            error: None,
         });
         assert_eq!(st.lock().unwrap().pairs[0].progress.done, 1);
+
+        // A failure carries its reason all the way to the pair banner and the
+        // activity line, rather than collapsing to "an operation failed".
+        sink.emit(&SyncEvent::OpFinished {
+            pair: "docs".into(),
+            action: "upload".into(),
+            path: "b".into(),
+            ok: false,
+            error: Some("No paths matched: /x/b".into()),
+        });
+        {
+            let s = st.lock().unwrap();
+            assert_eq!(
+                s.pairs[0].last_error.as_deref(),
+                Some("upload b: No paths matched: /x/b")
+            );
+            let last = s.activity.back().expect("an activity line");
+            assert_eq!(last.text, "upload b: No paths matched: /x/b");
+            assert_eq!(
+                last.op.as_ref().and_then(|o| o.error.as_deref()),
+                Some("No paths matched: /x/b")
+            );
+        }
         sink.emit(&SyncEvent::PairFinished {
             pair: "docs".into(),
             applied: 2,

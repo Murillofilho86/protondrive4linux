@@ -1,8 +1,6 @@
 # GUI backend API (`neutronsync::service`)
 
-The backend for a rich GUI. The frontend stays thin: hold one `Controller`,
-read a cheap `snapshot()` each frame, and issue non-blocking commands. All slow
-work runs on background threads; engine events become observable state.
+The backend for a rich GUI. The frontend stays thin: hold one `Controller`, read a cheap `snapshot()` each frame, and issue non-blocking commands. All slow work runs on background threads; engine events become observable state.
 
 ## Lifecycle
 
@@ -48,9 +46,7 @@ struct ActivityItem { ts: i64, kind: ActivityKind /*Info|Sync|Error*/, text: Str
 ```
 
 Rendering hints:
-- Per-pair row: name, `phase`, a progress bar from `progress.fraction()`, and
-  `current_op` as a subtitle. Colour by `phase` (Synced=green, Error=red,
-  Scanning/Syncing=accent).
+- Per-pair row: name, `phase`, a progress bar from `progress.fraction()`, and `current_op` as a subtitle. Colour by `phase` (Synced=green, Error=red, Scanning/Syncing=accent).
 - Activity tab: iterate `activity` (it's already capped), colour by `kind`.
 - Account tab: dot from `signed_in`, show `version`.
 
@@ -75,22 +71,11 @@ controller.commit_config(cfg);               // store + refresh the pair list
 controller.save(&path)?;                      // persist to disk
 ```
 
-`commit_config` preserves the phase/progress of pairs whose names are unchanged,
-so the UI doesn't flicker when you tweak options.
+`commit_config` preserves the phase/progress of pairs whose names are unchanged, so the UI doesn't flicker when you tweak options.
 
 ## Notes
 
-- `Controller` methods take `&self` (interior mutability), so you can keep it in
-  your `App` by value; no `Arc`/`Mutex` needed on your side.
-- Progress `total` is the number of actionable operations for the pair; `done`
-  ticks up per finished op. During a scan, `phase == Scanning` and
-  `scanned_folders` climbs (there's no total for the scan — the CLI can't tell
-  us the tree size up front).
-- The watch daemon feeds the same state, so a running watch shows pairs cycling
-  Scanning → Synced with activity entries, and `watching == true`.
-- In tray mode the daemon and the window are **separate processes**. The process
-  running the work calls `publish_status()` to write a live snapshot to
-  `status.json`; a window reads it with `Controller::read_status(state_dir)` and
-  renders that instead of its own idle state. This is why an open window reflects
-  what the background daemon is doing. A CLI `neutronsync sync` also records its
-  ops into the shared activity store, so those runs appear in the feed too.
+- `Controller` methods take `&self` (interior mutability), so you can keep it in your `App` by value; no `Arc`/`Mutex` needed on your side.
+- Progress `total` is the number of actionable operations for the pair; `done` ticks up per finished op. During a scan, `phase == Scanning` and `scanned_folders` climbs (there's no total for the scan — the CLI can't tell us the tree size up front).
+- The watch daemon feeds the same state, so a running watch shows pairs cycling Scanning → Synced with activity entries, and `watching == true`.
+- In tray mode the daemon and the window are **separate processes**. The process running the work calls `publish_status()` to write a live snapshot to `status.json`; a window reads it with `Controller::read_status(state_dir)` and renders that instead of its own idle state. This is why an open window reflects what the background daemon is doing. A CLI `neutronsync sync` also records its ops into the shared activity store, so those runs appear in the feed too.

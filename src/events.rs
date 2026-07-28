@@ -31,12 +31,15 @@ pub enum SyncEvent {
         action: String,
         path: String,
     },
-    /// An operation finished (ok=false means it errored).
+    /// An operation finished (ok=false means it errored). `error` carries the
+    /// reason when it failed, so a frontend and the ops history can show WHY
+    /// rather than a bare "an operation failed".
     OpFinished {
         pair: String,
         action: String,
         path: String,
         ok: bool,
+        error: Option<String>,
     },
     /// A pair finished reconciling.
     PairFinished {

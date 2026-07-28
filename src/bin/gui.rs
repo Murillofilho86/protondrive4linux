@@ -454,6 +454,24 @@ enum UpdateState {
     Idle,
     Checking,
     Done(std::result::Result<UpdateInfo, String>),
+    /// Streaming the package down: bytes so far, total (0 when unknown).
+    Downloading {
+        done: u64,
+        total: u64,
+    },
+    /// Checking the download against the release's published SHA-256.
+    Verifying,
+    /// Handed to the package manager; the polkit prompt is on screen.
+    Installing,
+    /// Installed and ready; the app has to restart to run the new build.
+    Installed {
+        version: String,
+    },
+    /// Downloaded but not installed (no package manager owns this copy).
+    Downloaded {
+        path: PathBuf,
+    },
+    Failed(String),
 }
 
 struct App {
@@ -2041,30 +2059,129 @@ impl App {
                             .color(WARN),
                     );
                 }
+                UpdateState::Downloading { done, total } => {
+                    let text = if *total > 0 {
+                        format!(
+                            "Downloading… {}% ({} of {})",
+                            done * 100 / total.max(&1),
+                            human_bytes(*done),
+                            human_bytes(*total)
+                        )
+                    } else {
+                        format!("Downloading… {}", human_bytes(*done))
+                    };
+                    ui.label(RichText::new(text).size(12.0).color(ACCENT));
+                }
+                UpdateState::Verifying => {
+                    ui.label(
+                        RichText::new("Verifying checksum…")
+                            .size(12.0)
+                            .color(ACCENT),
+                    );
+                }
+                UpdateState::Installing => {
+                    ui.label(
+                        RichText::new("Installing… (confirm the password prompt)")
+                            .size(12.0)
+                            .color(ACCENT),
+                    );
+                }
+                UpdateState::Installed { version } => {
+                    ui.label(
+                        RichText::new(format!("{version} installed. Restart to finish."))
+                            .size(12.0)
+                            .color(ACCENT),
+                    );
+                }
+                UpdateState::Downloaded { path } => {
+                    ui.label(
+                        RichText::new(format!("Downloaded to {}", path.display()))
+                            .size(12.0)
+                            .color(DIM),
+                    );
+                }
+                UpdateState::Failed(e) => {
+                    ui.label(RichText::new(e.clone()).size(12.0).color(WARN));
+                }
             }
         });
-        // Offer to open the release page when a newer version is available.
-        let release_url = match &*self.update.lock().unwrap() {
-            UpdateState::Done(Ok(info)) if info.newer && !info.html_url.is_empty() => {
-                Some(info.html_url.clone())
-            }
-            _ => None,
-        };
-        if let Some(url) = release_url {
-            ui.add_space(6.0);
-            if button(ui, None, "Open release", Btn::Primary, false, true).clicked() {
-                open_url(&url);
-            }
+
+        // Decide the follow-up action without holding the lock across the UI.
+        enum UpdateAction {
+            Install(UpdateInfo),
+            Restart,
+            OpenRelease(String),
+            None,
         }
+        let (action, busy) = match &*self.update.lock().unwrap() {
+            UpdateState::Done(Ok(info)) if info.newer => (
+                if updater::install_kind().can_install()
+                    && updater::pick_asset(info, updater::install_kind()).is_some()
+                {
+                    UpdateAction::Install(info.clone())
+                } else {
+                    UpdateAction::OpenRelease(info.html_url.clone())
+                },
+                false,
+            ),
+            UpdateState::Installed { .. } => (UpdateAction::Restart, false),
+            UpdateState::Downloading { .. } | UpdateState::Verifying | UpdateState::Installing => {
+                (UpdateAction::None, true)
+            }
+            UpdateState::Failed(_) => (UpdateAction::None, false),
+            _ => (UpdateAction::None, false),
+        };
+        if busy {
+            // Keep repainting so the byte counter actually moves.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        match action {
+            UpdateAction::Install(info) => {
+                ui.add_space(6.0);
+                let label = format!("Download and install {}", info.latest);
+                if button(ui, Some(Icon::Sync), &label, Btn::Primary, false, true).clicked() {
+                    // The ONLY path that downloads or installs anything. Nothing
+                    // updates on a timer, on launch, or as a side effect of a
+                    // check: an update happens because this was pressed.
+                    spawn_update_install(self.update.clone(), info, ui.ctx().clone());
+                }
+            }
+            UpdateAction::Restart => {
+                ui.add_space(6.0);
+                if button(ui, None, "Restart now", Btn::Primary, false, true).clicked() {
+                    if let Err(e) = updater::restart() {
+                        *self.update.lock().unwrap() =
+                            UpdateState::Failed(format!("Couldn't restart: {e}"));
+                    } else {
+                        // The helper stops this process; leaving is the point.
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+            UpdateAction::OpenRelease(url) if !url.is_empty() => {
+                ui.add_space(6.0);
+                if button(ui, None, "Open release", Btn::Primary, false, true).clicked() {
+                    open_url(&url);
+                }
+            }
+            _ => {}
+        }
+
         ui.add_space(4.0);
         let chan = match channel {
             UpdateChannel::Stable => "stable",
             UpdateChannel::Prerelease => "pre-release",
         };
+        let how = match updater::install_kind() {
+            updater::InstallKind::Deb => "Updates install with apt, so your package list stays correct.",
+            updater::InstallKind::Rpm => "Updates install with your rpm package manager, so your package list stays correct.",
+            updater::InstallKind::Unmanaged => "This copy wasn't installed from a package, so updates are downloaded for you to install.",
+        };
         ui.label(
             RichText::new(format!(
                 "Following the {chan} channel. Releases come from GitHub; nothing is \
-                 installed without you choosing to."
+                 installed without you choosing to. {how}"
             ))
             .size(11.5)
             .color(DIM2),
@@ -2434,6 +2551,80 @@ fn spawn_update_check(
     });
 }
 
+/// Download the release asset for this install kind, then install it. Progress
+/// and the outcome land in `slot`, which the Updates panel renders.
+fn spawn_update_install(
+    slot: std::sync::Arc<std::sync::Mutex<UpdateState>>,
+    info: UpdateInfo,
+    ctx: egui::Context,
+) {
+    *slot.lock().unwrap() = UpdateState::Downloading { done: 0, total: 0 };
+    std::thread::spawn(move || {
+        let kind = updater::install_kind();
+        let Some(asset) = updater::pick_asset(&info, kind).cloned() else {
+            *slot.lock().unwrap() =
+                UpdateState::Failed("That release has no package for this system.".into());
+            ctx.request_repaint();
+            return;
+        };
+
+        let prog_slot = slot.clone();
+        let progress = move |done: u64, total: u64| {
+            *prog_slot.lock().unwrap() = UpdateState::Downloading { done, total };
+        };
+        let never_cancel = || false;
+        let downloaded = match updater::download(&asset, &progress, &never_cancel) {
+            Ok(p) => p,
+            Err(e) => {
+                *slot.lock().unwrap() = UpdateState::Failed(format!("Download failed: {e}"));
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        // Verify against the checksum the release API published before anything
+        // is handed to a root process. A mismatch discards the file.
+        *slot.lock().unwrap() = UpdateState::Verifying;
+        ctx.request_repaint();
+        if let Err(e) = updater::verify(&downloaded, &asset) {
+            let _ = std::fs::remove_file(&downloaded);
+            *slot.lock().unwrap() = UpdateState::Failed(format!("{e}"));
+            ctx.request_repaint();
+            return;
+        }
+
+        if !kind.can_install() {
+            *slot.lock().unwrap() = UpdateState::Downloaded { path: downloaded };
+            ctx.request_repaint();
+            return;
+        }
+
+        *slot.lock().unwrap() = UpdateState::Installing;
+        ctx.request_repaint();
+        *slot.lock().unwrap() = match updater::install(&downloaded, kind) {
+            Ok(()) => UpdateState::Installed {
+                version: info.latest.clone(),
+            },
+            Err(e) => UpdateState::Failed(format!("{e}")),
+        };
+        ctx.request_repaint();
+    });
+}
+
+/// Bytes as a short human string ("6.5 MB"), for download progress.
+fn human_bytes(n: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    const KB: f64 = 1_000.0;
+    let n = n as f64;
+    if n >= MB {
+        format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.0} kB", n / KB)
+    } else {
+        format!("{n:.0} B")
+    }
+}
+
 /// Base of the XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`).
 fn xdg_data_home() -> PathBuf {
     std::env::var("XDG_DATA_HOME")
@@ -2640,10 +2831,18 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64) -> Option<Open> {
                 .truncate()
                 .sense(Sense::click()),
         );
+        let r = r.on_hover_text(&op.path);
         if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         name_clicked = r.clicked();
+        // A failed row says why on the row itself: the reason used to live only
+        // in sync.log, so the feed showed a red filename and nothing else.
+        if let Some(err) = op.error.as_deref().filter(|e| !e.is_empty()) {
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(RichText::new(err).size(11.5).color(DANGER)).truncate())
+                .on_hover_text(err);
+        }
     });
     ui.add_space(4.0);
     if name_clicked {

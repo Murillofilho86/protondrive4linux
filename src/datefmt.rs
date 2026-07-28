@@ -59,6 +59,18 @@ pub fn epoch_to_iso(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
 }
 
+/// Format epoch seconds as "YYYY-MM-DD HH:MM:SSZ" (UTC), for log lines. The
+/// trailing Z is explicit because the log is read by a human who is probably
+/// not on UTC: without it, a timestamp two hours off the wall clock looks like
+/// a bug in the app rather than a timezone.
+pub fn epoch_to_log_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}Z")
+}
+
 /// Format epoch seconds as "YYYYMMDD-HHMMSS" (UTC), for conflict-copy names.
 pub fn epoch_to_stamp(secs: i64) -> String {
     let days = secs.div_euclid(86400);

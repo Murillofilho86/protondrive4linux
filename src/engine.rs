@@ -1314,6 +1314,9 @@ impl<'a, R: Remote> Engine<'a, R> {
             });
             let outcome = self.apply_op(pair, op, &mut new_base);
             let ok = outcome.is_ok();
+            // The bare cause, without the "<action> <path>: " prefix the log
+            // line carries: the event already names the action and the path.
+            let err_text = outcome.as_ref().err().map(|e| e.to_string());
             match outcome {
                 Ok(()) => {
                     result.applied += 1;
@@ -1343,6 +1346,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                 action: op.action.label().to_string(),
                 path: op.path.clone(),
                 ok,
+                error: err_text,
             });
         }
 
@@ -1473,6 +1477,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         };
         let on_done = |j: &DownloadJob, r: std::result::Result<(), String>| {
             let ok = r.is_ok();
+            let err_text = r.as_ref().err().cloned();
             match r {
                 Ok(()) => {
                     applied.fetch_add(1, Ordering::Relaxed);
@@ -1491,6 +1496,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                     action: "download".into(),
                     path: j.rel.clone(),
                     ok,
+                    error: err_text,
                 });
             }
         };
