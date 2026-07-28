@@ -104,7 +104,7 @@ jobs:
         with:
           # Published, not a draft: the updater skips drafts, so a draft
           # release is invisible to the app until someone publishes it by hand.
-          # Pushing a tag is the decision to release; nothing else is needed.
+          # Pushing a tag is the decision to ship a pre-release.
           draft: false
           # Every tag ships as a pre-release. Promotion to stable is a separate,
           # deliberate decision made once a build has proven itself:
