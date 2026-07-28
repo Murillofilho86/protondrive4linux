@@ -168,4 +168,4 @@ echo "Nothing has been pushed. To ship it:"
 echo "    git push origin $(git branch --show-current) && git push origin v$ver"
 echo
 echo "It lands as a pre-release. Promote it once it has proven itself:"
-echo "    gh release edit v$ver --prerelease=false --latest"
+echo "    scripts/promote.sh $ver"

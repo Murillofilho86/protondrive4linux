@@ -127,7 +127,7 @@ jobs:
           draft: false
           # Every tag ships as a pre-release. Promotion to stable is a separate,
           # deliberate decision made once a build has proven itself:
-          #   gh release edit vX.Y.Z --prerelease=false --latest
+          #   scripts/promote.sh X.Y.Z
           # That release then carries GitHub's "Latest" badge, which only ever
           # sits on one release at a time, and the updater's stable channel
           # starts offering it. The prerelease channel sees every tag as it lands.

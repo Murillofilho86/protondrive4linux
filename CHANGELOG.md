@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ## [Unreleased]
 
 ### Added
+- `scripts/promote.sh X.Y.Z` promotes a pre-release to stable, and `--demote` puts it back. GitHub carries only two badges, "Latest" on a single release and "Pre-release" on each flagged one, so a stable release that is not the newest stable shows nothing at all. The script therefore clears the pre-release flag, moves the "Latest" badge, and marks the title `NeutronSync vX.Y.Z (stable)` so the distinction stays visible down the list.
 - `scripts/release.sh` cuts a release in one command: it bumps the version in `Cargo.toml` and `Cargo.lock`, closes the changelog's `[Unreleased]` section as `## [x.y.z] - <date>`, commits, and creates the signed tag. It refuses to run on a dirty tree, on a version that already exists, or on an empty `[Unreleased]`, and it stops before pushing, so nothing reaches GitHub without a deliberate `git push`. `--dry-run` prints the release body it would publish.
 
 ### Changed
