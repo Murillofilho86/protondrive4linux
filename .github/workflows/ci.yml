@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [rust]
+    branches: [master]
   pull_request:
 
 env:
@@ -36,11 +36,21 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Build (with GUI)
-        run: cargo build --features gui --bin neutronsync-gui
+        run: cargo build --features gui --bin protondrive4linux-gui
 
       - name: Test
         run: cargo test --all-features
 
-      # Informational: clippy shouldn't block a merge on style nits for now.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
       - name: Clippy
-        run: cargo clippy --all-targets --all-features || true
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
