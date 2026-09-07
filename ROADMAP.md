@@ -34,71 +34,81 @@ features novas.
 e o que deve ser descartado, antes de construir qualquer coisa em cima dele.
 
 ### 0.1 Proveniência e integridade da cadeia de build
-- [ ] Verificar autoria dos commits (`git log --format='%an %ae %ad'`) — checar consistência de
+- [x] Verificar autoria dos commits (`git log --format='%an %ae %ad'`) — checar consistência de
       identidade, saltos temporais suspeitos (muitos commits/releases no mesmo dia), e se há GPG
       signing real nas tags (o README alega "signed releases" — confirmar, não assumir).
-- [ ] Auditar `Cargo.toml` / `Cargo.lock` por completo: toda dependência third-party, versão fixada,
+- [x] Auditar `Cargo.toml` / `Cargo.lock` por completo: toda dependência third-party, versão fixada,
       data de publicação no crates.io, número de downloads, maintainer. Marcar qualquer crate com
       poucos downloads/manutenção recente como candidato a substituição.
-- [ ] Rodar `cargo audit` e `cargo deny check` contra o `Cargo.lock` herdado.
-- [ ] Verificar se o binário `proton-drive` é sempre resolvido via PATH/checksum documentado, nunca
+- [x] Rodar `cargo audit` e `cargo deny check` contra o `Cargo.lock` herdado.
+- [x] Verificar se o binário `proton-drive` é sempre resolvido via PATH/checksum documentado, nunca
       baixado automaticamente sem verificação pelo próprio fork (evitar supply-chain attack via
       download silencioso).
 
 ### 0.2 Superfície de execução de processo externo
-- [ ] Mapear **todo** ponto do código que faz `std::process::Command` (ou equivalente) para invocar
+- [x] Mapear **todo** ponto do código que faz `std::process::Command` (ou equivalente) para invocar
       o `proton-drive` CLI. Esse é o ponto de maior risco: injeção de argumento, path hijacking
       (binário `proton-drive` errado sendo executado do PATH), variáveis de ambiente vazando para
       o subprocesso.
-- [ ] Confirmar que argumentos passados ao CLI nunca são construídos por concatenação de string a
+- [x] Confirmar que argumentos passados ao CLI nunca são construídos por concatenação de string a
       partir de input do usuário/config sem sanitização (paths de pastas configuráveis pelo usuário
       são o vetor óbvio).
-- [ ] Confirmar que segredos (senha, mailbox password, 2FA) nunca passam por argumento de processo
+- [x] Confirmar que segredos (senha, mailbox password, 2FA) nunca passam por argumento de processo
       (visível via `/proc/<pid>/cmdline` para outros usuários) — devem ir via stdin ou arquivo com
       permissão restrita, como o próprio CLI oficial recomenda.
 
 ### 0.3 Armazenamento de credenciais e estado
-- [ ] Confirmar que o fork **não** duplica nem faz cache de sessão fora do que o `proton-drive`
+- [x] Confirmar que o fork **não** duplica nem faz cache de sessão fora do que o `proton-drive`
       CLI já gerencia (que fica no keyring do SO). Qualquer cache próprio de token é superfície
       de ataque adicional que o projeto original pode ou não ter tratado corretamente.
-- [ ] Revisar permissões de arquivo de tudo que o fork escreve em disco: config TOML, baseline
+- [x] Revisar permissões de arquivo de tudo que o fork escreve em disco: config TOML, baseline
       de sync, logs. Confirmar `0600`/`0700` onde aplicável (dados de caminho de arquivo do
-      usuário podem ser sensíveis).
-- [ ] Verificar tratamento de `PROTON_DRIVE_UNSAFE_SECRETS` e modos de fallback sem keyring —
+      usuário podem ser sensíveis). — corrigido: `state_dir` e o config TOML agora são `0700`/`0600`.
+- [x] Verificar tratamento de `PROTON_DRIVE_UNSAFE_SECRETS` e modos de fallback sem keyring —
       confirmar que o fork nunca ativa esse modo silenciosamente.
 
 ### 0.4 Modelo de sync — corretude e segurança de dados
-- [ ] Ler `docs/SYNC_MODEL.md` do projeto original linha a linha e validar cada alegação contra
+- [x] Ler `docs/SYNC_MODEL.md` do projeto original linha a linha e validar cada alegação contra
       o código real (não confiar na documentação por si só).
-- [ ] Escrever testes adversariais próprios para os cenários que o README alega tratar:
-      baseline ausente, pasta local desmontada, pasta remota que sumiu, falha no meio da
-      transferência, corrida entre watch (inotify) e rescan periódico.
-- [ ] Validar especificamente o caso de **deleção**: simular os cenários descritos e confirmar
+- [x] Escrever testes adversariais próprios para os cenários que o README alega tratar: baseline
+      ausente, pasta local desmontada, pasta remota que sumiu, falha no meio da transferência —
+      cobertos (o gap de cobertura para "pasta remota base sumida" foi fechado com
+      `vanished_remote_base_suppresses_delete`). **Pendente**: corrida real entre watch (inotify)
+      e rescan periódico sob carga — não reproduzida, exigiria o `proton-drive` CLI real.
+- [x] Validar especificamente o caso de **deleção**: simular os cenários descritos e confirmar
       empiricamente que nunca há deleção em massa não intencional — este é o risco mais grave
       de qualquer sync engine (perda de dados do usuário).
 - [ ] Avaliar a estratégia de comparação padrão (`size+mtime`) quanto a falsos negativos e decidir
       se o padrão do fork deve ser `sha1` (mais seguro, mais lento) em vez de manter o upstream.
+      **Adiado para a Fase 2** (decisão de produto, não bug de segurança).
 
 ### 0.5 GUI e superfície de tray/IPC
-- [ ] Revisar o `docs/GUI_API.md` e a comunicação entre o daemon de watch e a GUI — confirmar que
-      não há socket/IPC exposto sem controle de acesso (mesmo em localhost).
-- [ ] Verificar se dependências de GUI (egui, tray via `libayatana-appindicator3`) têm CVEs
-      conhecidos nas versões fixadas.
+- [x] Revisar o `docs/GUI_API.md` e a comunicação entre o daemon de watch e a GUI — confirmar que
+      não há socket/IPC exposto sem controle de acesso (mesmo em localhost). — é um arquivo
+      (`status.json`), não socket; herdava o mesmo problema de permissões do item 0.3, já corrigido.
+- [x] Verificar se dependências de GUI (egui, tray via `libayatana-appindicator3`) têm CVEs
+      conhecidos nas versões fixadas. — `cargo deny check advisories` cobre as 533 crates do
+      lockfile, incluindo as da feature `gui`; nenhuma advisory conhecida.
 
 ### 0.6 Auto-update
-- [ ] O README alega atualização in-app via releases do GitHub com verificação de checksum e
+- [x] O README alega atualização in-app via releases do GitHub com verificação de checksum e
       instalação via `pkexec`. Auditar esse fluxo com atenção redobrada — é o único ponto do
       projeto com potencial de escalação de privilégio. Confirmar: checksum vem de canal
       confiável (não só do mesmo release que está sendo verificado), assinatura GPG é
-      efetivamente checada antes do `pkexec`, e não há TOCTOU entre download e instalação.
-- [ ] Decisão de design: considerar desabilitar auto-update na v0 do fork e mover para
+      efetivamente checada antes do `pkexec`, e não há TOCTOU entre download e instalação. —
+      confirmado que o checksum vem do mesmo canal (não é assinatura independente); sem TOCTOU
+      explorável (diretório de download `0700` por PID).
+- [x] Decisão de design: considerar desabilitar auto-update na v0 do fork e mover para
       atualização apenas via AUR (`pacman -Syu`), eliminando essa superfície de ataque até
-      o mecanismo ser reescrito e auditado com calma.
+      o mecanismo ser reescrito e auditado com calma. — feito: `updater::UPDATES_ENABLED = false`.
 
-### Critério de saída da Fase 0
-Documento `SECURITY_AUDIT.md` com achados classificados (crítico/alto/médio/baixo), decisão
-por item (corrigir agora / corrigir depois / aceitar risco / descartar componente), e um `git log`
-limpo mostrando que os itens críticos já foram corrigidos antes de seguir para a Fase 1.
+### Critério de saída da Fase 0 — ✅ atendido
+`SECURITY_AUDIT.md` documenta os achados classificados e a decisão por item. Os 4 itens
+Crítico/Alto (REPO do updater apontando pro upstream, permissões de `state_dir`, auto-update
+sem assinatura independente, gap de cobertura em `remote_root_missing`) foram corrigidos e
+commitados (`6cad543`, `883778a`, `a5e25ff`) antes da Fase 1 começar. Uma revisão de código
+adicional (7 achados: índices de diálogo desatualizados, nomes de par duplicados, remoção
+local sem `gio`, corrida de lock, etc.) também foi feita e corrigida na mesma janela.
 
 ---
 
@@ -106,22 +116,34 @@ limpo mostrando que os itens críticos já foram corrigidos antes de seguir para
 
 **Objetivo**: ter o fork rodando localmente, com CI própria, antes de qualquer feature nova.
 
-- [ ] Fork real no seu GitHub, rebranding mínimo (nome do binário, app ID, sem usar marca/ícone
-      da Proton — ver `NOTICE.md`/trademark do upstream).
-- [ ] `cargo test` completo passando localmente no Arch Linux (não só CI do upstream).
-- [ ] Confirmar build reprodutível: `cargo build --release` e `cargo build --release --features gui`
+- [x] Fork real no seu GitHub, rebranding mínimo (nome do binário, app ID, sem usar marca/ícone
+      da Proton — ver `NOTICE.md`/trademark do upstream). — renomeado para **protondrive4linux**
+      (ver a discussão sobre a política de marca da Proton nesta sessão); repo:
+      `Murillofilho86/protondrive_linux_sync`, branch `master`.
+- [x] `cargo test` completo passando localmente no Arch Linux (não só CI do upstream). — 61/61
+      (22 unitários + 39 em `tests/engine.rs`).
+- [x] Confirmar build reprodutível: `cargo build --release` e `cargo build --release --features gui`
       funcionando com as libs do sistema listadas no README (`libgtk-3-dev`, etc. — mapear para
       nomes de pacote Arch: `gtk3`, `libxkbcommon`, `wayland`, `libx11`, `libxcb`, `mesa`,
-      `libayatana-appindicator`... confirmar cada um).
-- [ ] Configurar CI própria (GitHub Actions ou similar) rodando: `cargo test`, `cargo clippy -- -D warnings`,
+      `libayatana-appindicator`... confirmar cada um). — confirmado num container `archlinux:base`
+      genuinamente limpo (não nesta máquina de dev, que já tinha quase tudo instalado): build,
+      testes e empacotamento dos dois binários funcionaram do zero.
+- [x] Configurar CI própria (GitHub Actions ou similar) rodando: `cargo test`, `cargo clippy -- -D warnings`,
       `cargo audit`, `cargo fmt --check` a cada PR.
-- [ ] `PKGBUILD` inicial para build local via `makepkg` (ainda não submeter ao AUR nesta fase).
-- [ ] Decidir e documentar o novo nome do projeto (evitar confusão com "NeutronSync" upstream e
-      com qualquer marca Proton).
+- [x] `PKGBUILD` inicial para build local via `makepkg` (ainda não submeter ao AUR nesta fase). —
+      variante `-git`; achou e corrigiu um bug real (`options=('!lto')` — o `-flto=auto` padrão do
+      Arch quebra a compilação C bundled do SQLite) que teria impedido a instalação de qualquer
+      pessoa usando configuração padrão do `makepkg.conf`.
+- [x] Decidir e documentar o novo nome do projeto (evitar confusão com "NeutronSync" upstream e
+      com qualquer marca Proton). — **protondrive4linux**.
 
-### Critério de saída
-`makepkg -si` funcionando do zero numa máquina Arch limpa, instalando um binário que faz
-login e um `sync --dry-run` bem-sucedido.
+### Critério de saída — ✅ atendido (com uma ressalva)
+`makepkg -s` (build) validado de ponta a ponta num container Arch limpo: clona do GitHub,
+`pkgver()` correto a partir da tag `v0.4.0`, compila CLI+GUI, roda os 61 testes, empacota.
+**Ressalva**: `makepkg -si` (instalar de verdade) + `login` + `sync --dry-run` com uma conta
+Proton real não foi executado nesta sessão — exige credenciais interativas do usuário num
+sistema real, não um container efêmero. Fica como o próximo passo manual antes de considerar
+a Fase 1 100% fechada.
 
 ---
 
