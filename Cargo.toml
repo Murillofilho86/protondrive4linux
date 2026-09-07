@@ -1,20 +1,24 @@
 [package]
-name = "neutronsync"
+name = "protondrive4linux"
 version = "0.3.3"
 edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/WilhelmZA/protondrive_linux_sync"
-homepage = "https://github.com/WilhelmZA/protondrive_linux_sync"
+repository = "https://github.com/Murillofilho86/protondrive_linux_sync"
+homepage = "https://github.com/Murillofilho86/protondrive_linux_sync"
 
 # Library core (reused by the CLI now, and a GUI later) + a thin CLI binary.
+# The lib keeps its original internal crate name (neutronsync) - it's Cargo's
+# Rust-side identifier only, invisible to end users, and renaming it would
+# mean touching every `neutronsync::` path across src/ and tests/ for no
+# user-facing benefit.
 [lib]
 name = "neutronsync"
 path = "src/lib.rs"
 
 [[bin]]
-name = "neutronsync"
+name = "protondrive4linux"
 path = "src/main.rs"
 
 [dependencies]
@@ -48,7 +52,7 @@ panic = "abort"
 
 [features]
 # The GUI is opt-in so the CLI stays dependency-light:
-#   cargo run --features gui --bin neutronsync-gui
+#   cargo run --features gui --bin protondrive4linux-gui
 gui = [
     "dep:eframe",
     "dep:rfd",
@@ -62,7 +66,7 @@ gui = [
 ]
 
 [[bin]]
-name = "neutronsync-gui"
+name = "protondrive4linux-gui"
 path = "src/bin/gui.rs"
 required-features = ["gui"]
 
@@ -73,38 +77,38 @@ required-features = ["gui"]
 #   cargo deb --features gui         &&   cargo generate-rpm
 # proton-drive is a runtime prerequisite (not in distro repos) - see README.
 [package.metadata.deb]
-maintainer = "Wilhelm Schonfeldt"
-copyright = "2026 Wilhelm Schonfeldt"
+maintainer = "Murillofilho86 <murillohard@hotmail.com>"
+copyright = "2026 Wilhelm Schonfeldt, 2026 Murillofilho86"
 section = "utils"
 priority = "optional"
 depends = "$auto, libgl1, libxkbcommon0"
 extended-description = """\
 Bidirectional Proton Drive folder sync built on the official proton-drive CLI. \
-Ships a CLI (neutronsync) and a native GUI (neutronsync-gui). Requires the \
+Ships a CLI (protondrive4linux) and a native GUI (protondrive4linux-gui). Requires the \
 proton-drive CLI to be installed separately."""
 assets = [
-    ["target/release/neutronsync", "usr/bin/", "755"],
-    ["target/release/neutronsync-gui", "usr/bin/", "755"],
-    ["packaging/neutronsync-gui.desktop", "usr/share/applications/", "644"],
-    ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/neutronsync.png", "644"],
-    ["assets/neutron-logo.svg", "usr/share/icons/hicolor/scalable/apps/neutronsync.svg", "644"],
-    ["systemd/neutronsync-watch.service", "usr/lib/systemd/user/", "644"],
-    ["systemd/neutronsync.service", "usr/lib/systemd/user/", "644"],
-    ["systemd/neutronsync.timer", "usr/lib/systemd/user/", "644"],
-    ["README.md", "usr/share/doc/neutronsync/README.md", "644"],
-    ["LICENSE", "usr/share/doc/neutronsync/LICENSE", "644"],
+    ["target/release/protondrive4linux", "usr/bin/", "755"],
+    ["target/release/protondrive4linux-gui", "usr/bin/", "755"],
+    ["packaging/protondrive4linux-gui.desktop", "usr/share/applications/", "644"],
+    ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/protondrive4linux.png", "644"],
+    ["assets/neutron-logo.svg", "usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", "644"],
+    ["systemd/protondrive4linux-watch.service", "usr/lib/systemd/user/", "644"],
+    ["systemd/protondrive4linux.service", "usr/lib/systemd/user/", "644"],
+    ["systemd/protondrive4linux.timer", "usr/lib/systemd/user/", "644"],
+    ["README.md", "usr/share/doc/protondrive4linux/README.md", "644"],
+    ["LICENSE", "usr/share/doc/protondrive4linux/LICENSE", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/neutronsync", dest = "/usr/bin/neutronsync", mode = "755" },
-    { source = "target/release/neutronsync-gui", dest = "/usr/bin/neutronsync-gui", mode = "755" },
-    { source = "packaging/neutronsync-gui.desktop", dest = "/usr/share/applications/neutronsync-gui.desktop", mode = "644" },
-    { source = "assets/logo.png", dest = "/usr/share/icons/hicolor/256x256/apps/neutronsync.png", mode = "644" },
-    { source = "assets/neutron-logo.svg", dest = "/usr/share/icons/hicolor/scalable/apps/neutronsync.svg", mode = "644" },
-    { source = "systemd/neutronsync-watch.service", dest = "/usr/lib/systemd/user/neutronsync-watch.service", mode = "644" },
-    { source = "systemd/neutronsync.service", dest = "/usr/lib/systemd/user/neutronsync.service", mode = "644" },
-    { source = "systemd/neutronsync.timer", dest = "/usr/lib/systemd/user/neutronsync.timer", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/neutronsync/README.md", mode = "644" },
-    { source = "LICENSE", dest = "/usr/share/doc/neutronsync/LICENSE", mode = "644" },
+    { source = "target/release/protondrive4linux", dest = "/usr/bin/protondrive4linux", mode = "755" },
+    { source = "target/release/protondrive4linux-gui", dest = "/usr/bin/protondrive4linux-gui", mode = "755" },
+    { source = "packaging/protondrive4linux-gui.desktop", dest = "/usr/share/applications/protondrive4linux-gui.desktop", mode = "644" },
+    { source = "assets/logo.png", dest = "/usr/share/icons/hicolor/256x256/apps/protondrive4linux.png", mode = "644" },
+    { source = "assets/neutron-logo.svg", dest = "/usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", mode = "644" },
+    { source = "systemd/protondrive4linux-watch.service", dest = "/usr/lib/systemd/user/protondrive4linux-watch.service", mode = "644" },
+    { source = "systemd/protondrive4linux.service", dest = "/usr/lib/systemd/user/protondrive4linux.service", mode = "644" },
+    { source = "systemd/protondrive4linux.timer", dest = "/usr/lib/systemd/user/protondrive4linux.timer", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/protondrive4linux/README.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/doc/protondrive4linux/LICENSE", mode = "644" },
 ]

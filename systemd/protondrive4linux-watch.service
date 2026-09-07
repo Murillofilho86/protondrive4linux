@@ -1,12 +1,12 @@
 [Unit]
-Description=Proton Drive live sync (neutronsync watch)
+Description=Proton Drive live sync (protondrive4linux watch)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Adjust the path to wherever you installed the binary (see neutronsync.service).
-ExecStart=/usr/bin/neutronsync watch
+# Adjust the path to wherever you installed the binary (see protondrive4linux.service).
+ExecStart=/usr/bin/protondrive4linux watch
 Restart=on-failure
 RestartSec=30
 Nice=10

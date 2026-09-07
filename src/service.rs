@@ -600,7 +600,7 @@ impl Controller {
         s.pairs.retain(|p| p.name != name);
     }
 
-    /// Wipe all NeutronSync metadata — baseline, per-file state, hot-folder
+    /// Wipe all protondrive4linux metadata — baseline, per-file state, hot-folder
     /// stats and the activity feed — and stop watching. Local files are NOT
     /// touched. The caller clears the folder list from the config.
     pub fn reset_data(&self) {

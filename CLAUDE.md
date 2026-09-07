@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-NeutronSync: bidirectional folder sync for Proton Drive on Linux, built on top of the official `proton-drive` CLI (which has no sync engine of its own — this crate adds a three-way-merge engine driven entirely by that CLI's one-shot commands). Single Cargo crate: a core library, a CLI binary, and an optional GUI binary.
+protondrive4linux: bidirectional folder sync for Proton Drive on Linux, built on top of the official `proton-drive` CLI (which has no sync engine of its own — this crate adds a three-way-merge engine driven entirely by that CLI's one-shot commands). Single Cargo crate: a core library, a CLI binary, and an optional GUI binary.
 
 Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for the sync design/invariants (required reading before touching `engine.rs` or `watcher.rs`), and `docs/GUI_API.md` for the `service::Controller` API the GUI is built on.
 
@@ -14,8 +14,8 @@ Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for t
 cargo build                                    # lib + CLI
 cargo test                                     # engine + unit tests (the real spec for sync behavior)
 cargo test <test_name>                         # run a single test, e.g. cargo test conflict_keep_both
-cargo build --features gui --bin neutronsync-gui
-cargo run   --features gui --bin neutronsync-gui
+cargo build --features gui --bin protondrive4linux-gui
+cargo run   --features gui --bin protondrive4linux-gui
 ```
 
 GUI build needs system libs (Debian/Ubuntu): `libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libxdo-dev libayatana-appindicator3-dev`.
@@ -30,7 +30,7 @@ Not something to do casually — see `CONTRIBUTING.md` for full detail. In short
 
 ### Module layout (`src/lib.rs`)
 
-- `config` — TOML config load/parse (`~/.config/neutronsync/neutronsync.toml`), `[[pair]]` definitions.
+- `config` — TOML config load/parse (`~/.config/protondrive4linux/protondrive4linux.toml`), `[[pair]]` definitions.
 - `models` — shared data types (pair, file entry, etc.).
 - `protoncli` — the **only** place that knows `proton-drive` CLI specifics (flags, invocation, output parsing). Keep all CLI-adapter logic contained here.
 - `engine` — the three-way-merge sync engine: classifies each path per side against the baseline (Created/Modified/Deleted/Unchanged/Absent) and decides an action (`decide` / `decide_dir`). Also owns the streaming full-walk implementation (`run_sync_streaming`) and its tested sequential oracle (`Engine::sync_pair_streaming`).
@@ -45,8 +45,8 @@ Not something to do casually — see `CONTRIBUTING.md` for full detail. In short
 
 ### Binaries
 
-- `src/main.rs` — `neutronsync` CLI (thin wrapper over the library: `login`, `init`, `sync`, `status`, `doctor`, `logout`, `watch`).
-- `src/bin/gui.rs` — `neutronsync-gui` (egui, behind `gui` feature). Intentionally thin over `service::Controller`; has no sync logic of its own.
+- `src/main.rs` — `protondrive4linux` CLI (thin wrapper over the library: `login`, `init`, `sync`, `status`, `doctor`, `logout`, `watch`).
+- `src/bin/gui.rs` — `protondrive4linux-gui` (egui, behind `gui` feature). Intentionally thin over `service::Controller`; has no sync logic of its own.
 
 ### Key design constraints (see `docs/SYNC_MODEL.md` for full detail)
 

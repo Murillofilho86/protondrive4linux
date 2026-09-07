@@ -46,7 +46,7 @@ gh release view "$tag" >/dev/null 2>&1 ||
 if [ "$demote" -eq 1 ]; then
 	gh release edit "$tag" \
 		--prerelease=true \
-		--title "NeutronSync $tag" \
+		--title "protondrive4linux $tag" \
 		--verify-tag >/dev/null
 	echo "$tag is a pre-release again."
 	echo
@@ -56,7 +56,7 @@ else
 	gh release edit "$tag" \
 		--prerelease=false \
 		--latest \
-		--title "NeutronSync $tag (stable)" \
+		--title "protondrive4linux $tag (stable)" \
 		--verify-tag >/dev/null
 	echo "$tag is stable and now carries the \"Latest\" badge."
 	echo

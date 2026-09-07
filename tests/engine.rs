@@ -283,7 +283,7 @@ impl Tmp {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("neutronsync-test-{tag}-{n}"));
+        let p = std::env::temp_dir().join(format!("protondrive4linux-test-{tag}-{n}"));
         std::fs::create_dir_all(&p).unwrap();
         Tmp(p)
     }

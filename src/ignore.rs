@@ -79,7 +79,7 @@ pub const DEFAULT_IGNORE: &[&str] = &[
     ".dropbox",
     ".dropbox.cache",
     ".dropbox.attr",
-    // NeutronSync keep-both copies — never re-sync them or they nest forever
+    // protondrive4linux keep-both copies — never re-sync them or they nest forever
     // ("file (conflict …) (conflict …).pdf").
     "*(conflict *)*",
 ];
@@ -172,7 +172,7 @@ mod tests {
         assert!(!is_ignored_junk("notes/synced-plan.md")); // contains "sync" but not a component
         assert!(!is_ignored_junk("music/track.tmp3")); // not a .tmp extension
         assert!(!is_ignored_junk(""));
-        // NeutronSync conflict copies must be ignored (or they re-sync and nest)
+        // protondrive4linux conflict copies must be ignored (or they re-sync and nest)
         assert!(is_ignored_junk(
             "_Actuarial/record (conflict 20260826-062245).pdf"
         ));

@@ -1,8 +1,8 @@
 //! Configuration loading and validation (TOML).
 //!
-//! Search order: `--config PATH`, `$NEUTRONSYNC_CONFIG`,
-//! `$XDG_CONFIG_HOME/neutronsync/neutronsync.toml` (`~/.config/...`),
-//! then `./neutronsync.toml`.
+//! Search order: `--config PATH`, `$PROTONDRIVE4LINUX_CONFIG`,
+//! `$XDG_CONFIG_HOME/protondrive4linux/protondrive4linux.toml` (`~/.config/...`),
+//! then `./protondrive4linux.toml`.
 
 use std::path::{Path, PathBuf};
 
@@ -195,7 +195,9 @@ fn state_home() -> PathBuf {
 }
 
 pub fn default_config_path() -> PathBuf {
-    config_home().join("neutronsync").join("neutronsync.toml")
+    config_home()
+        .join("protondrive4linux")
+        .join("protondrive4linux.toml")
 }
 
 /// Expand a leading `~` and `$VAR` / `${VAR}` references.
@@ -268,14 +270,14 @@ pub fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(e) = explicit {
         candidates.push(expand(e));
     }
-    if let Ok(e) = std::env::var("NEUTRONSYNC_CONFIG") {
+    if let Ok(e) = std::env::var("PROTONDRIVE4LINUX_CONFIG") {
         if !e.is_empty() {
             candidates.push(expand(&e));
         }
     }
     candidates.push(default_config_path());
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("neutronsync.toml"));
+        candidates.push(cwd.join("protondrive4linux.toml"));
     }
     candidates.into_iter().find(|c| c.is_file())
 }
@@ -283,7 +285,7 @@ pub fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
 pub fn load(explicit: Option<&str>) -> Result<Config> {
     let path = find_config(explicit).with_context(|| {
         format!(
-            "No config found. Run `neutronsync init` to create one at {}.",
+            "No config found. Run `protondrive4linux init` to create one at {}.",
             default_config_path().display()
         )
     })?;
@@ -344,7 +346,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 
     let state_dir = match opts.state_dir {
         Some(s) => expand(&s),
-        None => state_home().join("neutronsync"),
+        None => state_home().join("protondrive4linux"),
     };
 
     // Zero pairs is allowed: the app can come up clean and folders get added
@@ -678,10 +680,8 @@ mod tests {
 
     #[test]
     fn migrates_legacy_conflict_strategy_download() {
-        let got = migrate_transfer_flags(
-            vec!["-c".into(), "replace".into()],
-            TransferKind::Download,
-        );
+        let got =
+            migrate_transfer_flags(vec!["-c".into(), "replace".into()], TransferKind::Download);
         assert_eq!(
             got,
             vec![

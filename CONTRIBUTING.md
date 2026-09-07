@@ -7,8 +7,8 @@ A single Cargo crate: a **library** (the reusable core) plus two binaries.
 - `src/lib.rs` — core: `config`, `models`, `protoncli` (adapter over the
   `proton-drive` CLI), `engine` (three-way merge), `state`, `trash`, `datefmt`,
   `logger`, `events`, `service` (`Controller` for frontends), `watcher`.
-- `src/main.rs` — the `neutronsync` CLI.
-- `src/bin/gui.rs` — the `neutronsync-gui` GUI (behind the `gui` feature).
+- `src/main.rs` — the `protondrive4linux` CLI.
+- `src/bin/gui.rs` — the `protondrive4linux-gui` GUI (behind the `gui` feature).
 
 The GUI is intentionally thin over `service::Controller` (see `docs/GUI_API.md`);
 the core has no UI or CLI assumptions.
@@ -18,8 +18,8 @@ the core has no UI or CLI assumptions.
 ```sh
 cargo build                       # lib + CLI
 cargo test                        # engine + unit tests
-cargo build --features gui --bin neutronsync-gui
-cargo run   --features gui --bin neutronsync-gui
+cargo build --features gui --bin protondrive4linux-gui
+cargo run   --features gui --bin protondrive4linux-gui
 ```
 
 GUI build needs system libs (Debian/Ubuntu):

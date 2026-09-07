@@ -361,7 +361,7 @@ impl Stats {
         Ok(())
     }
 
-    /// Wipe all NeutronSync metadata (every table). Local files are untouched.
+    /// Wipe all protondrive4linux metadata (every table). Local files are untouched.
     pub fn wipe(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(

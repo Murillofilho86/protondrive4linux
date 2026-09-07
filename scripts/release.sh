@@ -110,7 +110,7 @@ awk -v v="$ver" '
 # The lockfile records the crate's own version too; patch it in place rather
 # than making a release depend on cargo being able to reach the network.
 awk -v v="$ver" '
-	/^name = "neutronsync"$/     { hit = 1; print; next }
+	/^name = "protondrive4linux"$/ { hit = 1; print; next }
 	hit && /^version = "/        { print "version = \"" v "\""; hit = 0; next }
 	{ print }
 ' Cargo.lock >Cargo.lock.new && mv Cargo.lock.new Cargo.lock
@@ -153,7 +153,7 @@ else
 fi
 
 # tag.gpgsign is set in this repo, so -a signs.
-git tag -a "v$ver" -F <(printf 'NeutronSync v%s\n\n%s\n' "$ver" "$notes")
+git tag -a "v$ver" -F <(printf 'protondrive4linux v%s\n\n%s\n' "$ver" "$notes")
 
 if git cat-file tag "v$ver" | grep -q 'BEGIN PGP SIGNATURE'; then
 	signed='signed'

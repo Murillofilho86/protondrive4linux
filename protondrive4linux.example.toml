@@ -1,5 +1,6 @@
-# neutronsync configuration. Copy to ~/.config/neutronsync/neutronsync.toml
-# (or run `neutronsync init`), then edit. See README.md.
+# protondrive4linux configuration. Copy to
+# ~/.config/protondrive4linux/protondrive4linux.toml (or run
+# `protondrive4linux init`), then edit. See README.md.
 
 [cli]
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
@@ -49,7 +50,7 @@ conflict = "keep-both"
 #   sha1        strictest; hashes local files and compares to Proton's claimedDigests.sha1
 compare = "size+mtime"
 
-# Watch mode (`neutronsync watch`). Two tiers catch remote changes:
+# Watch mode (`protondrive4linux watch`). Two tiers catch remote changes:
 #   scan_interval - short: re-check only "hot" (recently active) folders often.
 #   poll_interval - long: full rescan of everything (the safety net).
 # debounce is how long a burst of local file events settles before syncing.

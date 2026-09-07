@@ -1,16 +1,16 @@
 <p align="center">
-  <img src="assets/logo.png" width="88" alt="NeutronSync">
+  <img src="assets/logo.png" width="88" alt="protondrive4linux">
 </p>
 
-<h1 align="center">NeutronSync</h1>
+<h1 align="center">protondrive4linux</h1>
 
 <p align="center">
   Bidirectional folder sync for Proton Drive on Linux, built on Proton's official <code>proton-drive</code> CLI.
 </p>
 
-> NeutronSync is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG. NeutronSync never sees your Proton credentials; it only drives Proton's own CLI, which you log in yourself.
+> protondrive4linux is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Proton AG. "Proton" and "Proton Drive" are trademarks of Proton AG. protondrive4linux never sees your Proton credentials; it only drives Proton's own CLI, which you log in yourself.
 
-The official `proton-drive` CLI can upload, download, list, and manage sharing, but it has no sync engine. NeutronSync adds one: a three-way-merge engine that keeps one or more local folders and their Proton Drive counterparts in sync in both directions, driven entirely by the CLI's one-shot commands. It ships as a dependency-light CLI plus an optional native GUI, both on one core library.
+The official `proton-drive` CLI can upload, download, list, and manage sharing, but it has no sync engine. protondrive4linux adds one: a three-way-merge engine that keeps one or more local folders and their Proton Drive counterparts in sync in both directions, driven entirely by the CLI's one-shot commands. It ships as a dependency-light CLI plus an optional native GUI, both on one core library.
 
 ## Features
 
@@ -34,26 +34,26 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 
 ```sh
 # download the .deb from the Releases page, then:
-sudo apt install ./neutronsync_<version>_amd64.deb
+sudo apt install ./protondrive4linux_<version>_amd64.deb
 ```
 
 ### From a release (Fedora/RHEL)
 
 ```sh
-sudo dnf install ./neutronsync-<version>.x86_64.rpm
+sudo dnf install ./protondrive4linux-<version>.x86_64.rpm
 ```
 
-Both packages install the `neutronsync` CLI and `neutronsync-gui` GUI to `/usr/bin`, a desktop launcher, and systemd user units. A portable `neutronsync-<version>-x86_64-linux.tar.gz` (both binaries) is also attached to each release if you'd rather not use a package manager.
+Both packages install the `protondrive4linux` CLI and `protondrive4linux-gui` GUI to `/usr/bin`, a desktop launcher, and systemd user units. A portable `protondrive4linux-<version>-x86_64-linux.tar.gz` (both binaries) is also attached to each release if you'd rather not use a package manager.
 
 ### From source
 
 ```sh
 # CLI
-cargo install --path .                      # -> ~/.cargo/bin/neutronsync
+cargo install --path .                      # -> ~/.cargo/bin/protondrive4linux
 cargo test                                  # engine + unit tests
 
 # GUI (opt-in feature, keeps the CLI dependency-light)
-cargo build --release --features gui --bin neutronsync-gui
+cargo build --release --features gui --bin protondrive4linux-gui
 ```
 
 The GUI build needs a few system libraries (Debian/Ubuntu):
@@ -67,26 +67,26 @@ sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
 
 ### GUI
 
-Launch **NeutronSync** from your app menu (or `neutronsync-gui`). Sign in to Proton (this opens Proton's own login in your browser and signs in the CLI), add folder pairs on the Folders page, and use "Choose folders to sync" to exclude any sub-folders you don't want. Settings covers the tray, auto-sync, conflict handling, and your update channel.
+Launch **protondrive4linux** from your app menu (or `protondrive4linux-gui`). Sign in to Proton (this opens Proton's own login in your browser and signs in the CLI), add folder pairs on the Folders page, and use "Choose folders to sync" to exclude any sub-folders you don't want. Settings covers the tray, auto-sync, conflict handling, and your update channel.
 
 ### CLI
 
 ```sh
-neutronsync login                       # proton-drive auth login (browser)
-neutronsync init                        # write ~/.config/neutronsync/neutronsync.toml
-$EDITOR ~/.config/neutronsync/neutronsync.toml
-neutronsync sync --dry-run              # preview
-neutronsync sync                        # apply
-neutronsync watch                       # live sync: FS events + periodic rescan
+protondrive4linux login                       # proton-drive auth login (browser)
+protondrive4linux init                        # write ~/.config/protondrive4linux/protondrive4linux.toml
+$EDITOR ~/.config/protondrive4linux/protondrive4linux.toml
+protondrive4linux sync --dry-run              # preview
+protondrive4linux sync                        # apply
+protondrive4linux watch                       # live sync: FS events + periodic rescan
 ```
 
 `init` writes an empty config; add your own `[[pair]]` entries. Other commands: `status`, `doctor [REMOTE_PATH]` (probe the CLI and show list parsing), `logout`. `sync` takes `--dry-run`, `--resync` (rebuild the baseline from the union of both sides), and `--json`; passing pair names syncs only those.
 
 ## How it works
 
-For each folder pair, NeutronSync keeps a baseline snapshot of the last state the two sides agreed on. On every run it scans the current local and remote trees and classifies each path against the baseline (created, modified, or deleted) independently per side. Combining the two verdicts decides the action and which side wins.
+For each folder pair, protondrive4linux keeps a baseline snapshot of the last state the two sides agreed on. On every run it scans the current local and remote trees and classifies each path against the baseline (created, modified, or deleted) independently per side. Combining the two verdicts decides the action and which side wins.
 
-**Detecting changes.** Proton's CLI has no "recently changed" feed, and rebuilding its SDK to add one isn't worthwhile. So NeutronSync watches your local folders live and aims the work at where the activity actually is:
+**Detecting changes.** Proton's CLI has no "recently changed" feed, and rebuilding its SDK to add one isn't worthwhile. So protondrive4linux watches your local folders live and aims the work at where the activity actually is:
 
 - A local change reconciles only the folder whose direct contents changed (one shallow folder listing), not the whole tree. Because the watch is recursive, a change deeper down arrives as its own event and reconciles its own folder, so editing one file never re-walks a subtree.
 - On startup it syncs folders with fresh local changes first, then recently active ("hot") folders, then everything else.
@@ -104,11 +104,11 @@ When the background tray daemon is doing the work, an open window mirrors its li
 
 ## Selective sync
 
-Each pair can list sub-paths to exclude (in the GUI's "Choose folders to sync", or `exclude = [...]` in the config). Excluded paths are ignored entirely and never touched on Proton. Excluding an already-synced folder freezes both copies in place; when you exclude one, NeutronSync offers to remove the local copy (to the desktop trash) to free space while the cloud copy stays. Re-including a folder later re-downloads it from the cloud, so excluding can never delete remote data.
+Each pair can list sub-paths to exclude (in the GUI's "Choose folders to sync", or `exclude = [...]` in the config). Excluded paths are ignored entirely and never touched on Proton. Excluding an already-synced folder freezes both copies in place; when you exclude one, protondrive4linux offers to remove the local copy (to the desktop trash) to free space while the cloud copy stays. Re-including a folder later re-downloads it from the cloud, so excluding can never delete remote data.
 
 ## Configuration
 
-TOML at `~/.config/neutronsync/neutronsync.toml` (override with `-c PATH` or `$NEUTRONSYNC_CONFIG`). See `neutronsync.example.toml` for the annotated template.
+TOML at `~/.config/protondrive4linux/protondrive4linux.toml` (override with `-c PATH` or `$PROTONDRIVE4LINUX_CONFIG`). See `protondrive4linux.example.toml` for the annotated template.
 
 ```toml
 [cli]
@@ -143,13 +143,13 @@ Use one of these, not both (they'd contend for the same pairs):
 
 ```sh
 # Live sync (recommended) — the watch daemon:
-systemctl --user enable --now neutronsync-watch.service
+systemctl --user enable --now protondrive4linux-watch.service
 
 # or a periodic timer instead:
-systemctl --user enable --now neutronsync.timer
+systemctl --user enable --now protondrive4linux.timer
 ```
 
-The packaged units target `/usr/bin/neutronsync`. If you installed with `cargo install`, edit `ExecStart` to `%h/.cargo/bin/neutronsync`. Proton Drive is rate-limited, so keep the sync set modest and the rescan interval sane.
+The packaged units target `/usr/bin/protondrive4linux`. If you installed with `cargo install`, edit `ExecStart` to `%h/.cargo/bin/protondrive4linux`. Proton Drive is rate-limited, so keep the sync set modest and the rescan interval sane.
 
 ## Updates
 
@@ -157,7 +157,7 @@ Releases come from GitHub. Every tag ships as a pre-release; a stable release is
 
 ## Privacy and trust
 
-NeutronSync has no access to your Proton account. Logging in runs Proton's own `proton-drive auth login` in your browser; the CLI stores the session in your OS keyring, and all encryption and decryption is done by Proton's software. NeutronSync never sees, stores, or transmits your password or Proton credentials. Sync logs (which record file paths, not secrets) are written private to your user.
+protondrive4linux has no access to your Proton account. Logging in runs Proton's own `proton-drive auth login` in your browser; the CLI stores the session in your OS keyring, and all encryption and decryption is done by Proton's software. protondrive4linux never sees, stores, or transmits your password or Proton credentials. Sync logs (which record file paths, not secrets) are written private to your user.
 
 ## Known limitations
 

@@ -10,7 +10,7 @@ Linux desktop users who keep folders in Proton Drive and want them synced withou
 
 ## Product Purpose
 
-NeutronSync keeps local folders and Proton Drive folders in sync, both ways, on top of Proton's official `proton-drive` CLI. Success is invisibility: files are just there on every machine, deletions are recoverable, and nothing destructive ever happens without positive confirmation. The GUI's job is calm supervision, folders, activity, account state, not engagement.
+protondrive4linux keeps local folders and Proton Drive folders in sync, both ways, on top of Proton's official `proton-drive` CLI. Success is invisibility: files are just there on every machine, deletions are recoverable, and nothing destructive ever happens without positive confirmation. The GUI's job is calm supervision, folders, activity, account state, not engagement.
 
 ## Brand Personality
 

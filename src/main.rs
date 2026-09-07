@@ -1,4 +1,4 @@
-//! neutronsync CLI: a thin front-end over the neutronsync core library.
+//! protondrive4linux CLI: a thin front-end over the neutronsync core library.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,7 +46,7 @@ impl EventSink for DbSink {
 
 #[derive(Parser)]
 #[command(
-    name = "neutronsync",
+    name = "protondrive4linux",
     version,
     about = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 )]
@@ -146,7 +146,7 @@ fn cmd_init(cli: &Cli, force: bool) -> anyhow::Result<ExitCode> {
     }
     std::fs::write(&dest, EXAMPLE_CONFIG)?;
     println!("Wrote starter config: {}", dest.display());
-    println!("Edit it, then run:  neutronsync login  &&  neutronsync sync --dry-run");
+    println!("Edit it, then run:  protondrive4linux login  &&  protondrive4linux sync --dry-run");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -172,7 +172,7 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
         .resolve_binary()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "NOT FOUND on PATH".to_string());
-    println!("neutronsync {}", env!("CARGO_PKG_VERSION"));
+    println!("protondrive4linux {}", env!("CARGO_PKG_VERSION"));
     if let Some(p) = &cfg.source_path {
         println!("config          {}", p.display());
     }
@@ -215,7 +215,7 @@ fn cmd_doctor(cli: &Cli, path: Option<&str>) -> anyhow::Result<ExitCode> {
     println!("--- raw JSON (first 1500 chars) ---");
     let shown: String = raw.chars().take(1500).collect();
     println!("{}", if shown.is_empty() { "(empty)" } else { &shown });
-    println!("--- parsed by neutronsync ---");
+    println!("--- parsed by protondrive4linux ---");
     match ProtonCli::parse_list(&raw, target) {
         Ok(entries) => {
             if entries.is_empty() {

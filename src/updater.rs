@@ -7,7 +7,7 @@
 //! [`restart`] replaces the running processes with the new build.
 //!
 //! Installing through the package manager is deliberate. Overwriting
-//! `/usr/bin/neutronsync*` directly is fewer steps, but it leaves dpkg still
+//! `/usr/bin/protondrive4linux*` directly is fewer steps, but it leaves dpkg still
 //! reporting the version of whatever `.deb` was last installed, which is how a
 //! machine ends up showing 0.1.0-1 in App Center while running 0.3.1.
 
@@ -98,12 +98,12 @@ impl InstallKind {
 }
 
 /// Detect how this copy was installed by asking each package manager whether it
-/// owns the `neutronsync` package. Neither owning it means unmanaged.
+/// owns the `protondrive4linux` package. Neither owning it means unmanaged.
 pub fn install_kind() -> InstallKind {
-    if package_installed("dpkg-query", &["-W", "neutronsync"]) {
+    if package_installed("dpkg-query", &["-W", "protondrive4linux"]) {
         return InstallKind::Deb;
     }
-    if package_installed("rpm", &["-q", "neutronsync"]) {
+    if package_installed("rpm", &["-q", "protondrive4linux"]) {
         return InstallKind::Rpm;
     }
     InstallKind::Unmanaged
@@ -131,9 +131,7 @@ pub fn pick_asset(info: &UpdateInfo, kind: InstallKind) -> Option<&Asset> {
 /// the repo is private); works tokenless once the repo is public.
 pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
     if !UPDATES_ENABLED {
-        bail!(
-            "In-app updates are disabled in this build; update via your package manager (AUR)."
-        );
+        bail!("In-app updates are disabled in this build; update via your package manager (AUR).");
     }
     let release = match channel {
         // The stable channel follows only promoted releases; `/releases/latest`
@@ -215,7 +213,7 @@ pub fn download(
     let dir = download_dir()?;
     let dest = dir.join(&asset.name);
 
-    let mut req = ureq::get(&asset.url).set("User-Agent", "neutronsync-updater");
+    let mut req = ureq::get(&asset.url).set("User-Agent", "protondrive4linux-updater");
     if let Some(tok) = token() {
         req = req.set("Authorization", &format!("Bearer {tok}"));
     }
@@ -260,7 +258,7 @@ pub fn download(
 /// A private (0700) directory for downloaded packages, reused across attempts.
 fn download_dir() -> Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = std::env::temp_dir().join(format!("neutronsync-update-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("protondrive4linux-update-{}", std::process::id()));
     if !dir.exists() {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -393,14 +391,18 @@ fn is_executable(p: &Path) -> bool {
 
 /// Replace the running app with the freshly installed build.
 ///
-/// The window and the tray daemon are both `neutronsync-gui` processes holding
-/// PID-keyed locks, and there is no single shutdown path between them, so a
-/// clean handover has to happen from outside: a detached shell waits for this
-/// process to go away, stops any remaining ones, and starts the pair again.
+/// The window and the tray daemon are both `protondrive4linux-gui` processes
+/// holding PID-keyed locks, and there is no single shutdown path between them,
+/// so a clean handover has to happen from outside: a detached shell waits for
+/// this process to go away, stops any remaining ones, and starts the pair again.
 pub fn restart() -> Result<()> {
-    let script = "sleep 1; pkill -x neutronsync-gui; sleep 1; \
-                  setsid neutronsync-gui --tray >/dev/null 2>&1 < /dev/null & \
-                  sleep 1; setsid neutronsync-gui >/dev/null 2>&1 < /dev/null &";
+    // pkill -x matches /proc/PID/comm, which the kernel truncates to 15 bytes
+    // - "neutronsync-gui" fit exactly, but "protondrive4linux-gui" (22 bytes)
+    // never would. -f matches the full command line instead, which isn't
+    // truncated.
+    let script = "sleep 1; pkill -f protondrive4linux-gui; sleep 1; \
+                  setsid protondrive4linux-gui --tray >/dev/null 2>&1 < /dev/null & \
+                  sleep 1; setsid protondrive4linux-gui >/dev/null 2>&1 < /dev/null &";
     Command::new("setsid")
         .args(["-f", "/bin/sh", "-c", script])
         .stdout(std::process::Stdio::null())
@@ -412,7 +414,7 @@ pub fn restart() -> Result<()> {
 
 fn fetch(url: &str) -> Result<String> {
     let mut req = ureq::get(url)
-        .set("User-Agent", "neutronsync-updater")
+        .set("User-Agent", "protondrive4linux-updater")
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28");
     if let Some(tok) = token() {
@@ -470,10 +472,10 @@ mod tests {
     /// The asset names here are the ones the release workflow actually produces.
     fn release_with_assets() -> UpdateInfo {
         let names = [
-            "neutronsync-0.3.3-1.x86_64.rpm",
-            "neutronsync-v0.3.3-src.tar.gz",
-            "neutronsync-v0.3.3-x86_64-linux.tar.gz",
-            "neutronsync_0.3.3-1_amd64.deb",
+            "protondrive4linux-0.3.3-1.x86_64.rpm",
+            "protondrive4linux-v0.3.3-src.tar.gz",
+            "protondrive4linux-v0.3.3-x86_64-linux.tar.gz",
+            "protondrive4linux_0.3.3-1_amd64.deb",
         ];
         UpdateInfo {
             current: "0.3.2".into(),
@@ -496,7 +498,7 @@ mod tests {
 
     fn tmpfile(name: &str, body: &[u8]) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "neutronsync-updater-test-{name}-{}",
+            "protondrive4linux-updater-test-{name}-{}",
             std::process::id()
         ));
         std::fs::write(&p, body).unwrap();
@@ -553,17 +555,17 @@ mod tests {
         let info = release_with_assets();
         assert_eq!(
             pick_asset(&info, InstallKind::Deb).map(|a| a.name.as_str()),
-            Some("neutronsync_0.3.3-1_amd64.deb")
+            Some("protondrive4linux_0.3.3-1_amd64.deb")
         );
         assert_eq!(
             pick_asset(&info, InstallKind::Rpm).map(|a| a.name.as_str()),
-            Some("neutronsync-0.3.3-1.x86_64.rpm")
+            Some("protondrive4linux-0.3.3-1.x86_64.rpm")
         );
         // The binary tarball, NOT the source tarball: both end in .tar.gz, so a
         // looser match would hand the user a source archive to run.
         assert_eq!(
             pick_asset(&info, InstallKind::Unmanaged).map(|a| a.name.as_str()),
-            Some("neutronsync-v0.3.3-x86_64-linux.tar.gz")
+            Some("protondrive4linux-v0.3.3-x86_64-linux.tar.gz")
         );
     }
 

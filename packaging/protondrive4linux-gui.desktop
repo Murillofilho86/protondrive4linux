@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=NeutronSync
+Name=Proton Drive for Linux
 GenericName=Proton Drive sync
 Comment=Bidirectional Proton Drive folder sync
-Exec=neutronsync-gui %U
-Icon=neutronsync
+Exec=protondrive4linux-gui %U
+Icon=protondrive4linux
 Terminal=false
 Categories=Network;FileTransfer;
 Keywords=proton;drive;sync;backup;cloud;
-StartupWMClass=neutronsync
+StartupWMClass=protondrive4linux

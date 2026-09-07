@@ -1,19 +1,19 @@
 # Sync model
 
-How NeutronSync decides what to sync, when, and why. This is the design behind `src/engine.rs` and `src/watcher.rs`. It is written for contributors; users only need the "How it works" section of the [README](../README.md).
+How protondrive4linux decides what to sync, when, and why. This is the design behind `src/engine.rs` and `src/watcher.rs`. It is written for contributors; users only need the "How it works" section of the [README](../README.md).
 
 ## The constraint that shapes everything
 
-NeutronSync drives the official `proton-drive` CLI. That CLI has two properties that dictate the whole design:
+protondrive4linux drives the official `proton-drive` CLI. That CLI has two properties that dictate the whole design:
 
 1. **No change feed.** There is no "what changed on Proton since X" API. The only way to learn about a remote-side change (an edit made on another device) is to list the folder again and compare.
-2. **A cache that serves stale listings.** A default run can show a file that another device already trashed. So every listing NeutronSync makes runs with a throwaway `PROTON_DRIVE_CACHE_DIR`, and each concurrent scan worker gets its own, so parallel CLI processes never share (and corrupt) one cache.
+2. **A cache that serves stale listings.** A default run can show a file that another device already trashed. So every listing protondrive4linux makes runs with a throwaway `PROTON_DRIVE_CACHE_DIR`, and each concurrent scan worker gets its own, so parallel CLI processes never share (and corrupt) one cache.
 
 Everything below follows from "local changes are cheap to detect, remote changes cost a re-walk."
 
 ## Baseline and the three-way merge
 
-For each folder pair NeutronSync keeps a **baseline**: the last state the two sides agreed on, stored per file in SQLite (`stats.db`, table `baseline`, keyed by `(pair, rel)`). A sync classifies every path on each side against the baseline as Created, Modified, Deleted, Unchanged, or Absent, then combines the two verdicts to pick an action (`decide` / `decide_dir` in `engine.rs`).
+For each folder pair protondrive4linux keeps a **baseline**: the last state the two sides agreed on, stored per file in SQLite (`stats.db`, table `baseline`, keyed by `(pair, rel)`). A sync classifies every path on each side against the baseline as Created, Modified, Deleted, Unchanged, or Absent, then combines the two verdicts to pick an action (`decide` / `decide_dir` in `engine.rs`).
 
 The baseline commit is **additive**: `commit_baseline` writes the rows that synced this run and deletes the rows explicitly marked removed. It never rewrites the whole pair. This is what makes a partial or scoped sync safe: it only ever touches the rows it actually reconciled.
 
@@ -44,7 +44,7 @@ So syncing starts almost immediately and the full walk stops being a gate.
 
 ## The full walk: an adaptively paced safety net
 
-The full walk scans both trees end to end. It is the only thing that catches remote-only changes across the whole tree, so it must run, but on a large tree it is expensive and pointless to run constantly. So it is **paced to its own cost**: after each full walk NeutronSync measures how long it took and schedules the next one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configured `poll_interval` and capped so it always eventually runs. A 15-minute walk reruns about every 90 minutes; small, active folders stay fresh in between through the shallow and hot syncs.
+The full walk scans both trees end to end. It is the only thing that catches remote-only changes across the whole tree, so it must run, but on a large tree it is expensive and pointless to run constantly. So it is **paced to its own cost**: after each full walk protondrive4linux measures how long it took and schedules the next one at roughly `duration * 6` (`FULL_WALK_MULTIPLIER`), floored at the configured `poll_interval` and capped so it always eventually runs. A 15-minute walk reruns about every 90 minutes; small, active folders stay fresh in between through the shallow and hot syncs.
 
 The full walk **streams**: rather than scan the whole tree and only then apply, it walks folder-by-folder (a concurrent breadth-first walk, `run_sync_streaming`) and reconciles each folder as it is discovered, transferring immediately. So uploads and downloads overlap the walk instead of waiting for a full scan. Each folder is handled by the same shallow, direct-children primitive (`sync_pair_shallow_with_base`), and the walk descends into the child folders that reconcile reports (skipping any it just deleted or that are excluded).
 
@@ -65,7 +65,7 @@ These are the rules that must hold. Most exist because breaking one caused a rea
 
 ## The GUI is two processes
 
-In tray mode the background tray daemon owns the watcher and does the syncing in one process; the window is a separate process. The window cannot see the daemon's in-memory state directly, so the daemon publishes a compact live snapshot to `status.json` a few times a second and the window reads it. That is how an open window shows the daemon scanning, syncing, and per-file transfers in real time. A CLI `neutronsync sync` also records its operations into the same activity store the window reads, so command-line runs show up there too.
+In tray mode the background tray daemon owns the watcher and does the syncing in one process; the window is a separate process. The window cannot see the daemon's in-memory state directly, so the daemon publishes a compact live snapshot to `status.json` a few times a second and the window reads it. That is how an open window shows the daemon scanning, syncing, and per-file transfers in real time. A CLI `protondrive4linux sync` also records its operations into the same activity store the window reads, so command-line runs show up there too.
 
 ## Config knobs
 

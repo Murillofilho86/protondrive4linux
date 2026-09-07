@@ -59,7 +59,7 @@ jobs:
         run: cargo build --release --features gui --bins
 
       - name: Strip binaries
-        run: strip target/release/neutronsync target/release/neutronsync-gui || true
+        run: strip target/release/protondrive4linux target/release/protondrive4linux-gui || true
 
       - name: Package .deb
         run: cargo deb --no-build --features gui
@@ -72,18 +72,18 @@ jobs:
           mkdir -p dist
           ref="${GITHUB_REF_NAME}"
           git archive --format=tar.gz \
-            --prefix="neutronsync-${ref}/" \
-            -o "dist/neutronsync-${ref}-src.tar.gz" HEAD
+            --prefix="protondrive4linux-${ref}/" \
+            -o "dist/protondrive4linux-${ref}-src.tar.gz" HEAD
 
       - name: Binary tarball (portable, for the in-app updater)
         run: |
           mkdir -p dist
           ref="${GITHUB_REF_NAME}"
-          stage="stage/neutronsync-${ref}"
+          stage="stage/protondrive4linux-${ref}"
           mkdir -p "$stage"
-          cp target/release/neutronsync target/release/neutronsync-gui \
+          cp target/release/protondrive4linux target/release/protondrive4linux-gui \
              README.md LICENSE "$stage/"
-          tar -C stage -czf "dist/neutronsync-${ref}-x86_64-linux.tar.gz" "neutronsync-${ref}"
+          tar -C stage -czf "dist/protondrive4linux-${ref}-x86_64-linux.tar.gz" "protondrive4linux-${ref}"
 
       - name: Collect artifacts
         run: |
@@ -134,7 +134,7 @@ jobs:
           prerelease: true
           # Never move the "Latest" badge onto a fresh build; promotion does that.
           make_latest: false
-          name: NeutronSync ${{ github.ref_name }}
+          name: protondrive4linux ${{ github.ref_name }}
           body_path: dist/notes.md
           files: |
             dist/*.deb

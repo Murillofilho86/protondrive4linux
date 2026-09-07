@@ -13,10 +13,10 @@
 //!   * The CLI caches directory metadata and serves it STALE, so we point it at
 //!     a throwaway `PROTON_DRIVE_CACHE_DIR` per run (see `Config::fresh_cache`).
 //!   * `list -j` node: {uid, type:"file"|"folder", name:{ok,value},
-//!       activeRevision: either the revision object itself (cli-drive ≥ 0.8) or
-//!       {ok,value:{claimedSize, claimedModificationTime, claimedDigests:{sha1}}}
-//!       (≤ 0.7). totalStorageSize is the ENCRYPTED size and must not be used
-//!       as content size.
+//!     activeRevision: either the revision object itself (cli-drive ≥ 0.8) or
+//!     {ok,value:{claimedSize, claimedModificationTime, claimedDigests:{sha1}}}
+//!     (≤ 0.7). totalStorageSize is the ENCRYPTED size and must not be used
+//!     as content size.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -349,7 +349,7 @@ impl ProtonCli {
         let payload: Value = serde_json::from_str(stdout).with_context(|| {
             format!(
                 "could not parse JSON from `filesystem list -j {remote_path}`; \
-                 run `neutronsync doctor` and adjust protoncli.rs"
+                 run `protondrive4linux doctor` and adjust protoncli.rs"
             )
         })?;
         let rows = rows(&payload);
@@ -874,7 +874,7 @@ fn make_cache_dir() -> Option<PathBuf> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "neutronsync-cache-{}-{}",
+        "protondrive4linux-cache-{}-{}",
         std::process::id(),
         nanos
     ));

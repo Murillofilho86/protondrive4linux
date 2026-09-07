@@ -126,7 +126,7 @@ impl DaemonLock {
         // Atomic fast path: create_new (O_CREAT|O_EXCL) can't race with
         // another process doing the same, unlike a separate read-then-write -
         // two things starting at the same instant (a systemd timer and a
-        // manual `neutronsync watch`) can't both win this.
+        // manual `protondrive4linux watch`) can't both win this.
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -146,7 +146,7 @@ impl DaemonLock {
             if let Ok(pid) = s.trim().parse::<u32>() {
                 if Path::new(&format!("/proc/{pid}")).exists() {
                     bail!(
-                        "a neutronsync watch is already running (pid {pid}); \
+                        "a protondrive4linux watch is already running (pid {pid}); \
                          lock file {}",
                         path.display()
                     );

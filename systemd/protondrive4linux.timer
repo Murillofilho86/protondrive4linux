@@ -1,5 +1,5 @@
 [Unit]
-Description=Run neutronsync periodically
+Description=Run protondrive4linux periodically
 
 [Timer]
 # Shortly after login, then every 30 minutes. Proton Drive is rate-limited, so

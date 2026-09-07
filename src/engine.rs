@@ -26,6 +26,10 @@ use crate::models::{same_content, Action, Change, Compare, DownloadJob, Entry, O
 use crate::protoncli::{ListOutcome, ProtonCli, Remote};
 use crate::trash::trash_local;
 
+/// `plan()`'s return: (the plan, the prospective new baseline, whether the
+/// scan was incomplete, and the set of baseline rows to prune).
+type PlanOutcome = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
+
 pub struct SyncResult {
     pub pair: String,
     pub applied: usize,
@@ -83,7 +87,7 @@ pub fn run_sync_with(
     engine.set_observer(events, cancel);
     let (mut applied, mut errors) = (0usize, 0usize);
     for pair in pairs {
-        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             break;
         }
         match engine.sync_pair(pair, resync) {
@@ -345,7 +349,7 @@ pub fn run_sync_streaming(
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
-    let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
+    let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
     // One pair-level scan for the whole walk (the per-folder reconciles are
     // silent at the pair level), so the GUI shows a single stable "scanning …"
@@ -491,7 +495,7 @@ pub fn run_sync_shallow_many(
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
-    let is_cancelled = || cancel.map_or(false, |c| c.load(Ordering::Relaxed));
+    let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     // One pair-level scan for the whole batch (per-folder reconciles are silent
     // at the pair level), so the GUI shows one stable "scanning …" with a
     // climbing folder count rather than flapping per folder.
@@ -597,7 +601,7 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 
     fn cancelled(&self) -> bool {
-        self.cancel.map_or(false, |c| c.load(Ordering::Relaxed))
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
     // --- scanning -----------------------------------------------------------
@@ -764,17 +768,12 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 
     // --- planning -----------------------------------------------------------
-    /// Returns the plan, the prospective new baseline, whether the scan was
-    /// INCOMPLETE (some folders unreadable, or a side came back suspiciously
-    /// empty), and the set of baseline rows to PRUNE because they now fall under
-    /// an excluded sub-path. On an incomplete scan the caller must suppress
-    /// deletions.
-    fn plan(
-        &self,
-        pair: &Pair,
-        resync: bool,
-        scope: Option<&str>,
-    ) -> Result<(Plan, BTreeMap<String, Entry>, bool, HashSet<String>)> {
+    /// Builds the plan and the prospective new baseline. Also reports whether
+    /// the scan was INCOMPLETE (some folders unreadable, or a side came back
+    /// suspiciously empty) and the set of baseline rows to PRUNE because they
+    /// now fall under an excluded sub-path. On an incomplete scan the caller
+    /// must suppress deletions.
+    fn plan(&self, pair: &Pair, resync: bool, scope: Option<&str>) -> Result<PlanOutcome> {
         // Load the baseline first so the local scan can reuse cached hashes. For
         // a scoped sync, restrict the baseline to rows strictly UNDER the scope
         // so nothing outside it is ever seen as missing (and thus deleted) — the

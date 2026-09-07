@@ -1,5 +1,5 @@
 # Local config with paths / secrets
-neutronsync.toml
+protondrive4linux.toml
 
 # Rust
 /target/

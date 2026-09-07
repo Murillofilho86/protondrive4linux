@@ -1,2 +1,2 @@
 Noto Sans (Regular, Bold) — SIL Open Font License 1.1.
-Bundled as the neutronsync GUI typeface. https://fonts.google.com/noto
+Bundled as the protondrive4linux GUI typeface. https://fonts.google.com/noto

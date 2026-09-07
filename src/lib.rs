@@ -24,9 +24,9 @@ pub mod trash;
 pub mod updater;
 pub mod watcher;
 
-/// Starter config written by `neutronsync init` (kept in sync with
-/// neutronsync.example.toml).
-pub const EXAMPLE_CONFIG: &str = r#"# neutronsync configuration. See README.md.
+/// Starter config written by `protondrive4linux init` (kept in sync with
+/// protondrive4linux.example.toml).
+pub const EXAMPLE_CONFIG: &str = r#"# protondrive4linux configuration. See README.md.
 
 [cli]
 # Path to the official proton-drive binary. Leave as-is to find it on $PATH.
@@ -70,7 +70,7 @@ conflict = "keep-both"
 # How to detect a changed file: "size", "size+mtime", or "sha1".
 compare = "size+mtime"
 
-# Watch mode (`neutronsync watch`): seconds between periodic full rescans (the
+# Watch mode (`protondrive4linux watch`): seconds between periodic full rescans (the
 # safety net, and the only way remote-side changes are noticed), and the
 # debounce window that lets a burst of local file events settle.
 poll_interval = 300

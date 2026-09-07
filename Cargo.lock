@@ -2576,30 +2576,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "neutronsync"
-version = "0.3.3"
-dependencies = [
- "anyhow",
- "clap",
- "eframe",
- "egui-phosphor",
- "gtk",
- "notify-debouncer-full",
- "rfd",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "sha1_smol",
- "sha2",
- "toml",
- "tray-icon",
- "ureq",
- "walkdir",
- "winit",
-]
-
-[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3347,6 +3323,30 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "protondrive4linux"
+version = "0.3.3"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eframe",
+ "egui-phosphor",
+ "gtk",
+ "notify-debouncer-full",
+ "rfd",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1_smol",
+ "sha2",
+ "toml",
+ "tray-icon",
+ "ureq",
+ "walkdir",
+ "winit",
+]
 
 [[package]]
 name = "pxfm"

@@ -1,4 +1,4 @@
-//! neutronsync GUI — a native egui/eframe front-end over the `service::Controller`.
+//! protondrive4linux GUI — a native egui/eframe front-end over the `service::Controller`.
 //!
 //! Visual language follows Proton Drive's desktop client (see reference/gui and
 //! reference/gui/mockup): a frameless dark window with a custom title bar, a left
@@ -7,9 +7,9 @@
 //! hover fades, a pulsing status dot, an animated progress meter, a spinning
 //! sync glyph, and sliding toasts.
 //!
-//! Build/run: `cargo run --features gui --bin neutronsync-gui`.
+//! Build/run: `cargo run --features gui --bin protondrive4linux-gui`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,7 +103,7 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     );
 }
 
-/// Paint the NeutronSync logo (the atom mark from `assets/logo.png`) into `rect`.
+/// Paint the app logo (the atom mark from `assets/logo.png`) into `rect`.
 /// Falls back to a filled disc if the texture isn't loaded yet.
 fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHandle>) {
     if let Some(tex) = tex {
@@ -430,7 +430,7 @@ fn window_running(state_dir: &std::path::Path) -> bool {
 fn self_exe() -> std::ffi::OsString {
     std::env::current_exe()
         .map(std::ffi::OsString::from)
-        .unwrap_or_else(|_| "neutronsync-gui".into())
+        .unwrap_or_else(|_| "protondrive4linux-gui".into())
 }
 
 /// Propagate session-related env vars to a child process. Autostart and manual
@@ -999,7 +999,7 @@ impl eframe::App for App {
                     Ok(entries) => {
                         let mut dirs: Vec<Entry> =
                             entries.into_iter().filter(|e| e.is_dir).collect();
-                        dirs.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                        dirs.sort_by_key(|e| e.path.to_lowercase());
                         self.browser_entries = dirs;
                     }
                     Err(e) => self.browser_error = Some(e),
@@ -1041,8 +1041,7 @@ impl eframe::App for App {
                         // daemon's possibly stale signed_out flag (up to 20s lag
                         // without a refresh signal).
                         if mine.account.checked {
-                            pubd.signed_out =
-                                mine.account.binary_found && !mine.account.signed_in;
+                            pubd.signed_out = mine.account.binary_found && !mine.account.signed_in;
                         }
                         pubd
                     }
@@ -1154,7 +1153,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("NeutronSync")
+                            RichText::new("protondrive4linux")
                                 .font(FontId::new(13.5, ff_bold()))
                                 .color(TEXT),
                         );
@@ -1660,7 +1659,7 @@ impl App {
                                     {
                                         remove = Some(i);
                                     }
-                                    let syncing = ps.as_ref().map_or(false, |p| {
+                                    let syncing = ps.as_ref().is_some_and(|p| {
                                         matches!(p.phase, Phase::Scanning | Phase::Syncing)
                                     });
                                     if button(
@@ -1822,7 +1821,7 @@ impl App {
                     if setting_row(
                         ui,
                         "Launch at login",
-                        "Start NeutronSync automatically when you log in.",
+                        "Start protondrive4linux automatically when you log in.",
                         |ui| switch(ui, auto),
                     ) {
                         set_autostart(!auto, &self.cfg);
@@ -1928,8 +1927,8 @@ impl App {
                 settings_group(ui, "DANGER ZONE", |ui| {
                     if setting_row(
                         ui,
-                        "Reset NeutronSync",
-                        "Remove all folders and wipe NeutronSync's stored data \
+                        "Reset protondrive4linux",
+                        "Remove all folders and wipe protondrive4linux's stored data \
                          (baselines and sync history). Your actual files are not touched.",
                         |ui| {
                             button(ui, Some(Icon::Trash), "Reset…", Btn::Danger, true, true)
@@ -2017,7 +2016,7 @@ impl App {
     fn page_about(&mut self, ui: &mut egui::Ui) {
         self.page_header(ui, "About", |_ui, _app| {});
         ui.label(
-            RichText::new(format!("NeutronSync {}", env!("CARGO_PKG_VERSION")))
+            RichText::new(format!("protondrive4linux {}", env!("CARGO_PKG_VERSION")))
                 .font(FontId::new(16.0, ff_bold()))
                 .color(TEXT),
         );
@@ -2057,10 +2056,10 @@ impl App {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "NeutronSync is an independent, unofficial tool with no access to your \
+                "protondrive4linux is an independent, unofficial tool with no access to your \
                  Proton account. It simply drives Proton's official proton-drive CLI, which \
                  you sign in yourself. Your password and Proton credentials are never seen, \
-                 stored, or sent by NeutronSync — the CLI keeps your session in your OS \
+                 stored, or sent by protondrive4linux — the CLI keeps your session in your OS \
                  keyring, and all encryption and decryption is done by Proton's own software.",
             )
             .size(12.5)
@@ -2085,7 +2084,7 @@ impl App {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "Proton's CLI has no \"recently changed\" feed, so NeutronSync watches your \
+                "Proton's CLI has no \"recently changed\" feed, so protondrive4linux watches your \
                  local folders live and aims the work where the activity is. A local change \
                  reconciles just the folder that changed (not the whole tree); deeper changes \
                  arrive as their own events. On startup it syncs folders with fresh local \
@@ -2337,10 +2336,10 @@ impl App {
                     ui.add_space(10.0);
                     let sub = if found {
                         "Signing in opens Proton's own login in your browser and signs in \
-                         the official CLI. NeutronSync never sees your password or \
+                         the official CLI. protondrive4linux never sees your password or \
                          credentials."
                     } else {
-                        "NeutronSync drives Proton's official command-line client, which \
+                        "protondrive4linux drives Proton's official command-line client, which \
                          isn't installed yet (or isn't on your PATH). Two steps and you're \
                          syncing:"
                     };
@@ -2525,7 +2524,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_max_width(320.0);
                 ui.label(
-                    RichText::new("Reset NeutronSync?")
+                    RichText::new("Reset protondrive4linux?")
                         .font(FontId::new(15.0, ff_bold()))
                         .color(TEXT),
                 );
@@ -2550,7 +2549,7 @@ impl App {
                             self.confirm_reset = false;
                             self.toast(
                                 ctx,
-                                "NeutronSync reset. Add a folder to start fresh.",
+                                "protondrive4linux reset. Add a folder to start fresh.",
                                 false,
                             );
                         }
@@ -2734,14 +2733,15 @@ fn xdg_data_home() -> PathBuf {
 }
 
 /// Install a themed icon + `.desktop` so the shell shows our logo (not a generic
-/// gear) in the dock/overview. GNOME matches the window's `app_id` ("neutronsync",
-/// via `with_app_id`) to `neutronsync.desktop`'s `StartupWMClass` and uses its
-/// `Icon=`. Idempotent: only writes when missing or changed.
+/// gear) in the dock/overview. GNOME matches the window's `app_id`
+/// ("protondrive4linux", via `with_app_id`) to `protondrive4linux-gui.desktop`'s
+/// `StartupWMClass` and uses its `Icon=`. Idempotent: only writes when missing
+/// or changed.
 fn ensure_desktop_integration() {
     let data = xdg_data_home();
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "neutronsync-gui".to_string());
+        .unwrap_or_else(|_| "protondrive4linux-gui".to_string());
 
     let write_if_changed = |path: &std::path::Path, bytes: &[u8]| {
         if std::fs::read(path).ok().as_deref() != Some(bytes) {
@@ -2754,7 +2754,7 @@ fn ensure_desktop_integration() {
 
     // Raster icon under the hicolor theme (our own logo).
     write_if_changed(
-        &data.join("icons/hicolor/256x256/apps/neutronsync.png"),
+        &data.join("icons/hicolor/256x256/apps/protondrive4linux.png"),
         include_bytes!("../../assets/logo.png"),
     );
     // Scalable icon too — GNOME Shell prefers scalable over the raster sizes,
@@ -2762,7 +2762,7 @@ fn ensure_desktop_integration() {
     // our atom mark over it also heals those machines (we may not ship
     // Proton's artwork).
     write_if_changed(
-        &data.join("icons/hicolor/scalable/apps/neutronsync.svg"),
+        &data.join("icons/hicolor/scalable/apps/protondrive4linux.svg"),
         include_bytes!("../../assets/neutron-logo.svg"),
     );
 
@@ -2770,17 +2770,18 @@ fn ensure_desktop_integration() {
     // ".../Projects - Personal/..."), and an unquoted Exec is an invalid entry
     // that the shell rejects — which shows a generic gear instead of our icon.
     let desktop = format!(
-        "[Desktop Entry]\nType=Application\nName=NeutronSync\nGenericName=Proton Drive sync\nComment=Bidirectional Proton Drive folder sync\nExec=\"{exe}\" %U\nIcon=neutronsync\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=neutronsync\n"
+        "[Desktop Entry]\nType=Application\nName=protondrive4linux\nGenericName=Proton Drive sync\nComment=Bidirectional Proton Drive folder sync\nExec=\"{exe}\" %U\nIcon=protondrive4linux\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=protondrive4linux\n"
     );
     // Write to the SAME basename the package ships, so this user copy SHADOWS
     // the packaged one (one launcher entry) rather than adding a second.
     write_if_changed(
-        &data.join("applications/neutronsync-gui.desktop"),
+        &data.join("applications/protondrive4linux-gui.desktop"),
         desktop.as_bytes(),
     );
     // Remove the legacy duplicate from older builds (a different basename showed
     // up as a second "NeutronSync" entry alongside the packaged one).
     let _ = std::fs::remove_file(data.join("applications/neutronsync.desktop"));
+    let _ = std::fs::remove_file(data.join("applications/neutronsync-gui.desktop"));
 }
 
 /// Path of the XDG autostart entry for launch-at-login.
@@ -2790,7 +2791,7 @@ fn autostart_path() -> PathBuf {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
         });
-    base.join("autostart").join("neutronsync.desktop")
+    base.join("autostart").join("protondrive4linux.desktop")
 }
 
 fn autostart_enabled() -> bool {
@@ -2809,11 +2810,11 @@ fn set_autostart(enabled: bool, cfg: &Config) {
         }
         let exe = std::env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "neutronsync-gui".to_string());
+            .unwrap_or_else(|_| "protondrive4linux-gui".to_string());
         // With the tray on, launch the headless daemon; otherwise a plain window.
         let arg = if cfg.run_in_tray { " --tray" } else { "" };
         let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=NeutronSync\nComment=Bidirectional Proton Drive sync\nExec=\"{exe}\"{arg}\nIcon=neutronsync\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=protondrive4linux\nComment=Bidirectional Proton Drive sync\nExec=\"{exe}\"{arg}\nIcon=protondrive4linux\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
         );
         let _ = std::fs::write(&path, entry);
     } else {
@@ -2973,7 +2974,7 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Opti
 }
 
 fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
-    let first_run = ps.map_or(false, |p| p.last_synced.is_none());
+    let first_run = ps.is_some_and(|p| p.last_synced.is_none());
     let (col, text) = match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
             ACCENT,
@@ -3324,7 +3325,7 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
 }
 
 // -- starter config ----------------------------------------------------------
-fn starter_config(path: &PathBuf) -> Config {
+fn starter_config(path: &Path) -> Config {
     Config {
         binary: "proton-drive".into(),
         upload_flags: vec![
@@ -3362,10 +3363,10 @@ fn starter_config(path: &PathBuf) -> Config {
                 .unwrap_or_else(|_| {
                     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
                 });
-            base.join("neutronsync")
+            base.join("protondrive4linux")
         },
         pairs: vec![],
-        source_path: Some(path.clone()),
+        source_path: Some(path.to_path_buf()),
     }
 }
 
@@ -3390,14 +3391,14 @@ fn run_daemon() {
     let cfg = match config::load(None) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!("neutronsync: no config found; nothing to run in tray mode");
+            eprintln!("protondrive4linux: no config found; nothing to run in tray mode");
             return;
         }
     };
     let _lock = match PidLock::acquire(&cfg.state_dir, DAEMON_LOCK) {
         Some(l) => l,
         None => {
-            eprintln!("neutronsync: a tray daemon is already running");
+            eprintln!("protondrive4linux: a tray daemon is already running");
             return;
         }
     };
@@ -3412,12 +3413,12 @@ fn run_daemon() {
     }
 
     if let Err(e) = gtk::init() {
-        eprintln!("neutronsync: GTK init failed: {e}");
+        eprintln!("protondrive4linux: GTK init failed: {e}");
         return;
     }
 
     let menu = Menu::new();
-    let open_i = MenuItem::new("Open NeutronSync", true, None);
+    let open_i = MenuItem::new("Open protondrive4linux", true, None);
     let sync_i = MenuItem::new("Sync now", true, None);
     let quit_i = MenuItem::new("Quit", true, None);
     let _ = menu.append(&open_i);
@@ -3431,7 +3432,7 @@ fn run_daemon() {
     );
 
     let mut builder = TrayIconBuilder::new()
-        .with_tooltip("NeutronSync")
+        .with_tooltip("protondrive4linux")
         .with_menu(Box::new(menu));
     if let Some(icon) = tray_icon_image() {
         builder = builder.with_icon(icon);
@@ -3439,7 +3440,7 @@ fn run_daemon() {
     let _tray = match builder.build() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("neutronsync: system tray unavailable: {e}");
+            eprintln!("protondrive4linux: system tray unavailable: {e}");
             return;
         }
     };
@@ -3485,7 +3486,7 @@ fn run_daemon() {
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
                 pending_restart = true;
-                eprintln!("neutronsync: config changed; reloaded ({pairs} folder(s))");
+                eprintln!("protondrive4linux: config changed; reloaded ({pairs} folder(s))");
             }
         }
         // Start the watcher once the previous one has released watch.lock.
@@ -3526,8 +3527,8 @@ fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1040.0, 680.0])
         .with_min_inner_size([820.0, 520.0])
-        .with_title("NeutronSync for Linux")
-        .with_app_id("neutronsync");
+        .with_title("protondrive4linux")
+        .with_app_id("protondrive4linux");
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png")) {
         viewport = viewport.with_icon(icon);
     }
@@ -3542,7 +3543,7 @@ fn main() -> eframe::Result<()> {
         }));
     }
     eframe::run_native(
-        "neutronsync",
+        "protondrive4linux",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
