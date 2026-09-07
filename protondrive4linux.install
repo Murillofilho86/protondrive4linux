@@ -1,0 +1,21 @@
+post_install() {
+	cat <<-EOF
+
+	==> protondrive4linux installed, along with the official proton-drive CLI.
+	==> Launch "Proton Drive for Linux" from your application menu, or run:
+	        protondrive4linux-gui
+	==> First run: sign in to Proton (opens your browser), then add a folder
+	    to sync. Turn on "Run in system tray" and "Launch at login" in
+	    Settings to have it start automatically and keep syncing in the
+	    background - no terminal needed after that.
+	==> Prefer a headless setup instead of the GUI? Use one of:
+	        systemctl --user enable --now protondrive4linux-watch.service   # live sync
+	        systemctl --user enable --now protondrive4linux.timer          # periodic sync
+	    (these are opt-in - Arch packages don't enable services for you.)
+
+	EOF
+}
+
+post_upgrade() {
+	post_install
+}

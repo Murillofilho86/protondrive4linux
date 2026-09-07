@@ -11,11 +11,20 @@ pkgdesc="Bidirectional Proton Drive folder sync for Linux, built on the official
 arch=('x86_64')
 url="https://github.com/Murillofilho86/protondrive_linux_sync"
 license=('MIT')
-depends=('gtk3' 'libxkbcommon' 'wayland' 'libx11' 'libxcb' 'mesa' 'xdotool' 'libayatana-appindicator')
+depends=(
+	'gtk3' 'libxkbcommon' 'wayland' 'libx11' 'libxcb' 'mesa' 'xdotool' 'libayatana-appindicator'
+	# The official Proton Drive CLI this tool drives - useless without it, so
+	# it's a hard dependency, not optional. Three AUR packages currently
+	# provide it (proton-drive-cli, -bin, -git); depending on the virtual
+	# name lets an AUR helper resolve+build+install whichever one the user
+	# wants automatically as part of installing this package - no separate
+	# manual step.
+	'proton-drive-cli'
+)
 makedepends=('rust' 'git')
-optdepends=('proton-drive-cli: the official Proton Drive CLI this tool drives (install separately)')
 provides=('protondrive4linux')
 conflicts=('protondrive4linux')
+install=protondrive4linux.install
 # rusqlite's `bundled` feature compiles SQLite from C source via the `cc`
 # crate, which picks up CFLAGS from the environment. makepkg's default
 # OPTIONS include `lto`, which appends -flto=auto to CFLAGS for every

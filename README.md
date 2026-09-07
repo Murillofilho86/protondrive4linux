@@ -25,7 +25,7 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 ## Requirements
 
 - Linux with a recent Rust toolchain (edition 2021) if building from source.
-- The official `proton-drive` CLI on your `PATH` (<https://proton.me/blog/proton-drive-cli>). Verified against `cli-drive 0.8.0`.
+- The official `proton-drive` CLI on your `PATH` (<https://proton.me/blog/proton-drive-cli>). Verified against `cli-drive 0.8.0`. Installing via the `PKGBUILD` (Arch/AUR) pulls this in automatically as a dependency (`proton-drive-cli`, `-bin`, or `-git` - three community AUR packages provide it); building from source or installing another way still means getting it yourself.
 - `gio` (from glib, present on most desktops) for recoverable local deletes; a manual XDG-trash fallback is used if it is missing.
 
 ## Install
