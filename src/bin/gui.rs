@@ -103,7 +103,7 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     );
 }
 
-/// Paint the app logo (the atom mark from `assets/logo.png`) into `rect`.
+/// Paint the app logo (from `assets/logo.png`) into `rect`.
 /// Falls back to a filled disc if the texture isn't loaded yet.
 fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHandle>) {
     if let Some(tex) = tex {
@@ -986,7 +986,7 @@ impl eframe::App for App {
                     &ic.rgba,
                 );
                 self.logo_tex =
-                    Some(ctx.load_texture("neutron-logo", img, egui::TextureOptions::LINEAR));
+                    Some(ctx.load_texture("app-logo", img, egui::TextureOptions::LINEAR));
             }
         }
         self.pump_tray(ctx);
@@ -2759,11 +2759,11 @@ fn ensure_desktop_integration() {
     );
     // Scalable icon too — GNOME Shell prefers scalable over the raster sizes,
     // and old builds installed Proton's OWN gradient-folder SVG here; writing
-    // our atom mark over it also heals those machines (we may not ship
+    // our own mark over it also heals those machines (we may not ship
     // Proton's artwork).
     write_if_changed(
         &data.join("icons/hicolor/scalable/apps/protondrive4linux.svg"),
-        include_bytes!("../../assets/neutron-logo.svg"),
+        include_bytes!("../../assets/logo.svg"),
     );
 
     // Quote the exec path: it may contain spaces (dev builds under a path like
