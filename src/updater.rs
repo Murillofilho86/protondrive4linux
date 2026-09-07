@@ -20,7 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::UpdateChannel;
 
 /// owner/repo the releases are published under.
-const REPO: &str = "Murillofilho86/protondrive_linux_sync";
+const REPO: &str = "Murillofilho86/protondrive4linux";
 
 /// Whether in-app updates are allowed to run at all. Off in this fork build:
 /// the only integrity check available (`verify`, below) compares a downloaded

@@ -5,8 +5,8 @@ edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/Murillofilho86/protondrive_linux_sync"
-homepage = "https://github.com/Murillofilho86/protondrive_linux_sync"
+repository = "https://github.com/Murillofilho86/protondrive4linux"
+homepage = "https://github.com/Murillofilho86/protondrive4linux"
 
 # Library core (reused by the CLI now, and a GUI later) + a thin CLI binary.
 # The lib keeps its original internal crate name (neutronsync) - it's Cargo's
@@ -91,7 +91,7 @@ assets = [
     ["target/release/protondrive4linux-gui", "usr/bin/", "755"],
     ["packaging/protondrive4linux-gui.desktop", "usr/share/applications/", "644"],
     ["assets/logo.png", "usr/share/icons/hicolor/256x256/apps/protondrive4linux.png", "644"],
-    ["assets/neutron-logo.svg", "usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", "644"],
+    ["assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", "644"],
     ["systemd/protondrive4linux-watch.service", "usr/lib/systemd/user/", "644"],
     ["systemd/protondrive4linux.service", "usr/lib/systemd/user/", "644"],
     ["systemd/protondrive4linux.timer", "usr/lib/systemd/user/", "644"],
@@ -105,7 +105,7 @@ assets = [
     { source = "target/release/protondrive4linux-gui", dest = "/usr/bin/protondrive4linux-gui", mode = "755" },
     { source = "packaging/protondrive4linux-gui.desktop", dest = "/usr/share/applications/protondrive4linux-gui.desktop", mode = "644" },
     { source = "assets/logo.png", dest = "/usr/share/icons/hicolor/256x256/apps/protondrive4linux.png", mode = "644" },
-    { source = "assets/neutron-logo.svg", dest = "/usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", mode = "644" },
+    { source = "assets/logo.svg", dest = "/usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg", mode = "644" },
     { source = "systemd/protondrive4linux-watch.service", dest = "/usr/lib/systemd/user/protondrive4linux-watch.service", mode = "644" },
     { source = "systemd/protondrive4linux.service", dest = "/usr/lib/systemd/user/protondrive4linux.service", mode = "644" },
     { source = "systemd/protondrive4linux.timer", dest = "/usr/lib/systemd/user/protondrive4linux.timer", mode = "644" },

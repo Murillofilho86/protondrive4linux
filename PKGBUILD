@@ -9,7 +9,7 @@ pkgver=0.3.3.r0.g0000000
 pkgrel=1
 pkgdesc="Bidirectional Proton Drive folder sync for Linux, built on the official proton-drive CLI (unofficial, not affiliated with Proton AG)"
 arch=('x86_64')
-url="https://github.com/Murillofilho86/protondrive_linux_sync"
+url="https://github.com/Murillofilho86/protondrive4linux"
 license=('MIT')
 depends=(
 	'gtk3' 'libxkbcommon' 'wayland' 'libx11' 'libxcb' 'mesa' 'xdotool' 'libayatana-appindicator'
