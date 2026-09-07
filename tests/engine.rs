@@ -145,6 +145,71 @@ impl Remote for FakeRemote {
         s.moves += 1;
         Ok(())
     }
+
+    // Mirrors ProtonCli::list_tree's root-vs-subfolder NotFound distinction
+    // (protoncli.rs) via this fake's own `list_dir_probe`, so whole-pair tests
+    // (which go through `Engine::sync_pair` -> `list_tree`, not the trait's
+    // default that hard-codes `root_missing: false`) can exercise the
+    // `remote_root_missing` guard in engine.rs.
+    fn list_tree(
+        &self,
+        base: &str,
+        exclude: &(dyn Fn(&str) -> bool + Sync),
+        progress: &(dyn Fn(&str) + Sync),
+    ) -> anyhow::Result<neutronsync::models::TreeScan> {
+        let mut out = Vec::new();
+        let mut failed = Vec::new();
+        let mut root_missing = false;
+        let mut stack = vec![String::new()];
+        while let Some(rel) = stack.pop() {
+            let here = neutronsync::config::remote_join(base, &rel);
+            progress(&here);
+            let entries = match self.list_dir_probe(&here) {
+                Ok(ListOutcome::Listed(entries)) => entries,
+                Ok(ListOutcome::NotFound) if rel.is_empty() => {
+                    root_missing = true;
+                    Vec::new()
+                }
+                // A subfolder reporting NotFound is a race/transient, not an
+                // authoritative "base is gone" - treat as a failed listing so
+                // deletions are suppressed this run without flagging root_missing.
+                Ok(ListOutcome::NotFound) => {
+                    failed.push(rel);
+                    continue;
+                }
+                Err(_) => {
+                    failed.push(rel);
+                    continue;
+                }
+            };
+            for e in entries {
+                let child_rel = if rel.is_empty() {
+                    e.path.clone()
+                } else {
+                    format!("{rel}/{}", e.path)
+                };
+                if exclude(&child_rel) {
+                    continue;
+                }
+                let is_dir = e.is_dir;
+                out.push((
+                    child_rel.clone(),
+                    Entry {
+                        path: child_rel.clone(),
+                        ..e
+                    },
+                ));
+                if is_dir {
+                    stack.push(child_rel);
+                }
+            }
+        }
+        Ok(neutronsync::models::TreeScan {
+            entries: out,
+            failed,
+            root_missing,
+        })
+    }
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -727,6 +792,42 @@ fn missing_local_root_refuses_delete() {
     assert!(
         rf.contains_key("/my-files/docs/a.txt") && rf.contains_key("/my-files/docs/b.txt"),
         "remote files must survive a vanished local root"
+    );
+}
+
+#[test]
+fn vanished_remote_base_suppresses_delete() {
+    // The pair's remote base folder disappearing entirely (moved/deleted on
+    // another device, or a transient outage) must NOT be read as "every
+    // remote file was deleted": the sync must suppress deletions and leave
+    // the local copies and the baseline intact, per docs/SYNC_MODEL.md's
+    // "remote base folder vanishing ... is a catastrophe signature" rule.
+    let t = Tmp::new("vanishedremotebase");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "keep");
+    write(&t.path().join("local/b.txt"), "keep too");
+    run(&c, fake, false); // establishes the baseline with both files.
+
+    // The pair's whole remote base ("/my-files/docs") now reports NotFound.
+    store.borrow_mut().notfound_dir = Some("/my-files/docs".into());
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        // A vanished remote base is not a hard refusal like a vanished local
+        // root: it syncs additively but must not delete.
+        eng.sync_pair(&c.pairs[0], false).unwrap();
+    }
+    assert!(
+        t.path().join("local/a.txt").exists() && t.path().join("local/b.txt").exists(),
+        "local files must survive a vanished remote base folder"
+    );
+    let base = neutronsync::state::load_baseline(&c.state_dir, &c.pairs[0].name).unwrap();
+    assert!(
+        base.contains_key("a.txt") && base.contains_key("b.txt"),
+        "the baseline must not be wiped by a vanished remote base folder"
     );
 }
 
