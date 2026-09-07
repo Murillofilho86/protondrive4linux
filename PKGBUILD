@@ -16,6 +16,15 @@ makedepends=('rust' 'git')
 optdepends=('proton-drive-cli: the official Proton Drive CLI this tool drives (install separately)')
 provides=('protondrive4linux')
 conflicts=('protondrive4linux')
+# rusqlite's `bundled` feature compiles SQLite from C source via the `cc`
+# crate, which picks up CFLAGS from the environment. makepkg's default
+# OPTIONS include `lto`, which appends -flto=auto to CFLAGS for every
+# package; the resulting LTO-only object can't be resolved by the final
+# rustc-driven link, producing "undefined symbol: sqlite3_*" errors. This
+# only opts the C compilation out of Arch's automatic LTO injection - it has
+# no effect on this crate's own [profile.release] lto = true (Cargo/rustc
+# LTO, a separate, unrelated setting).
+options=('!lto')
 source=("$pkgname::git+$url.git#branch=master")
 sha256sums=('SKIP')
 
