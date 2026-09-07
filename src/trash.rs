@@ -31,6 +31,18 @@ pub fn trash_local(path: &Path, gio: Option<&Path>) -> Result<()> {
     xdg_trash(path)
 }
 
+/// Locate `gio` on `PATH`, for callers that want to pass it to [`trash_local`].
+pub fn which_gio() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("gio");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 fn data_home() -> PathBuf {
     if let Ok(v) = std::env::var("XDG_DATA_HOME") {
         if !v.is_empty() {

@@ -123,6 +123,25 @@ impl DaemonLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("watch.lock");
+        // Atomic fast path: create_new (O_CREAT|O_EXCL) can't race with
+        // another process doing the same, unlike a separate read-then-write -
+        // two things starting at the same instant (a systemd timer and a
+        // manual `neutronsync watch`) can't both win this.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(std::process::id().to_string().as_bytes())?;
+                return Ok(DaemonLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+        // A lock file already exists: either a live daemon, or one left
+        // behind by a crash. Only reclaim it if the PID it names is dead.
         if let Ok(s) = std::fs::read_to_string(&path) {
             if let Ok(pid) = s.trim().parse::<u32>() {
                 if Path::new(&format!("/proc/{pid}")).exists() {
@@ -151,17 +170,28 @@ impl Drop for DaemonLock {
 /// with when there's no source path or the reload fails (e.g. a half-written
 /// file mid-save), so a bad read never disrupts syncing.
 fn reload_cfg(base: &Config, log: &Logger) -> Config {
-    match base.source_path.as_deref() {
-        Some(p) => match crate::config::load(p.to_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                log.warn(&format!(
-                    "watch: keeping running config (reload failed: {e})"
-                ));
-                base.clone()
-            }
-        },
-        None => base.clone(),
+    let Some(p) = base.source_path.as_deref() else {
+        return base.clone();
+    };
+    // `p.to_str()` returning None (non-UTF-8 path) must not be treated the
+    // same as "no explicit path was given" - config::load(None) would then
+    // search the default config locations instead of reloading the actual
+    // running config, and could load an entirely different file.
+    let Some(p_str) = p.to_str() else {
+        log.warn(&format!(
+            "watch: keeping running config ({} is not valid UTF-8)",
+            p.display()
+        ));
+        return base.clone();
+    };
+    match crate::config::load(Some(p_str)) {
+        Ok(c) => c,
+        Err(e) => {
+            log.warn(&format!(
+                "watch: keeping running config (reload failed: {e})"
+            ));
+            base.clone()
+        }
     }
 }
 

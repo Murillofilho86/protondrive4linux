@@ -572,7 +572,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             remote,
             log,
             dry_run,
-            gio: which_gio(),
+            gio: crate::trash::which_gio(),
             ensured: HashSet::new(),
             events: None,
             cancel: None,
@@ -2313,17 +2313,6 @@ fn sha1_file(path: &Path) -> Option<String> {
         hasher.update(&buf[..n]);
     }
     Some(hasher.digest().to_string())
-}
-
-fn which_gio() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join("gio");
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
