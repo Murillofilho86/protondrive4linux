@@ -372,6 +372,18 @@ impl PidLock {
     fn acquire(state_dir: &std::path::Path, name: &str) -> Option<Self> {
         let _ = std::fs::create_dir_all(state_dir);
         let path = state_dir.join(name);
+        // Atomic fast path first (see watcher.rs's DaemonLock for why a plain
+        // check-then-write can't be trusted when two processes might start at
+        // the same instant).
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(std::process::id().to_string().as_bytes());
+            return Some(PidLock { path });
+        }
         if pid_alive_from(&path) {
             return None;
         }
@@ -524,14 +536,18 @@ struct App {
     // app logo texture (lazy-loaded from assets/logo.png)
     logo_tex: Option<egui::TextureHandle>,
 
-    // exclude editor ("choose folders to sync" per pair)
-    excl_open: Option<usize>,
+    // exclude editor ("choose folders to sync" per pair). Keyed by pair NAME,
+    // not index: these windows are non-modal, so the Folders list underneath
+    // can add/remove pairs (shifting indices) while one is open. Re-resolving
+    // by name every frame means a stale reference closes the dialog instead
+    // of silently acting on whatever pair now sits at the old index.
+    excl_open: Option<String>,
     excl_entries: Vec<String>,
     excl_loading: bool,
     excl_error: Option<String>,
     excl_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
     excl_newly: Vec<String>,
-    confirm_remove_local: Option<(usize, Vec<String>)>,
+    confirm_remove_local: Option<(String, Vec<String>)>,
 
     // When true (run_in_tray), a headless daemon owns the tray + watcher; this
     // window just ensures one exists and exits on close (the daemon lives on).
@@ -680,7 +696,7 @@ impl App {
         if i >= self.cfg.pairs.len() {
             return;
         }
-        self.excl_open = Some(i);
+        self.excl_open = Some(self.cfg.pairs[i].name.clone());
         self.excl_entries.clear();
         self.excl_error = None;
         self.excl_newly.clear();
@@ -696,14 +712,16 @@ impl App {
     }
 
     fn exclude_window(&mut self, ctx: &egui::Context) {
-        let Some(i) = self.excl_open else {
+        let Some(name) = self.excl_open.clone() else {
             return;
         };
-        if i >= self.cfg.pairs.len() {
+        // Re-resolve the index by name every frame (see the `excl_open` field
+        // comment): the pair may have been removed, or the list reordered,
+        // while this non-modal window was open.
+        let Some(i) = self.cfg.pairs.iter().position(|p| p.name == name) else {
             self.excl_open = None;
             return;
-        }
-        let name = self.cfg.pairs[i].name.clone();
+        };
         let mut win_open = true;
         let mut done = false;
         egui::Window::new(format!("Folders to sync — {name}"))
@@ -767,19 +785,21 @@ impl App {
             self.commit();
             if !self.excl_newly.is_empty() {
                 let newly = std::mem::take(&mut self.excl_newly);
-                self.confirm_remove_local = Some((i, newly));
+                self.confirm_remove_local = Some((name, newly));
             }
         }
     }
 
     fn remove_local_dialog(&mut self, ctx: &egui::Context) {
-        let Some((i, folders)) = self.confirm_remove_local.clone() else {
+        let Some((name, folders)) = self.confirm_remove_local.clone() else {
             return;
         };
-        if i >= self.cfg.pairs.len() {
+        // Re-resolve by name (see the `excl_open` field comment) - the pair
+        // this was queued for may have been removed since.
+        let Some(i) = self.cfg.pairs.iter().position(|p| p.name == name) else {
             self.confirm_remove_local = None;
             return;
-        }
+        };
         let local = self.cfg.pairs[i].local.clone();
         let mut choice: Option<bool> = None;
         egui::Window::new("Free up local space?")
@@ -826,10 +846,15 @@ impl App {
             });
         if let Some(remove) = choice {
             if remove {
+                // Resolve gio like the engine's own delete path does: without
+                // it, a folder on a different filesystem than $HOME fails the
+                // manual XDG-trash fallback's same-filesystem rename() and
+                // silently doesn't get removed.
+                let gio = neutronsync::trash::which_gio();
                 let mut n = 0usize;
                 for f in &folders {
                     let p = local.join(f);
-                    if p.exists() && neutronsync::trash::trash_local(&p, None).is_ok() {
+                    if p.exists() && neutronsync::trash::trash_local(&p, gio.as_deref()).is_ok() {
                         n += 1;
                     }
                 }
@@ -843,16 +868,36 @@ impl App {
         }
     }
 
+    /// `base` if no pair already has that name, else `base` with a disambiguating
+    /// suffix. config::load() hard-fails on a duplicate pair name (and the GUI
+    /// must never write a config it can't load back on the next launch), so
+    /// every path that adds a pair must go through this rather than assume an
+    /// auto-derived name (a folder's leaf name) is unique.
+    fn unique_pair_name(&self, base: &str) -> String {
+        if !self.cfg.pairs.iter().any(|p| p.name == base) {
+            return base.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("{base} ({n})");
+            if !self.cfg.pairs.iter().any(|p| p.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
     fn add_remote(&mut self, ctx: &egui::Context, remote_path: String) {
         if let Some(dir) = rfd::FileDialog::new()
             .set_title(format!("Local folder to sync with {remote_path}"))
             .pick_folder()
         {
-            let name = remote_path
+            let base = remote_path
                 .rsplit('/')
                 .next()
                 .unwrap_or("folder")
                 .to_string();
+            let name = self.unique_pair_name(&base);
             self.cfg.pairs.push(Pair {
                 name: name.clone(),
                 local: dir,
@@ -1428,12 +1473,7 @@ impl App {
             .activity
             .iter()
             .rev()
-            .filter(|a| {
-                a.op.is_some()
-                    || (a.kind == ActivityKind::Error
-                        && !a.text.starts_with("Signed out of Proton")
-                        && !a.text.starts_with("Signed back in to Proton"))
-            })
+            .filter(|a| a.op.is_some() || a.kind == ActivityKind::Error)
             .collect();
         let has_files = rows.iter().any(|a| a.op.is_some());
         if snap.active.is_empty() && rows.is_empty() {
@@ -1570,12 +1610,35 @@ impl App {
                             draw_icon(ui.painter(), ir.shrink(7.0), Icon::Folder, ACCENT);
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
-                                ui.add(
+                                let name_before = self.cfg.pairs[i].name.clone();
+                                let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.cfg.pairs[i].name)
                                         .desired_width(180.0)
                                         .font(FontId::new(14.0, ff_bold()))
                                         .frame(egui::Frame::NONE),
                                 );
+                                if resp.lost_focus() {
+                                    // Commit-on-blur, not per keystroke: the
+                                    // pair's name is its identity everywhere
+                                    // (baseline rows, live PairState), so a
+                                    // half-typed or colliding value must never
+                                    // reach config::save() - it would refuse
+                                    // to load on the next launch (see
+                                    // unique_pair_name).
+                                    let trimmed = self.cfg.pairs[i].name.trim().to_string();
+                                    let dup = self
+                                        .cfg
+                                        .pairs
+                                        .iter()
+                                        .enumerate()
+                                        .any(|(j, p)| j != i && p.name == trimmed);
+                                    if trimmed.is_empty() || dup {
+                                        self.cfg.pairs[i].name = name_before;
+                                    } else if trimmed != name_before {
+                                        self.cfg.pairs[i].name = trimmed;
+                                        changed = true;
+                                    }
+                                }
                                 pair_status(
                                     ui,
                                     ps.as_ref(),
@@ -1686,11 +1749,12 @@ impl App {
                 .set_title("Choose a folder to sync")
                 .pick_folder()
             {
-                let name = dir
+                let base = dir
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("folder")
                     .to_string();
+                let name = self.unique_pair_name(&base);
                 let remote = config::remote_join(&self.cfg.remote_root, &name);
                 self.cfg.pairs.push(Pair {
                     name: name.clone(),
