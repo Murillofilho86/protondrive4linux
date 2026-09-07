@@ -20,6 +20,28 @@ All notable changes to this project are documented here. The format follows [Kee
 - Every tag ships as a pre-release, and promotion to stable is a separate decision. 0.3.3 made a plain tag a stable release, which meant a build was declared stable at the moment it was cut, before it had run anywhere. The release workflow now always publishes as a pre-release and never moves the "Latest" badge; a build is promoted once it has proven itself, with `gh release edit vX.Y.Z --prerelease=false --latest`. The updater's `prerelease` channel still sees every tag as it lands, and its `stable` channel only ever offers a promoted one.
 - Release notes on GitHub now carry the changelog section for each version. Earlier releases had GitHub's generated body, a bare compare link, so the release page said nothing about what changed. The 0.1.1 through 0.3.2 notes were rewritten from this file, and titles read `NeutronSync vX.Y.Z`.
 
+### Changed
+- This is now **protondrive4linux**, a fork with its own identity rather than a drop-in continuation of NeutronSync: new binary names (`protondrive4linux` / `protondrive4linux-gui`), config location (`~/.config/protondrive4linux/protondrive4linux.toml`), env var (`PROTONDRIVE4LINUX_CONFIG`), and systemd units. See `ROADMAP.md` for the reasoning and what's planned next.
+
+### Security
+- The sync state directory (the baseline database and the live-status file, which together record every synced file's path, size, and content hash) is now created private to the user (`0700`/`0600`), matching how the sync log was already handled. It was previously created with default permissions, which on a shared machine left it readable by other local accounts.
+- In-app updates are disabled for now. The only integrity check available was a checksum GitHub itself computes over the same release asset being verified - it catches transport corruption but not a compromised release pipeline or account. Update through your package manager until a release process with an independent signature (checked against a maintainer key) is in place. See `SECURITY_AUDIT.md`.
+- The updater's release-check pointed at the upstream project's GitHub repo rather than this fork's; fixed so it can never offer to install someone else's build.
+
+### Fixed
+- A non-modal "choose folders to sync" / "remove locally" dialog could act on the wrong pair if another pair was added or removed while it was open (both are matched by pair name now, not by list position).
+- Adding a folder pair with the same auto-generated name as an existing one used to make the whole pair list disappear on the next launch; names are now disambiguated automatically.
+- Renaming a pair inline is now validated (no blank or duplicate names) and takes effect once you finish editing, instead of on every keystroke.
+- "Remove locally" now works for a synced folder that lives on a different filesystem than your home directory (it failed silently there before).
+- Fixed a race where two sync processes starting at the same instant (e.g. a systemd timer and a manually-run `watch`) could both start watching the same pairs, defeating the single-instance lock.
+- A config file path that isn't valid UTF-8 no longer makes the watch daemon silently search default config locations instead of reloading the real one on a live-edit reload.
+- A vanished remote base folder (the whole pair's remote root, not just a subfolder) is now covered by a regression test, closing a gap where this data-safety guard could have silently broken without any test failing.
+
+### Added
+- `SECURITY_AUDIT.md`: a due-diligence audit of the inherited code (process execution, credential handling, sync-engine data-safety invariants, GUI/tray IPC, auto-update).
+- An initial `PKGBUILD` for local `makepkg` builds (a `-git` package; not yet submitted to the AUR).
+- CI now enforces `cargo clippy -- -D warnings` and `cargo fmt --check`, and runs a `cargo-audit` dependency check, on every push and pull request.
+
 ## [0.3.3] - 2026-07-28
 
 ### Added
