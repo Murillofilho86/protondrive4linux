@@ -629,12 +629,29 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
     toml::to_string(&out).context("serialising config to TOML")
 }
 
-/// Write a Config to `path` (creating parent dirs).
+/// Write a Config to `path` (creating parent dirs). The config records local
+/// and remote folder names, so keep it private to the user: the directory is
+/// created 0700 and the file 0600 (modes apply when this process creates
+/// them, same as the sync log — see logger.rs).
 pub fn save(cfg: &Config, path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent);
     }
-    std::fs::write(path, to_toml(cfg)?).with_context(|| format!("writing {}", path.display()))?;
+    let toml = to_toml(cfg)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    use std::io::Write;
+    f.write_all(toml.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

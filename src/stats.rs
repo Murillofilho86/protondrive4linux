@@ -34,7 +34,16 @@ pub struct OpRecord {
 impl Stats {
     /// Open (creating if needed) the stats DB under `state_dir`.
     pub fn open(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir).ok();
+        // stats.db and the status.json this directory also holds record file
+        // paths and content hashes for everything synced, so keep the
+        // directory private to the user (matches logger.rs's log directory).
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(state_dir);
+        }
         let path = state_dir.join("stats.db");
         let conn = Connection::open(&path)
             .with_context(|| format!("opening stats db {}", path.display()))?;
