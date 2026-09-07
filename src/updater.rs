@@ -20,7 +20,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::config::UpdateChannel;
 
 /// owner/repo the releases are published under.
-const REPO: &str = "WilhelmZA/protondrive_linux_sync";
+const REPO: &str = "Murillofilho86/protondrive_linux_sync";
+
+/// Whether in-app updates are allowed to run at all. Off in this fork build:
+/// the only integrity check available (`verify`, below) compares a downloaded
+/// asset against the `digest` GitHub's own Release API reports for that same
+/// asset. That catches transport corruption but not a compromised GitHub
+/// account or release pipeline, since a malicious asset would carry a matching
+/// digest. Until releases carry an independent signature (e.g. minisign)
+/// checked against a maintainer key baked into the binary, updates go through
+/// the package manager (AUR) instead. See SECURITY_AUDIT.md §0.6.
+pub const UPDATES_ENABLED: bool = false;
 
 /// The running build's version (from Cargo).
 pub fn current_version() -> &'static str {
@@ -120,6 +130,11 @@ pub fn pick_asset(info: &UpdateInfo, kind: InstallKind) -> Option<&Asset> {
 /// Uses `GITHUB_TOKEN`/`GH_TOKEN` from the environment when set (needed while
 /// the repo is private); works tokenless once the repo is public.
 pub fn check(channel: UpdateChannel) -> Result<UpdateInfo> {
+    if !UPDATES_ENABLED {
+        bail!(
+            "In-app updates are disabled in this build; update via your package manager (AUR)."
+        );
+    }
     let release = match channel {
         // The stable channel follows only promoted releases; `/releases/latest`
         // returns the newest non-draft, non-prerelease one.
