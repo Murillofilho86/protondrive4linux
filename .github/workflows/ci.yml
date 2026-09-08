@@ -54,3 +54,11 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2024-0429: unsound VariantStrIter in glib 0.18.5, pulled in
+          # transitively by gtk 0.18 (tray-icon's `libappindicator` backend
+          # requires gtk ^0.18; even tray-icon's latest release, 0.24.2, still
+          # does). No fix exists below gtk-rs 0.19, and bumping the whole
+          # gtk-rs stack isn't something we control from here. Our own code
+          # never touches VariantStrIter directly. Re-check when tray-icon (or
+          # libappindicator) moves off gtk 0.18.
+          ignore: RUSTSEC-2024-0429
