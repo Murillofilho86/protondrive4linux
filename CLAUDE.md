@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 protondrive4linux: bidirectional folder sync for Proton Drive on Linux, built on top of the official `proton-drive` CLI (which has no sync engine of its own — this crate adds a three-way-merge engine driven entirely by that CLI's one-shot commands). Single Cargo crate: a core library, a CLI binary, and an optional GUI binary.
 
-Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for the sync design/invariants (required reading before touching `engine.rs` or `watcher.rs`), and `docs/GUI_API.md` for the `service::Controller` API the GUI is built on.
+Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for the sync design/invariants (required reading before touching `engine.rs` or `watcher.rs`), `docs/GUI_API.md` for the `service::Controller` API the GUI is built on, `docs/architecture/ARCHITECTURE_PRINCIPLES.md` for the module boundaries and non-negotiable design decisions, and `docs/roadmap/ROADMAP.md` for what's planned next and why (per-milestone detail in `docs/roadmap/M*.md`).
 
 ## Build & test
 
@@ -24,7 +24,7 @@ GUI build needs system libs (Debian/Ubuntu): `libgtk-3-dev libxkbcommon-dev libw
 
 ## Releasing
 
-Not something to do casually — see `CONTRIBUTING.md` for full detail. In short: `scripts/release.sh <version>` bumps version, closes the `[Unreleased]` CHANGELOG section, commits, and cuts a signed tag but stops before pushing; pushing a `v*` tag triggers `.github/workflows/release.yml` to build `.deb`/`.rpm`/tarball as a draft/pre-release. `scripts/promote.sh <version>` promotes a pre-release to stable (retitles it `(stable)` and gives it the "Latest" badge) or `--demote`s it back.
+Not something to do casually — see `docs/contributing/CONTRIBUTING.md` for full detail. In short: `scripts/release.sh <version>` bumps version, closes the `[Unreleased]` CHANGELOG section, commits, and cuts a signed tag but stops before pushing; pushing a `v*` tag triggers `.github/workflows/release.yml` to build `.deb`/`.rpm`/tarball as a draft/pre-release. `scripts/promote.sh <version>` promotes a pre-release to stable (retitles it `(stable)` and gives it the "Latest" badge) or `--demote`s it back.
 
 ## Architecture
 
