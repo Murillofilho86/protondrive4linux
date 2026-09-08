@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- CI now publishes to the AUR on every `v*` tag: a new `aur-publish` job in `release.yml` re-runs `cargo test` and then pushes `PKGBUILD` + `protondrive4linux.install` to the AUR git repo for `protondrive4linux-git`. It's off by default — the AUR isn't accepting new account registrations right now (an orphaned-packages incident on their end) — and turns on once the `AUR_ACCOUNT_READY` repo variable and three secrets (`AUR_USERNAME`, `AUR_EMAIL`, `AUR_SSH_PRIVATE_KEY`) are set.
+- `protondrive4linux.install`: a post-install/post-upgrade pacman hook that prints first-run guidance (sign in, then enable "Run in system tray" / "Launch at login", or the systemd units for a headless setup) — Arch packages don't auto-launch apps or auto-enable services during install.
+- `.github/ISSUE_TEMPLATE/` and `.github/PULL_REQUEST_TEMPLATE.md`.
+
+### Changed
+- `master` is now a protected branch: no direct pushes, not even for admins — every change goes through a branch and a pull request, gated on the `build-test` and `audit` CI jobs. Documented in `CONTRIBUTING.md`'s new Workflow section.
+- `PKGBUILD` now depends directly on `proton-drive-cli` (it was only `optdepends`, so `yay -S protondrive4linux-git` alone didn't produce a working install) and declares `glib2` explicitly instead of relying on it arriving transitively through gtk3.
+- New application icon (a purple/green cloud+folder+sync mark) replaces the old NeutronSync-era atom logo everywhere it's embedded — window/tray icon, About screen, the desktop-integration writer — later swapped for a higher-resolution version. The GUI's accent, success-green, and background tones were resampled from the icon's own pixel colors instead of hand-picked.
+- README rewritten to match reality: the in-app-updates feature claim is gone (the updater is disabled — see `SECURITY_AUDIT.md`), an AUR install section was added, and the change list now links `CHANGELOG.md` instead of duplicating it.
+
+### Fixed
+- `PKGBUILD` opts out of Arch's default LTO CFLAGS injection (`options=('!lto')`). Arch's `makepkg.conf` appends `-flto=auto` to CFLAGS for every build by default, which broke rusqlite's bundled SQLite C compilation ("undefined symbol: sqlite3_*") on a genuinely fresh build — invisible when reusing an already-built `target/`, which never re-triggers that build script.
+- Repository references (`Cargo.toml`'s `repository`/`homepage`, `PKGBUILD`'s `url`, the updater's `REPO` constant, and the local `origin` remote) updated after the GitHub repository itself was renamed to `Murillofilho86/protondrive4linux` — relying on GitHub's redirect indefinitely was fragile.
+- CI's audit job now has the `checks: write` permission it needs to publish findings as a native Check annotation; it previously fell back to an unreadable "Resource not accessible by integration" log dump.
+
+### Security
+- Two dependency advisories fixed via semver-compatible bumps caught by CI's audit job: `event-listener` (unsound `Send`/`Sync` on `StackSlot`) and `webbrowser` (Unix `BROWSER` argument injection — pulled in transitively by egui-winit's hyperlink handling, never called by this project's own code).
+- Two more advisories (`glib`'s unsound `VariantStrIter`, `quick-xml`'s quadratic-time/unbounded-allocation parsing) come in transitively through the GUI's tray/Wayland stack with no compatible fix available yet; documented and explicitly ignored in `ci.yml` with the reasoning attached, rather than silently, pending an upstream `gtk-rs`/`wayland-scanner` bump.
+
 ## [0.4.0] - 2026-09-07
 
 ### Fixed
