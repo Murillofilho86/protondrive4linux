@@ -28,17 +28,22 @@ Nenhum cenário pode resultar em exclusão silenciosa ou perda de dados.
 
 ## M1-002 — Transactional sync execution
 **Labels**: `type:refactor`, `area:sync`, `risk:data-loss`
-**Status: 🔶 Parcial.** "Transferência concluída antes da baseline" e "estado intermediário
-recuperável" já são verdade hoje (commit é por arquivo, não em lote).
+**Status: 🔶 Quase concluído** (mesma investigação de M0-002, ver
+`docs/architecture/ARCHITECTURE_PRINCIPLES.md` § Sync Plan vs. Sync Execution). O pipeline já
+existe no código, confirmado lendo `src/engine.rs`:
 
 ```text
 SCAN → PLAN → EXECUTE → VERIFY → COMMIT
 ```
 
+`Plan{ops}` (cálculo puro) → loop de execução → `apply_op() -> Result<()>` (verify) →
+bookkeeping `pending`/`done` (commit por confirmação positiva). Não é um refactor pendente.
+
 ### Critérios de aceite
 - [x] Transferência concluída antes da baseline.
-- [ ] Operação parcialmente executada pode ser retomada — formalizar como garantia testada, não
-      consequência incidental do design atual.
+- [ ] Operação parcialmente executada pode ser retomada — **único item real pendente**: existe
+      como consequência do design (uma op que falha não entra em `done`, próxima run re-detecta
+      e re-tenta), mas falta um teste que trate isso como contrato explícito, não acidente.
 - [x] Falha não invalida operações independentes.
 - [x] Estado intermediário é recuperável.
 
@@ -76,14 +81,23 @@ sem o CLI oficial expor a operação — fechar a issue documentando a limitaç�
 **Status: 🔶 Parcial.** Já existe `ConflictPolicy::{KeepBoth, Newer, Skip}` configurável, com
 seletor na GUI.
 
-### Gap real
+### Gap real (GUI)
 Não existe uma "caixa de entrada de conflitos" na GUI (lista dos arquivos em conflito aguardando
 decisão) nem histórico de qual resolução foi aplicada a qual arquivo — hoje só existe a política
 global. Fechar como feature de GUI + log, não como engine.
 
+### Gap real (testes) — encontrado ao escrever `docs/architecture/SYNC_STATE_MATRIX.md`
+`ConflictPolicy::Newer` e `ConflictPolicy::Skip` **não têm nenhum teste** — só `KeepBoth` é
+exercitado (`conflict_keep_both`, `streaming_keeps_both_on_conflict`). Como isto é
+`risk:data-loss`, precisa de teste antes de M1 ser considerada fechada, mesmo que o
+comportamento pareça correto por leitura de código (`Newer` cai em `KeepBoth` quando falta mtime
+de um dos lados — comportamento seguro, mas não comprovado por teste).
+
 ### Critérios de aceite
 - [x] Conflito nunca destrói automaticamente a outra versão (`keep-both` é sempre seguro).
 - [x] CLI/config suporta resolução (política global).
+- [ ] Teste para `ConflictPolicy::Newer` (incluindo o fallback para `KeepBoth` sem mtime).
+- [ ] Teste para `ConflictPolicy::Skip`.
 - [ ] GUI exibe conflitos (lista/inbox por arquivo).
 - [ ] Histórico de resolução disponível no log.
 
