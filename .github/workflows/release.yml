@@ -52,6 +52,15 @@ jobs:
             libx11-dev libxcb1-dev libgl1-mesa-dev \
             libxdo-dev libayatana-appindicator3-dev
 
+      # Belt-and-suspenders: master's branch protection already requires the
+      # CI workflow's test job to pass before a merge lands, so this commit
+      # was tested before the tag was cut. Re-running here costs a couple of
+      # minutes and catches anything odd about the tagged commit itself
+      # (a tag pushed to a non-master ref, a stale local branch, etc.)
+      # before it ships as a release.
+      - name: Test
+        run: cargo test --all-features
+
       - name: Install packagers
         run: cargo install cargo-deb cargo-generate-rpm
 
@@ -141,3 +150,26 @@ jobs:
             dist/*.rpm
             dist/*-x86_64-linux.tar.gz
             dist/*-src.tar.gz
+
+  aur-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PKGBUILD is the -git (rolling) variant: pkgver() computes the
+      # version from `git describe` at build time on the user's machine, so
+      # nothing here needs to bump a version or update checksums per tag -
+      # publishing on every release just keeps the AUR copy in sync with
+      # what master (already tested and built above) actually contains.
+      - name: Publish to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: protondrive4linux-git
+          pkgbuild: ./PKGBUILD
+          assets: protondrive4linux.install
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.ref_name }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
