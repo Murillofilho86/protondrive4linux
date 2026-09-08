@@ -189,7 +189,7 @@ protondrive4linux has no access to your Proton account. Logging in runs Proton's
 
 ## Development
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, build, and release notes, [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API, and [`CHANGELOG.md`](CHANGELOG.md) for what's changed release to release.
+See [`docs/contributing/CONTRIBUTING.md`](docs/contributing/CONTRIBUTING.md) for layout, build, and release notes, [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API, [`docs/roadmap/ROADMAP.md`](docs/roadmap/ROADMAP.md) for what's planned next, and [`CHANGELOG.md`](CHANGELOG.md) for what's changed release to release.
 
 ## License
 

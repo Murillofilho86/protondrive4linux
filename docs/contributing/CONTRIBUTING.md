@@ -10,7 +10,7 @@ A single Cargo crate: a **library** (the reusable core) plus two binaries.
 - `src/main.rs` — the `protondrive4linux` CLI.
 - `src/bin/gui.rs` — the `protondrive4linux-gui` GUI (behind the `gui` feature).
 
-The GUI is intentionally thin over `service::Controller` (see `docs/GUI_API.md`);
+The GUI is intentionally thin over `service::Controller` (see `../GUI_API.md`);
 the core has no UI or CLI assumptions.
 
 ## Build & test

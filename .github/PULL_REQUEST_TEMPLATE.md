@@ -9,4 +9,4 @@
 - [ ] Updated `docs/SYNC_MODEL.md` if this touches `engine.rs` or `watcher.rs`'s sync/safety behavior
 
 `master` requires the `build-test` and `audit` checks to pass before merging - see
-[`CONTRIBUTING.md`](../CONTRIBUTING.md#workflow).
+[`CONTRIBUTING.md`](../docs/contributing/CONTRIBUTING.md#workflow).
