@@ -49,8 +49,38 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # Lets the action publish its findings as a native Check annotation
+    # instead of falling back to a bare log dump ("Resource not accessible
+    # by integration") when the repo's default GITHUB_TOKEN is read-only.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: "RUSTSEC-2024-0429,RUSTSEC-2026-0194,RUSTSEC-2026-0195"
+          # RUSTSEC-2024-0429: unsound VariantStrIter in glib 0.18.5, pulled
+          # in transitively by gtk 0.18 (tray-icon's `libappindicator`
+          # backend requires gtk ^0.18; even tray-icon's latest release,
+          # 0.24.2, still does). No fix exists below gtk-rs 0.19, and
+          # bumping the whole gtk-rs stack isn't something we control from
+          # here. Our own code never touches VariantStrIter directly.
+          # Re-check when tray-icon (or libappindicator) moves off gtk 0.18.
+          #
+          # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: two separate advisories
+          # against quick-xml 0.39.4 (quadratic-time attribute dedup, and
+          # unbounded namespace-declaration allocation), pulled in
+          # transitively by wayland-scanner - a build-time-only proc-macro
+          # that codegens Wayland protocol bindings from XML bundled with the
+          # crate itself. Fixed, trusted input, never attacker-controlled,
+          # and the tool isn't present in the shipped binary at all.
+          # wayland-scanner pins quick-xml = "^0.39"; the fix for both is
+          # >=0.41.0, outside that range (confirmed: `cargo update -p
+          # quick-xml` can't select it while wayland-scanner's constraint
+          # holds). Given the pattern (two advisories against the same
+          # pinned version in as many days), expect more of these to surface
+          # here over time - add the new ID rather than silence the package
+          # wholesale, and re-check when wayland-scanner bumps its
+          # requirement.
