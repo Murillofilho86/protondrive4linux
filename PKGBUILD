@@ -6,7 +6,7 @@
 # release exists yet.
 pkgname=protondrive4linux-git
 pkgver=0.3.3.r0.g0000000
-pkgrel=1
+pkgrel=2
 pkgdesc="Bidirectional Proton Drive folder sync for Linux, built on the official proton-drive CLI (unofficial, not affiliated with Proton AG)"
 arch=('x86_64')
 url="https://github.com/Murillofilho86/protondrive4linux"
@@ -67,7 +67,7 @@ package() {
 		"$pkgdir/usr/share/applications/protondrive4linux-gui.desktop"
 	install -Dm644 assets/logo.png \
 		"$pkgdir/usr/share/icons/hicolor/256x256/apps/protondrive4linux.png"
-	install -Dm644 assets/neutron-logo.svg \
+	install -Dm644 assets/logo.svg \
 		"$pkgdir/usr/share/icons/hicolor/scalable/apps/protondrive4linux.svg"
 	install -Dm644 systemd/protondrive4linux.service \
 		"$pkgdir/usr/lib/systemd/user/protondrive4linux.service"
