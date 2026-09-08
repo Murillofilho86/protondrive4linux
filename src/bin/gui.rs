@@ -25,17 +25,20 @@ use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairS
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
-const NAV_BG: Color32 = Color32::from_rgb(0x16, 0x15, 0x1C);
-const PANEL: Color32 = Color32::from_rgb(0x1C, 0x1B, 0x24);
-const PANEL2: Color32 = Color32::from_rgb(0x23, 0x22, 0x30);
-const SEL: Color32 = Color32::from_rgb(0x2A, 0x28, 0x33);
+// Derived from assets/logo.png's actual pixel colors (sampled, not eyeballed)
+// to match the app icon's visual identity: a deep indigo-violet base, a
+// vivid violet-purple accent, and the icon's bright green for success states.
+const NAV_BG: Color32 = Color32::from_rgb(0x14, 0x10, 0x22);
+const PANEL: Color32 = Color32::from_rgb(0x1B, 0x16, 0x2A);
+const PANEL2: Color32 = Color32::from_rgb(0x22, 0x1C, 0x34);
+const SEL: Color32 = Color32::from_rgb(0x2A, 0x20, 0x3E);
 const TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 const DIM: Color32 = Color32::from_rgb(0x8E, 0x8B, 0x9A);
 const DIM2: Color32 = Color32::from_rgb(0x6C, 0x6A, 0x7A);
-const ACCENT: Color32 = Color32::from_rgb(0x6D, 0x4A, 0xFF);
-const ACCENT_HI: Color32 = Color32::from_rgb(0x7C, 0x5C, 0xFF);
-const ACCENT_LO: Color32 = Color32::from_rgb(0x5C, 0x3E, 0xDB);
-const OK: Color32 = Color32::from_rgb(0x3C, 0xBB, 0x87);
+const ACCENT: Color32 = Color32::from_rgb(0x64, 0x28, 0xFA);
+const ACCENT_HI: Color32 = Color32::from_rgb(0x7B, 0x48, 0xFB);
+const ACCENT_LO: Color32 = Color32::from_rgb(0x50, 0x20, 0xC8);
+const OK: Color32 = Color32::from_rgb(0x52, 0xE6, 0x5C);
 const DANGER: Color32 = Color32::from_rgb(0xE0, 0x50, 0x64);
 const WARN: Color32 = Color32::from_rgb(0xD8, 0xA0, 0x50);
 
