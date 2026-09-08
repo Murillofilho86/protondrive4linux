@@ -13,6 +13,11 @@ url="https://github.com/Murillofilho86/protondrive4linux"
 license=('MIT')
 depends=(
 	'gtk3' 'libxkbcommon' 'wayland' 'libx11' 'libxcb' 'mesa' 'xdotool' 'libayatana-appindicator'
+	# `gio`, for recoverable local deletes (trash.rs falls back to a manual
+	# XDG-trash move without it). Only ever pulled in transitively via gtk3
+	# before - declared directly since we call it ourselves, not just build
+	# against it.
+	'glib2'
 	# The official Proton Drive CLI this tool drives - useless without it, so
 	# it's a hard dependency, not optional. Three AUR packages currently
 	# provide it (proton-drive-cli, -bin, -git); depending on the virtual
