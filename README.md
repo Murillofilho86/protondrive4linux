@@ -19,7 +19,6 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 - **Selective sync.** Exclude sub-folders per pair. Excluded paths are never touched on Proton; you can optionally free up local space by removing the local copy while the cloud copy stays.
 - **Live sync.** A watch daemon reconciles on local change (inotify, debounced) and does a periodic full rescan to catch everything else, including changes made on your other devices.
 - **Native GUI or CLI.** An egui desktop app (single binary, optional system tray) or a lean command-line tool. Same engine, same config.
-- **In-app updates.** Checks GitHub releases on a channel you choose (stable or pre-release), then downloads and installs the new version for you: it picks the asset matching how you installed (`.deb` or `.rpm`), installs it through your package manager so your package list stays correct, and restarts the app. A copy that no package manager owns is downloaded for you to install by hand.
 - **Signed releases.** Commits and tags are GPG-signed; releases ship `.deb`, `.rpm`, and a portable binary tarball.
 
 ## Requirements
@@ -29,6 +28,18 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 - `gio` (from glib, present on most desktops) for recoverable local deletes; a manual XDG-trash fallback is used if it is missing.
 
 ## Install
+
+### Arch Linux (AUR)
+
+```sh
+yay -S protondrive4linux-git   # or paru, or any other AUR helper
+```
+
+This pulls in the official `proton-drive` CLI automatically (as `proton-drive-cli`,
+its `-bin`, or its `-git` variant — pick whichever your AUR helper offers) along
+with every other dependency, so one command leaves you ready to launch the app
+and sign in. `protondrive4linux-git` tracks `master`; see
+[`PKGBUILD`](PKGBUILD) if you'd rather build it yourself with `makepkg`.
 
 ### From a release (Debian/Ubuntu)
 
@@ -153,7 +164,18 @@ The packaged units target `/usr/bin/protondrive4linux`. If you installed with `c
 
 ## Updates
 
-Releases come from GitHub. Every tag ships as a pre-release; a stable release is one that has been promoted after the build has proven itself, and its title says `(stable)`. The newest promoted release is the one GitHub marks "Latest". Point the updater at the `stable` or `prerelease` channel in Settings (or `update_channel` in the config): `stable` offers only promoted releases, `prerelease` offers every build as it lands. Checking never installs anything. When an update is available, "Download and install" verifies the download against the checksum GitHub publishes and installs it through your package manager (one `pkexec` prompt), then offers to restart.
+Update through whatever installed protondrive4linux: `yay -Syu` (AUR), your
+package manager for the `.deb`/`.rpm`, or a fresh `cargo install --path .`
+from source.
+
+The GUI's in-app updater is currently **disabled**. It checks a GitHub
+release's checksum before installing, but that checksum is computed by
+GitHub over the same asset it's checking — it catches a corrupted download,
+not a compromised release pipeline or account. It'll come back once releases
+carry an independent signature checked against a maintainer key baked into
+the binary; see [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) §0.6 for the detail.
+Releases still come from GitHub as before (every tag a pre-release, promoted
+to stable deliberately) - only the automatic in-app install step is off.
 
 ## Privacy and trust
 
@@ -167,7 +189,7 @@ protondrive4linux has no access to your Proton account. Logging in runs Proton's
 
 ## Development
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, build, and release notes, and [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, build, and release notes, [`docs/GUI_API.md`](docs/GUI_API.md) for the GUI backend API, and [`CHANGELOG.md`](CHANGELOG.md) for what's changed release to release.
 
 ## License
 
