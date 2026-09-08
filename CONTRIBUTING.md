@@ -57,9 +57,15 @@ git push origin v0.1.0     # builds .deb + .rpm + source tarball -> a pre-releas
 ```
 
 The AUR publish step re-runs `cargo test` first (belt-and-suspenders on top
-of `master`'s branch protection) and needs three repo secrets set:
-`AUR_USERNAME`, `AUR_EMAIL`, `AUR_SSH_PRIVATE_KEY` (an SSH key registered on
-the AUR account that owns the package).
+of `master`'s branch protection) and is gated on the repo variable
+`AUR_ACCOUNT_READY` being `"true"` - it no-ops (skips, doesn't fail) until
+then, since it also needs three repo *secrets* set: `AUR_USERNAME`,
+`AUR_EMAIL`, `AUR_SSH_PRIVATE_KEY` (an SSH key registered on the AUR account
+that owns the package). As of 2026-09-08 the AUR isn't accepting new account
+registrations (an orphaned-packages incident), so this is blocked until that
+lifts; once the account exists and the three secrets are set, flip
+`AUR_ACCOUNT_READY` to `"true"` (Settings → Secrets and variables → Actions
+→ Variables) to turn the job on.
 
 Packaging metadata lives in `Cargo.toml` (`[package.metadata.deb]` and
 `[package.metadata.generate-rpm]`). Both packages ship the CLI, the GUI, the
