@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 protondrive4linux: bidirectional folder sync for Proton Drive on Linux, built on top of the official `proton-drive` CLI (which has no sync engine of its own — this crate adds a three-way-merge engine driven entirely by that CLI's one-shot commands). Single Cargo crate: a core library, a CLI binary, and an optional GUI binary.
 
-Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for the sync design/invariants (required reading before touching `engine.rs` or `watcher.rs`), `docs/GUI_API.md` for the `service::Controller` API the GUI is built on, `docs/architecture/ARCHITECTURE_PRINCIPLES.md` for the module boundaries and non-negotiable design decisions, and `docs/roadmap/ROADMAP.md` for what's planned next and why (per-milestone detail in `docs/roadmap/M*.md`).
+Read `README.md` for user-facing behavior and config, `docs/SYNC_MODEL.md` for the sync design/invariants (required reading before touching `engine.rs` or `watcher.rs`), `docs/architecture/SYNC_STATE_MATRIX.md` for the exact LOCAL×REMOTE decision table `decide`/`decide_dir` implement, `docs/GUI_API.md` for the `service::Controller` API the GUI is built on, `docs/architecture/ARCHITECTURE_PRINCIPLES.md` for the module boundaries and non-negotiable design decisions, and `docs/roadmap/ROADMAP.md` for what's planned next and why (per-milestone detail in `docs/roadmap/M*.md`).
 
 ## Build & test
 

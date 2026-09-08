@@ -64,5 +64,64 @@ Remote Provider / Storage / Security / Configuration) e os módulos reais:
 | Supporting | `models`, `events`, `stats`, `datefmt`, `logger`, `auth_signal`, `updater` (feature `gui`) |
 
 O critério de aceite mais importante de M0-001 já está satisfeito: a GUI não depende do CLI do
-Proton diretamente, e o Sync Engine não conhece detalhes da GUI. O que falta é um diagrama
-formal e este documento — ver `docs/roadmap/M0-foundation.md`.
+Proton diretamente, e o Sync Engine não conhece detalhes da GUI.
+
+## Diagrama arquitetural (M0-001)
+
+```mermaid
+flowchart TB
+    subgraph Frontends
+        CLI["src/main.rs\n(protondrive4linux)"]
+        GUI["src/bin/gui.rs\n(protondrive4linux-gui, feature gui)"]
+    end
+
+    Controller["service::Controller\n(Application — API não-bloqueante:\nsync/cancel/start_watch/stop_watch/snapshot)"]
+
+    subgraph Core[Sync Engine]
+        Engine["engine\n(decide/decide_dir, run_sync_streaming)"]
+        Watcher["watcher\n(inotify, hot-folder + full-walk paced)"]
+    end
+
+    Remote["protoncli\n(Remote Provider — único lugar\nque conhece o proton-drive CLI)"]
+    Storage["state\n(Storage/Baseline — SQLite stats.db,\ncommits aditivos/escopados)"]
+    FS["trash / ignore\n(Filesystem local — delete recuperável,\nexcludes invisíveis ao scan)"]
+    Config["config\n(Configuration)"]
+
+    CLI --> Controller
+    GUI --> Controller
+    Controller --> Engine
+    Controller --> Watcher
+    Engine --> Remote
+    Engine --> Storage
+    Engine --> FS
+    Watcher --> Engine
+    Config --> Controller
+    Config --> Engine
+
+    ProtonCLI["proton-drive CLI oficial\n(processo externo)"]
+    Remote --> ProtonCLI
+```
+
+Setas mostram dependência (A → B = "A chama B"), não fluxo de dados. Note que `GUI`/`CLI` só
+falam com `Controller`, nunca com `engine` ou `protoncli` diretamente — é a garantia que M0-001
+pede.
+
+## Sync Plan vs. Sync Execution (M0-002)
+
+A separação `SCAN → PLAN → EXECUTE → VERIFY → COMMIT` já existe no código, só não estava
+nomeada assim. Não é um refactor pendente — é preciso reconhecer o que já está lá:
+
+| Fase | Onde | O que garante |
+| --- | --- | --- |
+| **SCAN** | `run_sync`/`run_sync_streaming`: lista local, lista remoto, lê baseline | Produz os três conjuntos de entradas que tudo abaixo consome |
+| **PLAN** | `classify()` + `decide()`/`decide_dir()` → `Plan { ops: Vec<Op> }` (`models.rs`) | Função pura sobre os três conjuntos — nenhuma I/O acontece aqui. `Plan`/`Op` já são um tipo explícito, não uma lista de side-effects |
+| **EXECUTE** | O loop que consome `plan.ops` (uploads/mkdirs/conflitos sequenciais + pool concorrente de downloads) | Cada `Op` vira uma chamada real ao `protoncli`/filesystem |
+| **VERIFY** | `apply_op(...) -> Result<()>` | Sucesso/falha por operação — nada é assumido |
+| **COMMIT** | Bookkeeping `pending`/`done`: uma baseline row provisória (criada em PLAN) só sobrevive se sua op estiver em `done` | Isto é o commit por confirmação positiva citado no `README.md`/`docs/SYNC_MODEL.md` |
+
+O que falta de fato (ver `docs/roadmap/M1-data-integrity.md` M1-002) é só formalizar
+"operação parcialmente executada pode ser retomada" como garantia testada — hoje é consequência
+do design (uma op que falha simplesmente não entra em `done`, e a próxima run a re-detecta), mas
+não há teste que documente isso como contrato explícito.
+
+Ver `docs/architecture/SYNC_STATE_MATRIX.md` (M0-003) para a tabela completa de decisão do PLAN.
