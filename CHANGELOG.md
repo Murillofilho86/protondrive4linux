@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-08
+
 ### Added
 - CI now publishes to the AUR on every `v*` tag: a new `aur-publish` job in `release.yml` re-runs `cargo test` and then pushes `PKGBUILD` + `protondrive4linux.install` to the AUR git repo for `protondrive4linux-git`. It's off by default — the AUR isn't accepting new account registrations right now (an orphaned-packages incident on their end) — and turns on once the `AUR_ACCOUNT_READY` repo variable and three secrets (`AUR_USERNAME`, `AUR_EMAIL`, `AUR_SSH_PRIVATE_KEY`) are set.
 - `protondrive4linux.install`: a post-install/post-upgrade pacman hook that prints first-run guidance (sign in, then enable "Run in system tray" / "Launch at login", or the systemd units for a headless setup) — Arch packages don't auto-launch apps or auto-enable services during install.
