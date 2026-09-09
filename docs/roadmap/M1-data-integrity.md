@@ -51,16 +51,42 @@ bookkeeping `pending`/`done` (commit por confirmação positiva). Não era um re
 
 ## M1-003 — Baseline integrity
 **Labels**: `type:feature`, `area:sync`, `risk:data-loss`
-**Status: ⬜ Não iniciado — gap real.** Não há hoje detecção de baseline SQLite corrompida ou de
-versão de schema incompatível. É o item de maior risco desta milestone: uma baseline corrompida
-mal tratada pode ser lida como "todos os arquivos sumiram".
+**Status: ✅ Concluído.** Investigação encontrou que a garantia central já era estrutural, não
+apenas incidental: `classify()` só pode emitir `Deleted` para um path presente na baseline —
+uma baseline vazia (por corrupção degradada a "arquivo SQLite novo" ou por erro propagado) é
+**estruturalmente incapaz** de gerar qualquer delete, nunca foi só "sorte de design". O que
+realmente faltava era (a) um guard de versão de schema, que não existia, e (b) provar isso com
+teste, não só por leitura de código.
+
+### O que foi adicionado
+- `PRAGMA user_version` em `Stats::open` (`src/stats.rs`): grava a versão do schema; recusa
+  abrir (erro, não leitura silenciosa) se encontrar uma versão diferente da que este build
+  entende. Versão `0` (arquivo novo ou DB de antes desta checagem existir) é aceita e
+  estampada — não quebra instalações existentes.
+- `open_refuses_a_corrupted_file_instead_of_silently_treating_it_as_empty` e
+  `open_refuses_an_incompatible_schema_version` (`src/stats.rs`, testes unitários): provam que
+  um arquivo corrompido (bytes que não são SQLite) e uma versão de schema estranha falham alto
+  (`Err`), citando a mensagem real do SQLite, não uma checagem que poderia ela mesma ser
+  contornada.
+- `corrupted_baseline_db_refuses_to_sync_rather_than_mass_delete` (`tests/engine.rs`): prova de
+  ponta a ponta — corrompe o `stats.db` de um par já sincronizado e confirma que a sync inteira
+  é recusada (`Err`) e **nenhum arquivo é deletado de nenhum dos lados**.
+
+### Recovery (a resposta a "Recovery seguro")
+Falhar alto já É a recuperação segura: o usuário resolve apagando/restaurando o `stats.db`
+corrompido e rodando de novo — nesse ponto cai no caminho já existente e testado de "baseline
+ausente une os dois lados" (nunca espelha), então o pior caso é re-upload/re-download do que já
+existia, nunca perda de dado. Não foi construído fluxo de "auto-reparo" — não é necessário dado
+que a via seura já existe e é a mesma usada para qualquer baseline ausente.
 
 ### Critérios de aceite
-- [ ] Detectar baseline inválida.
-- [ ] Detectar versão incompatível.
-- [ ] Detectar corrupção.
-- [ ] Nunca interpretar baseline corrompida como "todos os arquivos foram removidos".
-- [ ] Recovery seguro.
+- [x] Detectar baseline inválida (arquivo corrompido falha em `Stats::open`, propagado como
+      `Err`, nunca lido como vazio).
+- [x] Detectar versão incompatível (`PRAGMA user_version` guard, novo).
+- [x] Detectar corrupção (erro nativo do SQLite já propagava; agora comprovado por teste).
+- [x] Nunca interpretar baseline corrompida como "todos os arquivos foram removidos" — comprovado
+      estruturalmente (`classify()`) e por teste de ponta a ponta.
+- [x] Recovery seguro (mesma via já testada de "baseline ausente une, nunca espelha").
 
 ## M1-004 — Rename detection
 **Labels**: `type:feature`, `area:sync`, `risk:data-loss`
@@ -132,7 +158,7 @@ implicitamente.
 
 ## M1 — Definition of Done
 - [ ] Disaster suite (parte nova) passando.
-- [ ] Baseline integrity check implementado e testado.
+- [x] Baseline integrity check implementado e testado.
 - [ ] Conflict inbox na GUI.
 - [ ] Offline recovery testado.
 - [ ] Nenhum `risk:data-loss` crítico aberto.

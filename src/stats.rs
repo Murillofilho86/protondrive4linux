@@ -15,6 +15,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::Entry;
 
+/// Stamped into the DB's `PRAGMA user_version` on every successful open. Bump
+/// this if a future change to the `baseline`/`pair_state` schema would make an
+/// older or newer build misinterpret existing rows (not needed for additive,
+/// backward-compatible changes like the `state`/`error` columns below, which
+/// use `ALTER TABLE` migrations instead).
+const SCHEMA_VERSION: i64 = 1;
+
 pub struct Stats {
     conn: Mutex<Connection>,
 }
@@ -47,6 +54,27 @@ impl Stats {
         let path = state_dir.join("stats.db");
         let conn = Connection::open(&path)
             .with_context(|| format!("opening stats db {}", path.display()))?;
+
+        // A version of 0 means either a brand-new file (nothing to conflict
+        // with) or one written before this check existed (same schema shape,
+        // safe to adopt going forward — stamped below). Anything else that
+        // isn't our own version is a schema we don't know how to read
+        // correctly; refuse rather than risk misinterpreting rows a
+        // different version wrote under different assumptions.
+        let existing_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .with_context(|| format!("reading schema version of {}", path.display()))?;
+        if existing_version != 0 && existing_version != SCHEMA_VERSION {
+            anyhow::bail!(
+                "{} has schema version {existing_version}, but this build expects \
+                 {SCHEMA_VERSION}. Refusing to open it rather than risk misreading its \
+                 baseline as empty. Back it up and remove it to start a fresh baseline \
+                 (a missing baseline unions both sides rather than deleting anything), or \
+                 use a build that matches this version.",
+                path.display()
+            );
+        }
+
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
@@ -100,6 +128,8 @@ impl Stats {
             "DELETE FROM baseline WHERE state IN ('pending_up', 'pending_down')",
             [],
         );
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .with_context(|| format!("stamping schema version on {}", path.display()))?;
         Ok(Stats {
             conn: Mutex::new(conn),
         })
@@ -449,5 +479,77 @@ mod tests {
         // outside the window -> nothing
         let old = s.hot_folders("p", 10, 1, 1_000_000).unwrap();
         assert!(old.is_empty());
+    }
+
+    #[test]
+    fn open_refuses_a_corrupted_file_instead_of_silently_treating_it_as_empty() {
+        // M1-003: a stats.db that isn't a valid SQLite file at all (disk
+        // corruption, a truncated write, garbage) must fail loudly, not be
+        // silently read as "no baseline" - the caller decides what "no
+        // baseline" safely means (union, never mirror); Stats::open must not
+        // make that call itself by swallowing the error.
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("stats.db"),
+            b"not a sqlite database, just garbage bytes",
+        )
+        .unwrap();
+
+        let err = match Stats::open(&dir) {
+            Ok(_) => panic!("a garbage file must not open as an empty DB"),
+            Err(e) => e,
+        };
+        // rusqlite's own message ("file is not a database"), not a message we
+        // invented - proves the failure comes from SQLite actually rejecting
+        // the file, not from a check that could itself be bypassed.
+        assert!(
+            format!("{err:#}").to_lowercase().contains("not a database"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_refuses_an_incompatible_schema_version() {
+        // M1-003: a stats.db stamped with a schema version this build doesn't
+        // know must be refused, not silently read under the wrong assumptions.
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-schemaver-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A normal open creates and stamps the current version.
+        Stats::open(&dir).unwrap();
+        // Simulate a DB written by some other (future or foreign) schema
+        // version.
+        Connection::open(dir.join("stats.db"))
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 999")
+            .unwrap();
+
+        let err = match Stats::open(&dir) {
+            Ok(_) => panic!("a foreign schema version must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("schema version"),
+            "unexpected error: {err:#}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
