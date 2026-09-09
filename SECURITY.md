@@ -41,6 +41,25 @@ best-effort target: an acknowledgment within a week, and a fix or mitigation pla
 before any public disclosure. Please give a reasonable amount of time to address the issue
 before disclosing it publicly.
 
+## Verifying a release
+
+Every release artifact (`.deb`, `.rpm`, source and binary tarballs) is signed with a GPG signing
+subkey dedicated to this project — separate from any personal key, so it can be rotated or
+revoked without affecting anything else. See `docs/contributing/RELEASE_SIGNING.md` for the full
+key-management model (this is still being rolled out; check that file for current status and
+the fingerprint).
+
+Once a release ships a `.asc` file next to an artifact:
+
+```sh
+gpg --import docs/keys/protondrive4linux-release.asc   # once, or `gpg --recv-keys <fingerprint>`
+gpg --verify protondrive4linux_X.Y.Z_amd64.deb.asc protondrive4linux_X.Y.Z_amd64.deb
+```
+
+A `Good signature from "protondrive4linux release signing ..."` confirms the artifact matches
+what this project's CI actually built and published — not just that the download didn't get
+corrupted in transit (which is all the GitHub-published SHA-256 checksum alone proves).
+
 ## Known, already-documented risk areas
 
 `SECURITY_AUDIT.md` records the due-diligence audit of the code this project forked from,

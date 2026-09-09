@@ -16,7 +16,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M1-005 | Conflict Manager | M1 | `type:feature` `area:sync` `risk:data-loss` | 🔶 (engine ✅, falta GUI) |
 | M1-006 | Content verification | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ (falta benchmark) |
 | M1-007 | Offline recovery | M1 | `type:test` `area:sync` `risk:data-loss` | ✅ |
-| M2-001 | Release signing | M2 | `type:security` `area:security` `priority:critical` | ⬜ |
+| M2-001 | Release signing | M2 | `type:security` `area:security` `priority:critical` | 🔶 (infra/CI prontos, falta gerar a chave) |
 | M2-002 | Secure updater | M2 | `type:security` `area:security` `risk:security` | 🔶 (desligado) |
 | M2-003 | Proton CLI resolution hardening | M2 | `type:security` `area:security` `risk:security` | ⬜ |
 | M2-004 | Automated dependency audit | M2 | `type:security` `area:security` | 🔶 |

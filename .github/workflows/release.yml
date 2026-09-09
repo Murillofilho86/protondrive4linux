@@ -101,6 +101,41 @@ jobs:
           cp target/generate-rpm/*.rpm dist/ 2>/dev/null || true
           ls -l dist/
 
+      # Signing is off until RELEASE_SIGNING_READY is flipped on (see
+      # docs/contributing/RELEASE_SIGNING.md) - there's no key yet to sign
+      # with. Once it's on, this must fail rather than silently ship an
+      # unsigned release: a flipped-on flag with a missing secret is a
+      # broken promise to anyone relying on M2-001, not a reason to skip.
+      - name: Require signing secrets once release signing is enabled
+        if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
+        run: |
+          [ -n "${{ secrets.GPG_SIGNING_KEY }}" ] ||
+            { echo "::error::RELEASE_SIGNING_READY is true but GPG_SIGNING_KEY secret is missing"; exit 1; }
+          [ -n "${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}" ] ||
+            { echo "::error::RELEASE_SIGNING_READY is true but GPG_SIGNING_KEY_FINGERPRINT var is missing"; exit 1; }
+
+      - name: Import release-signing GPG subkey
+        if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
+        run: gpg --batch --import <<< "${{ secrets.GPG_SIGNING_KEY }}"
+
+      - name: Sign release artifacts
+        if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
+        run: |
+          shopt -s nullglob
+          targets=(dist/*.deb dist/*.rpm dist/*-x86_64-linux.tar.gz dist/*-src.tar.gz)
+          for f in "${targets[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "${{ secrets.GPG_SIGNING_KEY_PASSPHRASE }}" \
+              --local-user "${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}" \
+              --detach-sign --armor "$f"
+          done
+          missing=0
+          for f in "${targets[@]}"; do
+            [ -e "$f.asc" ] || { echo "::error::no signature produced for $f"; missing=1; }
+          done
+          [ "$missing" -eq 0 ]
+          ls -l dist/*.asc
+
       # Release notes come from CHANGELOG.md, not GitHub's generated commit list:
       # the changelog says what changed and why, the commit list just repeats the
       # subject lines. Pull out the section for this tag's version.
@@ -150,6 +185,7 @@ jobs:
             dist/*.rpm
             dist/*-x86_64-linux.tar.gz
             dist/*-src.tar.gz
+            dist/*.asc
 
   aur-publish:
     needs: release
