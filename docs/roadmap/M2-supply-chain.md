@@ -4,16 +4,22 @@
 
 ## M2-001 — Release signing
 **Labels**: `type:security`, `area:security`, `priority:critical`
-**Status: ⬜ Não iniciado — gap real, já sinalizado no `SECURITY_AUDIT.md`.** Não há assinatura
-criptográfica de release hoje, só o checksum SHA-256 do próprio GitHub (mesmo canal do artefato,
-não é verificação independente). **Este é o item de segurança mais importante ainda aberto.**
+**Status: 🔶 Infra pronta, esperando a chave.** Modelo escolhido: GPG com chave mestra
+(offline, capacidade `Certify` só) + subchave de assinatura (a que roda em CI) — ver
+`docs/contributing/RELEASE_SIGNING.md` pro racional e o passo a passo. O workflow
+(`.github/workflows/release.yml`) já importa a subchave, assina cada artefato (`.deb`, `.rpm`,
+tarballs) e **falha a build** se a assinatura não sair — mas isso só liga quando a variável de
+repositório `RELEASE_SIGNING_READY` for setada, porque a chave em si ainda não foi gerada. Até
+lá, nenhum release sai assinado (mesma situação de antes: só o checksum SHA-256 do GitHub).
 
 ### Critérios de aceite
-- [ ] Chave de assinatura documentada.
-- [ ] Chave pública incorporada/verificável.
-- [ ] Release assinada.
-- [ ] Instruções de verificação.
-- [ ] CI falha se assinatura não for gerada.
+- [x] Chave de assinatura documentada (`docs/contributing/RELEASE_SIGNING.md`).
+- [ ] Chave pública incorporada/verificável (`docs/keys/protondrive4linux-release.asc` — falta
+      gerar a chave).
+- [ ] Release assinada (falta a primeira tag depois da chave existir).
+- [x] Instruções de verificação (`SECURITY.md#verifying-a-release`).
+- [x] CI falha se assinatura não for gerada (uma vez `RELEASE_SIGNING_READY=true`, secret/var
+      ausente ou `.asc` faltando derruba o job — não é best-effort).
 
 ## M2-002 — Secure updater
 **Labels**: `type:security`, `area:security`, `risk:security`
