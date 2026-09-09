@@ -65,9 +65,9 @@ No content comparison, no conflict — a directory is a container, not a value:
 
 | Policy | Behavior |
 | --- | --- |
-| `KeepBoth` (default) | Remote version wins the original name in the new baseline; local copy is renamed aside by the transfer layer. Never destroys either version. |
-| `Newer` | Compares mtimes; whichever is newer wins (upload or download). If either side lacks an mtime, **falls back to `KeepBoth`** rather than guessing — same safety guarantee as the default. |
-| `Skip` | Neither side is touched; baseline row is left as Noop until the user resolves it manually. |
+| `KeepBoth` (default) | Remote version wins the original name in the new baseline; local copy is renamed aside by the transfer layer. Never destroys either version. (`conflict_keep_both`, `streaming_keeps_both_on_conflict`) |
+| `Newer` | Compares mtimes; whichever is newer wins (upload or download). If either side lacks an mtime, **falls back to `KeepBoth`** rather than guessing — same safety guarantee as the default. (`conflict_newer_local_wins`, `conflict_newer_remote_wins`, `conflict_newer_without_remote_mtime_falls_back_to_keep_both`) |
+| `Skip` | Neither side is touched; baseline row is left as Noop until the user resolves it manually. (`conflict_skip_leaves_both_sides_untouched`) |
 
 ## Renames (`detect_renames`, post-processing on the plan)
 
@@ -84,10 +84,10 @@ documentation:
 
 - **`Unchanged`/`Modified` (download path) has no dedicated unit test** at the `decide()` level,
   only indirect coverage via the streaming full-walk tests.
-- **`ConflictPolicy::Newer` and `ConflictPolicy::Skip` have no test at all** — only `KeepBoth` is
-  exercised (`conflict_keep_both`, `streaming_keeps_both_on_conflict`). Given conflicts are a
-  `risk:data-loss` area, this is worth closing before M1 is considered done — fold into
-  `docs/roadmap/M1-data-integrity.md`'s M1-005 (Conflict Manager).
+- ~~`ConflictPolicy::Newer` and `ConflictPolicy::Skip` have no test at all~~ — closed:
+  `conflict_newer_local_wins`, `conflict_newer_remote_wins`,
+  `conflict_newer_without_remote_mtime_falls_back_to_keep_both`, and
+  `conflict_skip_leaves_both_sides_untouched` in `tests/engine.rs` (M1-005).
 - **Same-size/drifted-mtime baseline refresh** (the 0.4.0 thrash fix) has no dedicated regression
   test under this name — it's exercised indirectly by whatever real-world scenario prompted the
   0.4.0 fix, but a named test would prevent silent regression.

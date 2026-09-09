@@ -28,7 +28,7 @@ Nenhum cenário pode resultar em exclusão silenciosa ou perda de dados.
 
 ## M1-002 — Transactional sync execution
 **Labels**: `type:refactor`, `area:sync`, `risk:data-loss`
-**Status: 🔶 Quase concluído** (mesma investigação de M0-002, ver
+**Status: ✅ Concluído** (mesma investigação de M0-002, ver
 `docs/architecture/ARCHITECTURE_PRINCIPLES.md` § Sync Plan vs. Sync Execution). O pipeline já
 existe no código, confirmado lendo `src/engine.rs`:
 
@@ -37,13 +37,15 @@ SCAN → PLAN → EXECUTE → VERIFY → COMMIT
 ```
 
 `Plan{ops}` (cálculo puro) → loop de execução → `apply_op() -> Result<()>` (verify) →
-bookkeeping `pending`/`done` (commit por confirmação positiva). Não é um refactor pendente.
+bookkeeping `pending`/`done` (commit por confirmação positiva). Não era um refactor pendente.
 
 ### Critérios de aceite
 - [x] Transferência concluída antes da baseline.
-- [ ] Operação parcialmente executada pode ser retomada — **único item real pendente**: existe
-      como consequência do design (uma op que falha não entra em `done`, próxima run re-detecta
-      e re-tenta), mas falta um teste que trate isso como contrato explícito, não acidente.
+- [x] Operação parcialmente executada pode ser retomada — já testado como contrato explícito,
+      não só consequência do design: `failed_download_is_pending_not_deleted`,
+      `failed_upload_keeps_local_edit` (falha e retomada, ambas direções) e
+      `cancelled_run_does_not_record_untransferred_as_synced` (cancelamento a meio da run,
+      depois retomada) em `tests/engine.rs`.
 - [x] Falha não invalida operações independentes.
 - [x] Estado intermediário é recuperável.
 
@@ -78,26 +80,26 @@ sem o CLI oficial expor a operação — fechar a issue documentando a limitaç�
 
 ## M1-005 — Conflict Manager
 **Labels**: `type:feature`, `area:sync`, `risk:data-loss`
-**Status: 🔶 Parcial.** Já existe `ConflictPolicy::{KeepBoth, Newer, Skip}` configurável, com
-seletor na GUI.
+**Status: 🔶 Parcial (engine ✅, GUI ⬜).** Já existe `ConflictPolicy::{KeepBoth, Newer, Skip}`
+configurável, com seletor na GUI, e agora as três políticas têm cobertura de teste completa.
 
-### Gap real (GUI)
+### Testes adicionados (fechando o gap encontrado em `SYNC_STATE_MATRIX.md`)
+`conflict_newer_local_wins`, `conflict_newer_remote_wins`,
+`conflict_newer_without_remote_mtime_falls_back_to_keep_both` (prova que `Newer` nunca *adivinha*
+um vencedor sem mtime comparável dos dois lados — cai em `KeepBoth`, nunca escolhe um lado às
+cegas) e `conflict_skip_leaves_both_sides_untouched`, todos em `tests/engine.rs`.
+
+### Gap real restante (GUI)
 Não existe uma "caixa de entrada de conflitos" na GUI (lista dos arquivos em conflito aguardando
 decisão) nem histórico de qual resolução foi aplicada a qual arquivo — hoje só existe a política
-global. Fechar como feature de GUI + log, não como engine.
-
-### Gap real (testes) — encontrado ao escrever `docs/architecture/SYNC_STATE_MATRIX.md`
-`ConflictPolicy::Newer` e `ConflictPolicy::Skip` **não têm nenhum teste** — só `KeepBoth` é
-exercitado (`conflict_keep_both`, `streaming_keeps_both_on_conflict`). Como isto é
-`risk:data-loss`, precisa de teste antes de M1 ser considerada fechada, mesmo que o
-comportamento pareça correto por leitura de código (`Newer` cai em `KeepBoth` quando falta mtime
-de um dos lados — comportamento seguro, mas não comprovado por teste).
+global. Isto é feature de GUI + log, não de engine — fica para quando M5 (Desktop Experience)
+for atacado, já que é a mesma camada de trabalho.
 
 ### Critérios de aceite
 - [x] Conflito nunca destrói automaticamente a outra versão (`keep-both` é sempre seguro).
 - [x] CLI/config suporta resolução (política global).
-- [ ] Teste para `ConflictPolicy::Newer` (incluindo o fallback para `KeepBoth` sem mtime).
-- [ ] Teste para `ConflictPolicy::Skip`.
+- [x] Teste para `ConflictPolicy::Newer` (incluindo o fallback para `KeepBoth` sem mtime).
+- [x] Teste para `ConflictPolicy::Skip`.
 - [ ] GUI exibe conflitos (lista/inbox por arquivo).
 - [ ] Histórico de resolução disponível no log.
 

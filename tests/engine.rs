@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, UNIX_EPOCH};
 
 use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::engine::Engine;
@@ -21,6 +22,10 @@ use neutronsync::protoncli::{ListOutcome, Remote};
 struct Store {
     files: BTreeMap<String, Vec<u8>>, // absolute proton path -> bytes
     dirs: BTreeSet<String>,
+    // Remote mtime per file (epoch secs), for ConflictPolicy::Newer tests. A
+    // file with no entry here is listed with mtime: None, matching how a real
+    // remote entry can legitimately lack claimedModificationTime.
+    mtimes: BTreeMap<String, i64>,
     moves: usize,                  // count of rename/move calls
     fail_dir: Option<String>,      // absolute path whose listing should error
     notfound_dir: Option<String>,  // absolute path whose probe reports NotFound
@@ -78,6 +83,7 @@ impl Remote for FakeRemote {
                         path: rest.to_string(),
                         is_dir: false,
                         size: data.len() as u64,
+                        mtime: s.mtimes.get(f).copied(),
                         ..Default::default()
                     });
                 }
@@ -250,6 +256,12 @@ fn cfg(root: &Path) -> Config {
 fn write(p: &Path, text: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(p, text).unwrap();
+}
+
+fn set_local_mtime(p: &Path, secs: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+        .unwrap();
 }
 
 fn run(cfg: &Config, remote: FakeRemote, resync: bool) {
@@ -438,6 +450,181 @@ fn conflict_keep_both() {
     assert!(
         contents.contains("remote-change-different") && contents.contains("local-change"),
         "both versions on remote"
+    );
+}
+
+#[test]
+fn conflict_newer_local_wins() {
+    // ConflictPolicy::Newer with both mtimes known: the newer side (local
+    // here) wins outright - it's uploaded, no conflict copy is created, and
+    // the older remote content is replaced.
+    let t = Tmp::new("conf-newer-local");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/a.txt");
+    write(&local, "base");
+    run(&c, fake, false);
+
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/a.txt".into(), b"remote-change".to_vec());
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000);
+    write(&local, "local-change-newer");
+    set_local_mtime(&local, 2_000);
+
+    let (fake2, _s2) = reuse(&store);
+    run(&c, fake2, false);
+
+    assert_eq!(
+        std::fs::read_to_string(&local).unwrap(),
+        "local-change-newer",
+        "local (newer) content must survive untouched"
+    );
+    assert_eq!(
+        remote_files(&store).get("/my-files/docs/a.txt").unwrap(),
+        "local-change-newer",
+        "newer local content must have been uploaded over the older remote one"
+    );
+    let names: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("conflict")),
+        "Newer must not create a conflict copy when it can pick a winner: {names:?}"
+    );
+}
+
+#[test]
+fn conflict_newer_remote_wins() {
+    // Mirror of the above with the remote side newer: it's downloaded over
+    // the older local edit, no conflict copy created.
+    let t = Tmp::new("conf-newer-remote");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/a.txt");
+    write(&local, "base");
+    run(&c, fake, false);
+
+    write(&local, "local-change-older");
+    set_local_mtime(&local, 1_000);
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-newer".to_vec(),
+    );
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 2_000);
+
+    let (fake2, _s2) = reuse(&store);
+    run(&c, fake2, false);
+
+    assert_eq!(
+        std::fs::read_to_string(&local).unwrap(),
+        "remote-change-newer",
+        "newer remote content must have been downloaded over the older local edit"
+    );
+    let names: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("conflict")),
+        "Newer must not create a conflict copy when it can pick a winner: {names:?}"
+    );
+}
+
+#[test]
+fn conflict_newer_without_remote_mtime_falls_back_to_keep_both() {
+    // Data-safety regression: Newer must never GUESS a winner when it can't
+    // compare mtimes on both sides (e.g. a remote entry with no
+    // claimedModificationTime). It must fall back to the same safe KeepBoth
+    // behavior as the default policy, never silently pick a side.
+    let t = Tmp::new("conf-newer-no-mtime");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/a.txt");
+    write(&local, "base");
+    run(&c, fake, false);
+
+    write(&local, "local-change");
+    set_local_mtime(&local, 1_000);
+    // Remote change with NO mtime recorded (Store::mtimes left empty for this
+    // path) - the fake mirrors a real remote entry with no claimedModificationTime.
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-different".to_vec(),
+    );
+
+    let (fake2, _s2) = reuse(&store);
+    run(&c, fake2, false);
+
+    let names: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("conflict")),
+        "without a comparable remote mtime, Newer must fall back to keep-both: {names:?}"
+    );
+    let contents: BTreeSet<String> = remote_files(&store).into_values().collect();
+    assert!(
+        contents.contains("remote-change-different") && contents.contains("local-change"),
+        "both versions must survive on remote, same guarantee as the default policy"
+    );
+}
+
+#[test]
+fn conflict_skip_leaves_both_sides_untouched() {
+    // ConflictPolicy::Skip: neither side is touched and no conflict copy is
+    // created - the row is left pending until a human resolves it. Data-safety
+    // guarantee: skipping must never destroy either version.
+    let t = Tmp::new("conf-skip");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Skip;
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/a.txt");
+    write(&local, "base");
+    run(&c, fake, false);
+
+    write(&local, "local-change");
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-different".to_vec(),
+    );
+
+    let (fake2, _s2) = reuse(&store);
+    run(&c, fake2, false);
+
+    assert_eq!(
+        std::fs::read_to_string(&local).unwrap(),
+        "local-change",
+        "Skip must leave the local edit exactly as it was"
+    );
+    assert_eq!(
+        remote_files(&store).get("/my-files/docs/a.txt").unwrap(),
+        "remote-change-different",
+        "Skip must leave the remote edit exactly as it was"
+    );
+    let names: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("conflict")),
+        "Skip must not create a conflict copy: {names:?}"
     );
 }
 
