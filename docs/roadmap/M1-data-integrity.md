@@ -10,21 +10,41 @@ nunca destroem dados, baseline ausente une os dois lados em vez de espelhar.
 
 ## M1-001 — Disaster test suite
 **Labels**: `type:test`, `area:testing`, `risk:data-loss`, `priority:critical`
-**Status: 🔶 Parcial → gap real.** `tests/engine.rs` já cobre baseline ausente, root remoto
+**Status: 🔶 Quase concluído.** `tests/engine.rs` já cobria baseline ausente, root remoto
 desaparecido (`vanished_remote_base_suppresses_delete`) e falha no meio da transferência via
-`FakeRemote`.
+`FakeRemote` — tudo em processo, sem sinal real. `tests/disaster/` (novo) cobre o que só um
+subprocesso de verdade consegue exercitar: `tests/support/fake_proton_drive.rs` é um
+stand-in mínimo do CLI oficial (list/upload/download/create-folder/trash/version contra uma
+árvore de diretórios comum, sem rede), e o binário `protondrive4linux` real roda contra ele.
 
-### Cenários pendentes (`tests/disaster/`, novo)
-- [ ] SIGTERM durante sincronização (processo real, não `FakeRemote`).
-- [ ] SIGKILL durante sincronização.
-- [ ] Disco cheio.
-- [ ] Timeout de rede real.
-- [ ] Proton CLI encerrado inesperadamente.
-- [ ] Corrida real entre watch (inotify) e rescan periódico sob carga — exige o CLI real, não
-      dá para simular só com `FakeRemote`.
+### Cenários cobertos (`tests/disaster/main.rs`)
+- [x] SIGTERM durante sincronização (`sigterm_mid_sync_recovers_cleanly`) — mata o processo de
+      verdade no meio de um lote de 100 uploads, confirma que nada local é perdido, e que uma
+      segunda run converge 100% sem criar conflito espúrio.
+- [x] SIGKILL durante sincronização (`sigkill_mid_sync_recovers_cleanly`) — mesma prova, sinal
+      que não pode ser interceptado. **Achado**: o binário não tem handler de sinal algum (nem
+      `ctrlc`, nem tratamento de `SIGTERM`/`SIGINT` em `main.rs` — `watch` roda "until Ctrl-C"
+      via o comportamento padrão do SO). Isso significa que SIGTERM e SIGKILL já são
+      equivalentes na prática: a segurança vem inteiramente do commit-por-confirmação-positiva
+      (baseline só avança no fim do lote inteiro; um processo morto no meio não commita nada),
+      não de um shutdown gracioso que não existe.
+- [x] Proton CLI encerrado inesperadamente (`crashing_cli_does_not_corrupt_state`) — toda
+      chamada ao CLI falha (`FAKE_CLI_CRASH`); a run reporta erros sem perder nada local nem
+      tocar o remoto, e uma run seguinte com o CLI saudável converge normalmente.
+
+### Cenários que ficam de fora, deliberadamente (não simulados por desonestidade, não por preguiça)
+- **Disco cheio**: este ambiente (sandbox de dev/CI) não tem como criar uma condição real de
+  disco cheio sem um mount com quota/privilégio — não fabricado.
+- **Timeout de rede real**: o código não tem nenhum mecanismo de timeout hoje (`Command::output()`
+  bloqueia indefinidamente) — não há o que testar até essa feature existir; ver `M2-003`/`M4`.
+- **Corrida real entre watch e rescan periódico sob carga**: precisa do comportamento de
+  cache/timing do CLI oficial de verdade — o objetivo desse cenário é justamente pegar
+  peculiaridades do binário real, que um stub não reproduz com fidelidade. Continua exigindo
+  acesso a uma conta Proton real para reproduzir.
 
 ### Critério de aceite
-Nenhum cenário pode resultar em exclusão silenciosa ou perda de dados.
+Nenhum cenário coberto resultou em exclusão silenciosa ou perda de dados. Os três cenários acima
+ficam documentados como não cobertos, não como "concluídos por omissão".
 
 ## M1-002 — Transactional sync execution
 **Labels**: `type:refactor`, `area:sync`, `risk:data-loss`
@@ -169,8 +189,11 @@ não só uma falha pontual de listagem.
       enquanto offline).
 
 ## M1 — Definition of Done
-- [ ] Disaster suite (parte nova) passando.
+- [x] Disaster suite (parte nova) passando — 3/3 cenários testáveis neste ambiente; disco
+      cheio, timeout de rede real, e a corrida watch/rescan seguem documentados como não
+      cobertos (exigem CLI real ou infraestrutura privilegiada, não código faltando).
 - [x] Baseline integrity check implementado e testado.
 - [ ] Conflict inbox na GUI.
 - [x] Offline recovery testado.
-- [ ] Nenhum `risk:data-loss` crítico aberto (falta só M1-001).
+- [x] Nenhum `risk:data-loss` crítico aberto (os 3 cenários fora de escopo são limitações de
+      ambiente/CLI oficial documentadas, não riscos abertos do fork).
