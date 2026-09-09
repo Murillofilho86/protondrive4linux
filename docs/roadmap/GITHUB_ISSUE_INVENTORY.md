@@ -11,7 +11,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M0-003 | Criar matriz de estados de sincronização | M0 | `type:documentation` `area:sync` `area:testing` | ✅ |
 | M1-001 | Disaster test suite | M1 | `type:test` `area:testing` `risk:data-loss` `priority:critical` | 🔶 |
 | M1-002 | Transactional sync execution | M1 | `type:refactor` `area:sync` `risk:data-loss` | ✅ |
-| M1-003 | Baseline integrity | M1 | `type:feature` `area:sync` `risk:data-loss` | ⬜ |
+| M1-003 | Baseline integrity | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ |
 | M1-004 | Rename detection | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ (limitação do CLI documentada) |
 | M1-005 | Conflict Manager | M1 | `type:feature` `area:sync` `risk:data-loss` | 🔶 (engine ✅, falta GUI) |
 | M1-006 | Content verification | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ (falta benchmark) |

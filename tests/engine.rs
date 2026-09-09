@@ -1019,6 +1019,48 @@ fn vanished_remote_base_suppresses_delete() {
 }
 
 #[test]
+fn corrupted_baseline_db_refuses_to_sync_rather_than_mass_delete() {
+    // M1-003: a corrupted stats.db (disk corruption, a bad write, whatever)
+    // must never be silently read as "no baseline" and mirrored into a mass
+    // delete. It must fail loudly (refuse to sync this pair) and leave both
+    // sides exactly as they were, since the DB is unreadable, not empty.
+    let t = Tmp::new("corruptbaseline");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "keep");
+    write(&t.path().join("local/b.txt"), "keep too");
+    run(&c, fake, false); // establishes a real baseline with both files.
+
+    // Corrupt the baseline DB in place - not a missing file (that's the
+    // already-safe "never synced" case), a genuinely unreadable one.
+    let db_path = c.state_dir.join("stats.db");
+    std::fs::write(&db_path, b"definitely not a sqlite file").unwrap();
+
+    let (fake2, _s) = reuse(&store);
+    let result = try_run(&c, fake2, false);
+    assert!(
+        result.is_err(),
+        "a corrupted baseline must refuse to sync, not silently proceed as empty"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/a.txt")).unwrap(),
+        "keep",
+        "local file must survive a corrupted baseline untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/b.txt")).unwrap(),
+        "keep too",
+        "local file must survive a corrupted baseline untouched"
+    );
+    assert_eq!(
+        remote_files(&store).len(),
+        2,
+        "no remote file may be deleted when the baseline can't be read"
+    );
+}
+
+#[test]
 fn exclude_skips_subtree() {
     // An excluded sub-path is never uploaded/downloaded; everything else syncs.
     let t = Tmp::new("excl");
