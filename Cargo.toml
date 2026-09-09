@@ -70,6 +70,18 @@ name = "protondrive4linux-gui"
 path = "src/bin/gui.rs"
 required-features = ["gui"]
 
+# Test-only fixture: a minimal proton-drive CLI stand-in (list/upload/download/
+# create-folder/trash/version against a plain directory tree, no network) used
+# by tests/disaster/ to run the real protondrive4linux binary as a subprocess
+# and send it real signals - something an in-process FakeRemote (tests/engine.rs)
+# can't exercise. Not part of the shipped product; PKGBUILD/.deb/.rpm only
+# install the two binaries above by name.
+[[bin]]
+name = "fake-proton-drive"
+path = "tests/support/fake_proton_drive.rs"
+test = false
+doc = false
+
 # --- Packaging -------------------------------------------------------------
 # Built by .github/workflows/release.yml on a v* tag. Both packages ship the
 # CLI, the GUI, the .desktop entry, and the systemd --user units. The GUI
