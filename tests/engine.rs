@@ -31,6 +31,10 @@ struct Store {
     notfound_dir: Option<String>,  // absolute path whose probe reports NotFound
     fail_download: Option<String>, // absolute file path whose download should error
     fail_upload: Option<String>,   // absolute file path whose upload should error
+    // Total connectivity loss (M1-007): every list/upload/download call fails,
+    // like a real proton-drive CLI with no network. Distinct from fail_dir/
+    // fail_download/fail_upload, which target one specific path.
+    offline: bool,
 }
 
 struct FakeRemote {
@@ -52,6 +56,9 @@ fn basename(p: &str) -> String {
 
 impl Remote for FakeRemote {
     fn list_dir_probe(&self, remote_path: &str) -> anyhow::Result<ListOutcome> {
+        if self.store.borrow().offline {
+            anyhow::bail!("simulated offline: no connection to Proton Drive");
+        }
         if self.store.borrow().notfound_dir.as_deref() == Some(remote_path.trim_end_matches('/')) {
             return Ok(ListOutcome::NotFound);
         }
@@ -61,6 +68,9 @@ impl Remote for FakeRemote {
     fn list_dir(&self, remote_path: &str) -> anyhow::Result<Vec<Entry>> {
         let prefix = format!("{}/", remote_path.trim_end_matches('/'));
         let s = self.store.borrow();
+        if s.offline {
+            anyhow::bail!("simulated offline: no connection to Proton Drive");
+        }
         if s.fail_dir.as_deref() == Some(remote_path.trim_end_matches('/')) {
             anyhow::bail!("simulated listing failure for {remote_path}");
         }
@@ -101,6 +111,9 @@ impl Remote for FakeRemote {
     }
 
     fn upload(&self, local_path: &str, remote_parent: &str) -> anyhow::Result<()> {
+        if self.store.borrow().offline {
+            anyhow::bail!("simulated offline: no connection to Proton Drive");
+        }
         let data = std::fs::read(local_path)?;
         let key = format!(
             "{}/{}",
@@ -115,6 +128,9 @@ impl Remote for FakeRemote {
     }
 
     fn download(&self, remote_path: &str, local_dest: &str) -> anyhow::Result<()> {
+        if self.store.borrow().offline {
+            anyhow::bail!("simulated offline: no connection to Proton Drive");
+        }
         if self.store.borrow().fail_download.as_deref() == Some(remote_path) {
             anyhow::bail!("simulated download failure for {remote_path}");
         }
@@ -1057,6 +1073,119 @@ fn corrupted_baseline_db_refuses_to_sync_rather_than_mass_delete() {
         remote_files(&store).len(),
         2,
         "no remote file may be deleted when the baseline can't be read"
+    );
+}
+
+#[test]
+fn offline_then_reconnect_reconciles_correctly() {
+    // M1-007: total connectivity loss (every remote call fails, like a real
+    // proton-drive CLI with no network) must not lose local edits and must
+    // not propagate anything destructive while offline. Once reconnected, it
+    // must correctly reconcile independent changes made on each side during
+    // the outage - including detecting a real conflict when both sides
+    // touched the same file.
+    let t = Tmp::new("offline");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/shared.txt"), "v1");
+    write(&t.path().join("local/local-untouched.txt"), "stable");
+    run(&c, fake, false); // baseline: both files on both sides.
+
+    // --- Go offline, make local edits ---
+    store.borrow_mut().offline = true;
+    write(&t.path().join("local/shared.txt"), "v1-local-edit"); // will conflict later
+    write(
+        &t.path().join("local/new-local-file.txt"),
+        "created while offline",
+    );
+
+    {
+        let (fake2, _s) = reuse(&store);
+        let log = Logger::silent();
+        let mut eng = Engine::new(&c, fake2, &log, false);
+        let res = eng
+            .sync_pair(&c.pairs[0], false)
+            .expect("an offline attempt reports errors, it doesn't hard-fail the whole pair");
+        assert!(
+            !res.errors.is_empty(),
+            "every operation should have failed while offline"
+        );
+    }
+    // Nothing destructive happened while offline: local edits untouched,
+    // nothing on remote deleted or changed.
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/shared.txt")).unwrap(),
+        "v1-local-edit",
+        "local edit must survive a failed offline sync attempt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/new-local-file.txt")).unwrap(),
+        "created while offline"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/local-untouched.txt")).unwrap(),
+        "stable",
+        "an untouched file must never be deleted just because listing failed"
+    );
+    assert_eq!(
+        remote_files(&store).len(),
+        2,
+        "nothing on remote may change while offline"
+    );
+
+    // --- Independent changes happen on the remote while we were offline
+    // (another device, or just Proton's own servers) ---
+    store.borrow_mut().offline = false;
+    store.borrow_mut().files.insert(
+        "/my-files/docs/shared.txt".into(),
+        b"v1-remote-edit".to_vec(), // conflicts with our local edit above
+    );
+    store.borrow_mut().files.insert(
+        "/my-files/docs/new-remote-file.txt".into(),
+        b"created remotely while offline".to_vec(),
+    );
+
+    // --- Back online: reconcile ---
+    let (fake3, _s) = reuse(&store);
+    run(&c, fake3, false);
+
+    // Local-only new file uploaded.
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/new-local-file.txt")
+            .map(String::as_str),
+        Some("created while offline"),
+        "file created locally while offline must upload once reconnected"
+    );
+    // Remote-only new file downloaded.
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/new-remote-file.txt")).unwrap(),
+        "created remotely while offline",
+        "file created remotely while offline must download once reconnected"
+    );
+    // Untouched file survives, on both sides.
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/local-untouched.txt")).unwrap(),
+        "stable"
+    );
+    assert!(remote_files(&store).values().any(|v| v == "stable"));
+    // Real conflict (both sides edited shared.txt differently) is detected
+    // and resolved per ConflictPolicy - never silently dropped, never
+    // silently overwritten.
+    let names: Vec<String> = std::fs::read_dir(t.path().join("local"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("conflict")),
+        "concurrent edits to the same file during the outage must be flagged as a conflict: {names:?}"
+    );
+    let contents: BTreeSet<String> = remote_files(&store).into_values().collect();
+    assert!(
+        contents.contains("v1-local-edit") && contents.contains("v1-remote-edit"),
+        "both conflicting edits must survive on remote"
     );
 }
 

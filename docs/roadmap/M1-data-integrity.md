@@ -146,19 +146,31 @@ for atacado, já que é a mesma camada de trabalho.
 
 ## M1-007 — Offline recovery
 **Labels**: `type:test`, `area:sync`, `risk:data-loss`
-**Status: ⬜ Não iniciado — gap real.** O cenário "internet cai, edita local, internet volta,
-reconcilia" não tem teste dedicado hoje, mesmo que o mecanismo de baseline deva lidar com ele
-implicitamente.
+**Status: ✅ Concluído.** `offline_then_reconnect_reconciles_correctly` (`tests/engine.rs`)
+cobre o ciclo completo: `FakeRemote` ganhou um modo `offline` (toda chamada de list/upload/
+download falha, como um `proton-drive` real sem rede) — edições locais feitas offline, uma
+tentativa de sync que falha graciosamente (erros reportados, nada perdido), mudanças
+independentes injetadas no remoto durante a "queda", e uma reconciliação final que confirma as
+4 garantias abaixo numa única passada.
+
+O mecanismo por trás já existia (o guard de "scan incompleto suprime deletes", o mesmo que
+`incomplete_remote_scan_suppresses_delete`/`vanished_remote_base_suppresses_delete` já
+testavam) — o que faltava era provar que ele cobre o fluxo offline→reconecta de ponta a ponta,
+não só uma falha pontual de listagem.
 
 ### Critérios de aceite
-- [ ] Alterações locais preservadas.
-- [ ] Alterações remotas recuperadas.
-- [ ] Conflitos detectados.
-- [ ] Nenhuma operação destrutiva incorreta.
+- [x] Alterações locais preservadas (edição local + arquivo novo local sobrevivem à tentativa
+      offline e são enviados ao reconectar).
+- [x] Alterações remotas recuperadas (arquivo criado no remoto durante a queda é baixado ao
+      reconectar).
+- [x] Conflitos detectados (o mesmo arquivo editado nos dois lados durante a queda vira
+      conflito de verdade, resolvido pela `ConflictPolicy`, nunca perdido).
+- [x] Nenhuma operação destrutiva incorreta (arquivo intocado sobrevive; nada no remoto muda
+      enquanto offline).
 
 ## M1 — Definition of Done
 - [ ] Disaster suite (parte nova) passando.
 - [x] Baseline integrity check implementado e testado.
 - [ ] Conflict inbox na GUI.
-- [ ] Offline recovery testado.
-- [ ] Nenhum `risk:data-loss` crítico aberto.
+- [x] Offline recovery testado.
+- [ ] Nenhum `risk:data-loss` crítico aberto (falta só M1-001).
