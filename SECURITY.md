@@ -46,19 +46,25 @@ before disclosing it publicly.
 Every release artifact (`.deb`, `.rpm`, source and binary tarballs) is signed with a GPG signing
 subkey dedicated to this project — separate from any personal key, so it can be rotated or
 revoked without affecting anything else. See `docs/contributing/RELEASE_SIGNING.md` for the full
-key-management model (this is still being rolled out; check that file for current status and
-the fingerprint).
+key-management model.
 
-Once a release ships a `.asc` file next to an artifact:
+Master key fingerprint: `58D0231CA8A38EC4263500937F87E84394A6E101`
+Signing subkey fingerprint: `72ACDDB4ED23A2F7CE7B768F7D57E42A1FDAB300` (expires 2027-09-10 —
+renewed periodically per the runbook; verify against the current `docs/keys/*.asc` if this looks
+stale)
 
 ```sh
-gpg --import docs/keys/protondrive4linux-release.asc   # once, or `gpg --recv-keys <fingerprint>`
+gpg --import docs/keys/protondrive4linux-release.asc
 gpg --verify protondrive4linux_X.Y.Z_amd64.deb.asc protondrive4linux_X.Y.Z_amd64.deb
 ```
 
 A `Good signature from "protondrive4linux release signing ..."` confirms the artifact matches
 what this project's CI actually built and published — not just that the download didn't get
 corrupted in transit (which is all the GitHub-published SHA-256 checksum alone proves).
+
+The key and CI wiring exist as of this commit; signing only actually runs once
+`RELEASE_SIGNING_READY` is turned on (see `docs/contributing/RELEASE_SIGNING.md`). Anything
+released before the first tag with a `.asc` attached is checksum-only.
 
 ## Known, already-documented risk areas
 

@@ -14,9 +14,11 @@ lá, nenhum release sai assinado (mesma situação de antes: só o checksum SHA-
 
 ### Critérios de aceite
 - [x] Chave de assinatura documentada (`docs/contributing/RELEASE_SIGNING.md`).
-- [ ] Chave pública incorporada/verificável (`docs/keys/protondrive4linux-release.asc` — falta
-      gerar a chave).
-- [ ] Release assinada (falta a primeira tag depois da chave existir).
+- [x] Chave pública incorporada/verificável (`docs/keys/protondrive4linux-release.asc`, chave
+      mestra `58D0231CA8A38EC4263500937F87E84394A6E101`, subchave de assinatura
+      `72ACDDB4ED23A2F7CE7B768F7D57E42A1FDAB300`).
+- [ ] Release assinada (secrets/var já configurados no repo; falta ligar
+      `RELEASE_SIGNING_READY` e cortar a primeira tag depois disso).
 - [x] Instruções de verificação (`SECURITY.md#verifying-a-release`).
 - [x] CI falha se assinatura não for gerada (uma vez `RELEASE_SIGNING_READY=true`, secret/var
       ausente ou `.asc` faltando derruba o job — não é best-effort).
