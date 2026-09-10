@@ -3347,6 +3347,7 @@ fn starter_config(path: &Path) -> Config {
         fresh_cache: true,
         scan_threads: 0,
         download_threads: 0,
+        cli_timeout_secs: 1800,
         remote_root: config::DEFAULT_REMOTE_ROOT.into(),
         propagate_deletes: true,
         auto_sync: false,

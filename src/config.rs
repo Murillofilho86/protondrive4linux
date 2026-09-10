@@ -60,6 +60,13 @@ pub struct Config {
     /// Concurrent file downloads during a sync (0 = auto). Bandwidth-bound, so
     /// the auto default is modest.
     pub download_threads: usize,
+    /// Kill and fail a single `proton-drive` invocation (list, upload,
+    /// download, ...) if it hasn't finished after this many seconds, instead
+    /// of blocking forever. A hung/crashed CLI process previously froze the
+    /// whole sync (and, if it happened on the GUI's own thread, the window
+    /// itself) with no way to recover short of killing it by hand. Generous
+    /// by default so a legitimately large/slow transfer isn't cut off.
+    pub cli_timeout_secs: u64,
     pub remote_root: String,
     pub propagate_deletes: bool,
     /// Start the watch daemon on launch (the GUI's global "Auto sync").
@@ -139,6 +146,7 @@ struct RawCli {
     fresh_cache: Option<bool>,
     scan_threads: Option<u64>,
     download_threads: Option<u64>,
+    cli_timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -385,6 +393,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         fresh_cache: cli.fresh_cache.unwrap_or(true),
         scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
         download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
+        cli_timeout_secs: cli.cli_timeout_secs.unwrap_or(1800),
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
         auto_sync: opts.auto_sync.unwrap_or(false),
@@ -516,6 +525,7 @@ struct OutCli {
     fresh_cache: bool,
     scan_threads: usize,
     download_threads: usize,
+    cli_timeout_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials_store: Option<String>,
 }
@@ -595,6 +605,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             fresh_cache: cfg.fresh_cache,
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
+            cli_timeout_secs: cfg.cli_timeout_secs,
             credentials_store: cfg.credentials_store.clone(),
         },
         options: OutOptions {

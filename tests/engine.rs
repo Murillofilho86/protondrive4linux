@@ -244,6 +244,7 @@ fn cfg(root: &Path) -> Config {
         fresh_cache: false,
         scan_threads: 0,
         download_threads: 0,
+        cli_timeout_secs: 30,
         remote_root: "/my-files".into(),
         propagate_deletes: false,
         auto_sync: false,
