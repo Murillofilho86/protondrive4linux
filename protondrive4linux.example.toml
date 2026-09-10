@@ -18,6 +18,10 @@ upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strate
 # download also prompts without a strategy; overwrite the local copy on download
 # (0.8 renamed the overwrite strategy from replace → remove).
 download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
+# Kill and fail a single proton-drive call (list/upload/download/...) if it
+# hasn't finished after this many seconds, instead of blocking forever. Bump
+# this if you regularly transfer very large files over a slow connection.
+# cli_timeout_secs = 1800
 # Optional: force where the CLI stores your session credentials.
 # One of "keychain", "pass", "unsafe_file". Omit to use the CLI default.
 # credentials_store = "keychain"

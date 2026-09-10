@@ -141,6 +141,69 @@ pub trait Remote {
     }
 }
 
+/// Like `Command::output()`, but kills the child and returns an error instead
+/// of blocking forever if it hasn't exited within `timeout`. `std` has no
+/// built-in wait-with-timeout, so this polls `try_wait` while two threads
+/// drain stdout/stderr concurrently (required either way: a child that writes
+/// more than a pipe buffer's worth of output would otherwise deadlock against
+/// a parent that isn't reading yet).
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn proton-drive CLI")?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll proton-drive CLI")?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "proton-drive CLI did not finish within {}s, killed it",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("stdout reader thread panicked"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("stderr reader thread panicked"))?;
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 pub struct ProtonCli {
     binary: String,
     upload_flags: Vec<String>,
@@ -149,6 +212,7 @@ pub struct ProtonCli {
     cache_dir: Option<PathBuf>,
     scan_threads: usize,
     download_threads: usize,
+    cli_timeout: Duration,
 }
 
 impl Drop for ProtonCli {
@@ -182,6 +246,7 @@ impl ProtonCli {
             cache_dir,
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
+            cli_timeout: Duration::from_secs(cfg.cli_timeout_secs),
         }
     }
 
@@ -203,9 +268,8 @@ impl ProtonCli {
     }
 
     fn run_with(&self, args: &[&str], cache: Option<&Path>) -> Result<(bool, String, String)> {
-        let out = self
-            .command_with(args, cache)
-            .output()
+        let mut cmd = self.command_with(args, cache);
+        let out = output_with_timeout(&mut cmd, self.cli_timeout)
             .with_context(|| format!("failed to run {:?}", self.binary))?;
         Ok((
             out.status.success(),
