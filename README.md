@@ -12,6 +12,12 @@
 
 The official `proton-drive` CLI can upload, download, list, and manage sharing, but it has no sync engine. protondrive4linux adds one: a three-way-merge engine that keeps one or more local folders and their Proton Drive counterparts in sync in both directions, driven entirely by the CLI's one-shot commands. It ships as a dependency-light CLI plus an optional native GUI, both on one core library.
 
+<p align="center">
+  <img src="docs/screenshots/activity.png" width="32%" alt="Activity view, showing a completed sync">
+  <img src="docs/screenshots/folders.png" width="32%" alt="Folders view, showing a local/Proton Drive pair">
+  <img src="docs/screenshots/settings.png" width="32%" alt="Settings view">
+</p>
+
 ## Features
 
 - **Bidirectional three-way merge.** A per-pair baseline lets it tell "new on the remote" apart from "deleted locally", so changes on either side are applied correctly instead of blindly mirrored.
@@ -19,7 +25,7 @@ The official `proton-drive` CLI can upload, download, list, and manage sharing, 
 - **Selective sync.** Exclude sub-folders per pair. Excluded paths are never touched on Proton; you can optionally free up local space by removing the local copy while the cloud copy stays.
 - **Live sync.** A watch daemon reconciles on local change (inotify, debounced) and does a periodic full rescan to catch everything else, including changes made on your other devices.
 - **Native GUI or CLI.** An egui desktop app (single binary, optional system tray) or a lean command-line tool. Same engine, same config.
-- **Signed releases.** Commits and tags are GPG-signed; releases ship `.deb`, `.rpm`, and a portable binary tarball.
+- **Checksummed releases, signing in progress.** Releases ship `.deb`, `.rpm`, and a portable binary tarball with published SHA-256 checksums. Independent GPG signing of release artifacts is being rolled out (see [`SECURITY.md`](SECURITY.md#verifying-a-release)) so a compromised release pipeline, not just a corrupted download, can be caught.
 
 ## Requirements
 

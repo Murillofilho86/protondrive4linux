@@ -108,12 +108,128 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
 
 /// Paint the app logo (from `assets/logo.png`) into `rect`.
 /// Falls back to a filled disc if the texture isn't loaded yet.
+///
+/// `logo.png` isn't perfectly square (1303x1207 - the shield badge sticks out
+/// past the cloud's bounding box), so drawing it straight into a square
+/// `rect` stretched it ~8% on one axis - subtle in a size number, but very
+/// visible on a round cloud shape, which is what "the icon looks distorted"
+/// turned out to be. Fit it (letterboxed, centered) instead of stretching it.
 fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHandle>) {
     if let Some(tex) = tex {
+        let size = tex.size_vec2();
+        let fitted = if size.x > 0.0 && size.y > 0.0 {
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            Rect::from_center_size(rect.center(), size * scale)
+        } else {
+            rect
+        };
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        painter.image(tex.id(), rect, uv, Color32::WHITE);
+        painter.image(tex.id(), fitted, uv, Color32::WHITE);
     } else {
         painter.circle_filled(rect.center(), rect.width() * 0.5, ACCENT);
+    }
+}
+
+/// Box-filter downsample of RGBA8 pixels so the longer side is at most
+/// `max_dim`, preserving aspect ratio. A no-op if already within `max_dim`.
+///
+/// `logo.png` is decoded at its full source resolution (1303x1207) and then
+/// drawn as small as a 26px nav-rail icon; the GPU's plain bilinear
+/// minification (no mipmaps - see `TextureOptions::LINEAR` at the call site)
+/// can't average a ~50:1 minification sensibly and turns the shield/arrow
+/// detail into a colored smear. Shrinking the source in software first (to
+/// something the GPU only needs to minify a little further) fixes it without
+/// a new image-processing dependency.
+///
+/// Averages in premultiplied-alpha space: averaging straight (unmultiplied)
+/// alpha would let a transparent pixel's arbitrary RGB darken the edge of
+/// opaque content it's boxed together with.
+fn downscale_rgba(
+    pixels: &[u8],
+    src_w: usize,
+    src_h: usize,
+    max_dim: usize,
+) -> (Vec<u8>, usize, usize) {
+    if src_w == 0 || src_h == 0 || src_w.max(src_h) <= max_dim {
+        return (pixels.to_vec(), src_w, src_h);
+    }
+    let scale = max_dim as f64 / src_w.max(src_h) as f64;
+    let dst_w = ((src_w as f64 * scale).round() as usize).max(1);
+    let dst_h = ((src_h as f64 * scale).round() as usize).max(1);
+    let mut out = vec![0u8; dst_w * dst_h * 4];
+    for oy in 0..dst_h {
+        let sy0 = oy * src_h / dst_h;
+        let sy1 = ((oy + 1) * src_h / dst_h).max(sy0 + 1).min(src_h);
+        for ox in 0..dst_w {
+            let sx0 = ox * src_w / dst_w;
+            let sx1 = ((ox + 1) * src_w / dst_w).max(sx0 + 1).min(src_w);
+            let (mut r, mut g, mut b, mut a, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in sy0..sy1 {
+                let row = sy * src_w;
+                for sx in sx0..sx1 {
+                    let i = (row + sx) * 4;
+                    let pa = pixels[i + 3] as u64;
+                    r += pixels[i] as u64 * pa;
+                    g += pixels[i + 1] as u64 * pa;
+                    b += pixels[i + 2] as u64 * pa;
+                    a += pa;
+                    n += 1;
+                }
+            }
+            let o = (oy * dst_w + ox) * 4;
+            if let (Some(rr), Some(gg), Some(bb), Some(aa)) = (
+                r.checked_div(a),
+                g.checked_div(a),
+                b.checked_div(a),
+                a.checked_div(n),
+            ) {
+                out[o] = rr as u8;
+                out[o + 1] = gg as u8;
+                out[o + 2] = bb as u8;
+                out[o + 3] = aa as u8;
+            }
+        }
+    }
+    (out, dst_w, dst_h)
+}
+
+#[cfg(test)]
+mod downscale_tests {
+    use super::downscale_rgba;
+
+    #[test]
+    fn is_a_noop_when_already_within_max_dim() {
+        let px = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let (out, w, h) = downscale_rgba(&px, 2, 2, 4);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(out, px);
+    }
+
+    #[test]
+    fn averages_a_uniform_block() {
+        // A 4x4 block of solid red, downsampled 2:1, must stay solid red -
+        // not drift from rounding or from mixing in neighboring boxes.
+        let px: Vec<u8> = [200u8, 0, 0, 255].repeat(16);
+        let (out, w, h) = downscale_rgba(&px, 4, 4, 2);
+        assert_eq!((w, h), (2, 2));
+        for pixel in out.chunks(4) {
+            assert_eq!(pixel, [200, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn transparent_pixels_do_not_darken_opaque_edges() {
+        // 2x1: opaque white next to fully-transparent (zeroed) black.
+        // Averaging straight (unmultiplied) RGB would pull this toward gray;
+        // averaging in premultiplied space must keep the color white, only
+        // the coverage (alpha) drops.
+        let px = [255, 255, 255, 255, 0, 0, 0, 0];
+        let (out, w, h) = downscale_rgba(&px, 2, 1, 1);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(&out[0..3], &[255, 255, 255]);
+        assert_eq!(out[3], 127); // average alpha of 255 and 0
     }
 }
 
@@ -984,10 +1100,14 @@ impl eframe::App for App {
             if let Ok(ic) =
                 eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png"))
             {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [ic.width as usize, ic.height as usize],
-                    &ic.rgba,
-                );
+                // 256px comfortably covers every on-screen use (26px nav icon,
+                // 72px onboarding icon, even at 2x-3x HiDPI) while still being
+                // small enough for the GPU's bilinear minification to look
+                // sharp - see downscale_rgba's doc comment for why this needs
+                // to happen here instead of uploading the full-resolution PNG.
+                let (rgba, w, h) =
+                    downscale_rgba(&ic.rgba, ic.width as usize, ic.height as usize, 256);
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                 self.logo_tex =
                     Some(ctx.load_texture("app-logo", img, egui::TextureOptions::LINEAR));
             }
@@ -1303,27 +1423,37 @@ impl App {
         // In tray mode the background daemon owns the watcher, so this window
         // shows/edits the *setting* (cfg.auto_sync) rather than its own watch
         // state — starting a second watcher here would fight over the lock.
-        let on = if self.mode_daemon {
+        let mode_daemon = self.mode_daemon;
+        let on = if mode_daemon {
             self.cfg.auto_sync
         } else {
             snap.watching
         };
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Auto sync").size(12.5).color(TEXT));
-                let sub = if on && self.mode_daemon {
-                    format!(
-                        "On · tray is watching {n} folder{}",
-                        if n == 1 { "" } else { "s" }
-                    )
-                } else if on {
-                    format!("On · watching {n} folder{}", if n == 1 { "" } else { "s" })
-                } else {
-                    "Off · sync on demand".to_string()
-                };
-                ui.label(RichText::new(sub).size(11.0).color(DIM));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        // Sides (not horizontal+vertical) so the switch's width is reserved
+        // before the label wraps - see setting_row's doc comment for why.
+        // The left closure only captures plain locals (not `self`): the right
+        // one needs `&mut self` to react to the click, and both closures are
+        // constructed as values before `show()` runs them, so the borrow
+        // checker requires their captures not to overlap.
+        egui::Sides::new().shrink_left().wrap().show(
+            ui,
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Auto sync").size(12.5).color(TEXT));
+                    let sub = if on && mode_daemon {
+                        format!(
+                            "On · tray is watching {n} folder{}",
+                            if n == 1 { "" } else { "s" }
+                        )
+                    } else if on {
+                        format!("On · watching {n} folder{}", if n == 1 { "" } else { "s" })
+                    } else {
+                        "Off · sync on demand".to_string()
+                    };
+                    ui.label(RichText::new(sub).size(11.0).color(DIM));
+                });
+            },
+            |ui| {
                 if switch(ui, on) {
                     if self.mode_daemon {
                         // Just update the setting; the tray daemon applies it.
@@ -1353,8 +1483,8 @@ impl App {
                         self.dirty = true;
                     }
                 }
-            });
-        });
+            },
+        );
     }
 }
 
@@ -3227,6 +3357,13 @@ fn settings_group(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::U
 
 /// A settings row: title + description on the left, a control on the right,
 /// aligned to a consistent right edge. Returns the control closure's value.
+///
+/// The control is laid out first (via `Sides::shrink_left`) so the text
+/// column's wrap width is the space actually left over, not the full row
+/// width - a plain `horizontal` + `vertical` here measured the text before
+/// the control claimed its space, so on a narrow window the text wrapped as
+/// if it had the whole row and then overlapped the control instead of
+/// breaking early.
 fn setting_row<R>(
     ui: &mut egui::Ui,
     title: &str,
@@ -3234,17 +3371,20 @@ fn setting_row<R>(
     right: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let mut out = None;
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(title).size(13.5).color(TEXT));
-            if !desc.is_empty() {
-                ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(DIM2)));
-            }
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    egui::Sides::new().shrink_left().wrap().show(
+        ui,
+        |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(13.5).color(TEXT));
+                if !desc.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(DIM2)));
+                }
+            });
+        },
+        |ui| {
             out = Some(right(ui));
-        });
-    });
+        },
+    );
     ui.add_space(12.0);
     out.expect("setting_row control ran")
 }
