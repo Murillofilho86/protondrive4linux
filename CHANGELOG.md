@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-11
+
 ### Added
 - Release artifacts (`.deb`, `.rpm`, source and binary tarballs) are now GPG-signed in CI (M2-001): an offline, Certify-only master key with a Sign-only subkey dedicated to CI, so the subkey can be rotated or revoked without ever touching the project's long-term identity or requiring users to re-trust a new key. See `docs/contributing/RELEASE_SIGNING.md` for the key-management model and `SECURITY.md#verifying-a-release` for verification instructions. The public key is published at `docs/keys/protondrive4linux-release.asc`.
 - `docs/screenshots/` (Activity, Folders, Settings), embedded in the README for visitors.
