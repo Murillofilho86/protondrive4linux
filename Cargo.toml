@@ -1,6 +1,6 @@
 [package]
 name = "protondrive4linux"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 license = "MIT"

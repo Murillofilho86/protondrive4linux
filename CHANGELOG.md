@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-11
+
+### Added
+- Release artifacts (`.deb`, `.rpm`, source and binary tarballs) are now GPG-signed in CI (M2-001): an offline, Certify-only master key with a Sign-only subkey dedicated to CI, so the subkey can be rotated or revoked without ever touching the project's long-term identity or requiring users to re-trust a new key. See `docs/contributing/RELEASE_SIGNING.md` for the key-management model and `SECURITY.md#verifying-a-release` for verification instructions. The public key is published at `docs/keys/protondrive4linux-release.asc`.
+- `docs/screenshots/` (Activity, Folders, Settings), embedded in the README for visitors.
+
+### Fixed
+- `ProtonCli` called the `proton-drive` CLI with no timeout, so a wedged process (network stall, unexpected interactive prompt, a crash that hangs instead of exiting) blocked the calling thread forever. In the field this showed up as a sync that created the remote folder structure but uploaded nothing, with the app eventually reported "Application not responding". Calls now fail after a configurable `cli_timeout_secs` (default 1800s) instead of hanging indefinitely.
+- GUI: settings rows and the sidebar's "Auto sync" row measured their description text's wrap width before the switch/control on the right claimed its space, so on a narrow window the text wrapped as if it owned the whole row and then overlapped the control instead of breaking early - readable as cut-off, garbled text. Also very likely what made the "Add folder" button (which was never actually missing) hard to find on a small screen.
+- GUI: the app icon looked distorted at small sizes (the 26px nav-rail icon). The non-square source image (1303x1207) was stretched into whatever square rect it was drawn into, and uploaded to the GPU at full resolution with only plain bilinear (no mipmap) minification - a ~50:1 minification with no mipmaps turned fine detail into a color smear. Aspect ratio is now preserved, and the source is pre-downsampled (a small dependency-free box filter, correct in premultiplied-alpha space) before upload.
+
+### Changed
+- README: corrected a stale "Signed releases. Commits and tags are GPG-signed" claim - tag signing isn't configured and release-artifact signing was still being rolled out when that line was written. Now describes the actual current state.
+
 ## [0.4.1] - 2026-09-08
 
 ### Added
