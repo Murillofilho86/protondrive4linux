@@ -84,3 +84,12 @@ jobs:
           # here over time - add the new ID rather than silence the package
           # wholesale, and re-check when wayland-scanner bumps its
           # requirement.
+
+      # cargo-audit (above) checks known vulnerabilities; cargo-deny (M2-004)
+      # additionally checks license compliance and "unmaintained" advisories
+      # (audit-check doesn't fail on those) and unexpected dependency
+      # sources. Config, including its own advisory ignores, is in deny.toml.
+      - name: cargo-deny (licenses, unmaintained deps, dependency sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
