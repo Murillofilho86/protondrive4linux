@@ -1,0 +1,56 @@
+# cargo-deny config (M2-004). Run locally with `cargo deny check`.
+# Full reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# So `cargo deny check` sees the same dependency set CI actually builds
+# (the `gui` feature) without needing `--all-features` passed every time.
+all-features = true
+
+[advisories]
+# RUSTSEC advisories. `cargo audit` (ci.yml's `audit` job) already checks
+# vulnerabilities; this additionally catches "unmaintained" notices, which
+# cargo-audit doesn't fail on by default - see the RUSTSEC-2026-0192 entry
+# below for why one is already ignored here.
+ignore = [
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 is marked unmaintained, no safe upgrade published. Pulled in transitively via ab_glyph -> sctk-adwaita -> winit (gui feature only, Wayland-compositor decoration rendering) - not a dependency this project chose directly, and not reachable from any protondrive4linux code. Re-check periodically; remove this ignore once winit's dependency tree moves off it or a fix ships." },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is marked unmaintained, no safe upgrade published. Pulled in transitively via glib-macros -> glib 0.18 -> gtk 0.18 (tray-icon's libappindicator backend requires gtk ^0.18; see the same root cause documented for RUSTSEC-2024-0429 in ci.yml's audit job). Build-time proc-macro dependency only, not present in the shipped binary. Re-check when tray-icon/libappindicator moves off gtk 0.18." },
+    # Same two quick-xml advisories already ignored in ci.yml's `cargo audit`
+    # job, with the same reasoning: wayland-scanner (build-time-only XML
+    # codegen from bundled, trusted protocol XML, gui feature) pins
+    # quick-xml = "^0.39", outside the >=0.41.0 fix range.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic-time attribute dedup, via wayland-scanner (build-time only, fixed trusted input). See ci.yml's audit job for the full explanation." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation, via wayland-scanner (build-time only, fixed trusted input). See ci.yml's audit job for the full explanation." },
+]
+
+[licenses]
+# Every license actually present in the dependency tree (checked with
+# `--all-features`, matching ci.yml). SPDX "OR" expressions (e.g. "MIT OR
+# Apache-2.0") are satisfied as long as one side is listed here, so a
+# copyleft alternative on a dual-licensed crate (self_cell's
+# "Apache-2.0 OR GPL-2.0-only") doesn't need to be listed - Apache-2.0
+# already satisfies it, and picking it is why it's not here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",       # option-ext (via dirs -> tray-icon, gui feature): weak/file-level copyleft, standard in the Rust ecosystem
+    "OFL-1.1",       # epaint_default_fonts: bundled font license, not code
+    "Ubuntu-font-1.0", # epaint_default_fonts: same, the Ubuntu font specifically
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[sources]
+# Every dependency comes from crates.io today; deny (not just warn on)
+# anything from an unlisted registry or git source so a compromised/typo
+# dependency pointing elsewhere is caught immediately, not just noted.
+unknown-registry = "deny"
+unknown-git = "deny"

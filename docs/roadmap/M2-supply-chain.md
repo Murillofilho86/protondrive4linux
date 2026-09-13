@@ -73,16 +73,22 @@ relativas). `command_with()` agora resolve pela `which()` hardenizada antes de m
 
 ## M2-004 — Automated dependency audit
 **Labels**: `type:security`, `area:security`
-**Status: 🔶 Quase concluído.** CI já roda `cargo clippy -- -D warnings`, `cargo fmt --check` e
-`cargo audit` (via `rustsec/audit-check`) em todo push/PR (`.github/workflows/ci.yml`).
+**Status: ✅ Fechado.** CI roda `cargo clippy -- -D warnings`, `cargo fmt --check`, `cargo audit`
+(via `rustsec/audit-check`) e agora `cargo deny check` (via `EmbarkStudios/cargo-deny-action`)
+em todo push/PR (`.github/workflows/ci.yml`). Config e as exceções documentadas (com motivo) em
+`deny.toml` na raiz.
 
 ### Critérios de aceite
 - [x] Executado em todo PR.
 - [x] Vulnerabilidade crítica bloqueia merge.
-- [ ] Licenças verificadas — falta `cargo deny check licenses` automatizado em CI (hoje só as
-      advisories de segurança são checadas; licença/manutenção foi feita manualmente na
-      auditoria original, não está em CI).
-- [ ] Dependências não mantidas identificadas automaticamente.
+- [x] Licenças verificadas — `cargo deny check licenses` com allow-list explícita de todas as
+      licenças presentes na árvore de dependências (`--all-features`, a mesma que a CI builda).
+      Achado real ao configurar: `cargo deny` já detecta e falha por padrão em advisories
+      "unmaintained" (`ttf-parser`, `proc-macro-error`), algo que o `cargo audit` atual não fazia
+      — ambos ignorados em `deny.toml` com a mesma causa raiz já documentada em `ci.yml`
+      (`ttf-parser` via winit/gui, `proc-macro-error` via gtk 0.18/tray-icon).
+- [x] Dependências não mantidas identificadas automaticamente — resolvido pelo mesmo
+      `cargo deny check advisories` acima (não precisou de ferramenta separada).
 
 ## M2-005 — Reproducible release metadata
 **Labels**: `type:security`, `area:distribution`
@@ -100,6 +106,6 @@ versão do `Cargo.toml` contra a tag.
 ## M2 — Definition of Done
 - [x] Release assinada (bloqueia reativação do updater — M2-002 ainda depende disso ficar
       testado em produção antes de reativar).
-- [ ] `cargo deny check licenses` em CI.
+- [x] `cargo deny check licenses` em CI.
 - [x] CLI resolution hardening documentado e implementado.
 - [ ] Commit SHA no `--version`.
