@@ -4,21 +4,22 @@
 
 ## M2-001 — Release signing
 **Labels**: `type:security`, `area:security`, `priority:critical`
-**Status: 🔶 Infra pronta, esperando a chave.** Modelo escolhido: GPG com chave mestra
-(offline, capacidade `Certify` só) + subchave de assinatura (a que roda em CI) — ver
+**Status: 🔶 Chave e secrets prontos, `RELEASE_SIGNING_READY=true`, falta confirmar a primeira
+release assinada com sucesso.** Modelo escolhido: GPG com chave mestra (offline, capacidade
+`Certify` só) + subchave de assinatura (a que roda em CI) — ver
 `docs/contributing/RELEASE_SIGNING.md` pro racional e o passo a passo. O workflow
 (`.github/workflows/release.yml`) já importa a subchave, assina cada artefato (`.deb`, `.rpm`,
-tarballs) e **falha a build** se a assinatura não sair — mas isso só liga quando a variável de
-repositório `RELEASE_SIGNING_READY` for setada, porque a chave em si ainda não foi gerada. Até
-lá, nenhum release sai assinado (mesma situação de antes: só o checksum SHA-256 do GitHub).
+tarballs) e **falha a build** se a assinatura não sair. A chave original (gerada em 2026-09-09)
+teve a senha perdida no processo de configuração e foi descartada sem nunca ter assinado um
+release real; foi gerada uma nova em 2026-09-13.
 
 ### Critérios de aceite
 - [x] Chave de assinatura documentada (`docs/contributing/RELEASE_SIGNING.md`).
 - [x] Chave pública incorporada/verificável (`docs/keys/protondrive4linux-release.asc`, chave
-      mestra `58D0231CA8A38EC4263500937F87E84394A6E101`, subchave de assinatura
-      `72ACDDB4ED23A2F7CE7B768F7D57E42A1FDAB300`).
-- [ ] Release assinada (secrets/var já configurados no repo; falta ligar
-      `RELEASE_SIGNING_READY` e cortar a primeira tag depois disso).
+      mestra `67A9CE00271C5DE87557AC76BBA104838E512C30`, subchave de assinatura
+      `D2D1405C5D85E6268EED6CE2FA5BDA1DD50C980D`).
+- [ ] Release assinada (secrets/var já configurados no repo; falta confirmar que o rerun do
+      workflow da tag `v0.4.2` publica os `.asc` com sucesso).
 - [x] Instruções de verificação (`SECURITY.md#verifying-a-release`).
 - [x] CI falha se assinatura não for gerada (uma vez `RELEASE_SIGNING_READY=true`, secret/var
       ausente ou `.asc` faltando derruba o job — não é best-effort).
