@@ -48,8 +48,8 @@ subkey dedicated to this project — separate from any personal key, so it can b
 revoked without affecting anything else. See `docs/contributing/RELEASE_SIGNING.md` for the full
 key-management model.
 
-Master key fingerprint: `58D0231CA8A38EC4263500937F87E84394A6E101`
-Signing subkey fingerprint: `72ACDDB4ED23A2F7CE7B768F7D57E42A1FDAB300` (expires 2027-09-10 —
+Master key fingerprint: `67A9CE00271C5DE87557AC76BBA104838E512C30`
+Signing subkey fingerprint: `D2D1405C5D85E6268EED6CE2FA5BDA1DD50C980D` (expires 2027-09-13 —
 renewed periodically per the runbook; verify against the current `docs/keys/*.asc` if this looks
 stale)
 
