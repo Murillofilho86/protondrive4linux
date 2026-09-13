@@ -177,6 +177,9 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
         println!("config          {}", p.display());
     }
     println!("proton-drive    {resolved} (configured: {})", cfg.binary);
+    if let Some(w) = proton.binary_location_warning() {
+        println!("  ⚠ {w}");
+    }
     println!("remote root     {}", cfg.remote_root);
     println!(
         "propagate del.  {} (local -> {:?})",
@@ -208,6 +211,9 @@ fn cmd_doctor(cli: &Cli, path: Option<&str>) -> anyhow::Result<ExitCode> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "NOT FOUND".into())
     );
+    if let Some(w) = proton.binary_location_warning() {
+        println!("  ⚠ {w}");
+    }
     println!("version: {}", proton.version());
     let target = path.unwrap_or(&cfg.remote_root);
     println!("\nProbing `filesystem list -j {target}` ...");

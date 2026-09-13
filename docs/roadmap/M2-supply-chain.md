@@ -46,15 +46,30 @@ correta. **Não reativar antes de M2-001 fechar.**
 
 ## M2-003 — Proton CLI resolution hardening
 **Labels**: `type:security`, `area:security`, `risk:security`
-**Status: ⬜ Não iniciado — gap real.** `proton-drive` é resolvido por PATH hoje
-(`src/protoncli.rs`, `which`), com path configurável.
+**Status: ✅ Fechado.** `proton-drive` é resolvido por PATH (`src/protoncli.rs`, `which`), com
+path configurável. Achado real ao implementar: a resolução "segura" (`which()`) só era usada
+para diagnóstico (`status`/`doctor`) — a execução de verdade passava o nome puro pro
+`Command::new()`, que delega a busca no PATH pro SO (mais permissivo, aceita entradas
+relativas). `command_with()` agora resolve pela `which()` hardenizada antes de montar o
+`Command`, então o que é exibido é exatamente o que é executado.
 
 ### Critérios de aceite
-- [ ] Definir estratégia segura de resolução.
-- [ ] Detectar executável inesperado.
-- [ ] Mostrar caminho efetivamente utilizado (expandir `doctor` — ver M6-003).
-- [ ] Evitar execução acidental de binário malicioso encontrado no diretório atual.
-- [ ] Documentar comportamento.
+- [x] Definir estratégia segura de resolução: busca em PATH, mas ignora qualquer entrada
+      relativa (inclusive `.`/entrada vazia, que o POSIX trata como diretório atual) — o
+      truque clássico de PATH injection. Um `binary` configurado explicitamente com `/` é
+      honrado como está (é escolha do usuário, não algo que um atacante controla via ambiente).
+- [x] Detectar executável inesperado: `binary_location_warning()` avisa se o diretório do
+      binário resolvido for gravável por outros usuários — sinal concreto e de baixo
+      falso-positivo, ao invés de uma lista de "caminhos esperados" (o CLI é distribuído por
+      três pacotes AUR diferentes, `.deb`, `.rpm`, e instalação manual, então uma lista
+      branca erraria instalações legítimas).
+- [x] Mostrar caminho efetivamente utilizado: `status`/`doctor` já mostravam o path resolvido;
+      agora mostram o aviso de localização junto quando aplicável. Superfície na GUI (painel de
+      conta) fica como melhoria futura, não bloqueia o fechamento — o caminho já é visível ali.
+- [x] Evitar execução acidental de binário malicioso no diretório atual: fechado pelo hardening
+      da `which()` acima, combinado com `command_with()` agora realmente usar essa resolução.
+- [x] Documentar comportamento: comentários em `which()`/`command_with()`/
+      `binary_location_warning()` no código; este arquivo.
 
 ## M2-004 — Automated dependency audit
 **Labels**: `type:security`, `area:security`
@@ -86,5 +101,5 @@ versão do `Cargo.toml` contra a tag.
 - [x] Release assinada (bloqueia reativação do updater — M2-002 ainda depende disso ficar
       testado em produção antes de reativar).
 - [ ] `cargo deny check licenses` em CI.
-- [ ] CLI resolution hardening documentado e implementado.
+- [x] CLI resolution hardening documentado e implementado.
 - [ ] Commit SHA no `--version`.
