@@ -108,25 +108,42 @@ jobs:
       # broken promise to anyone relying on M2-001, not a reason to skip.
       - name: Require signing secrets once release signing is enabled
         if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          GPG_SIGNING_KEY_FINGERPRINT: ${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}
         run: |
-          [ -n "${{ secrets.GPG_SIGNING_KEY }}" ] ||
+          [ -n "$GPG_SIGNING_KEY" ] ||
             { echo "::error::RELEASE_SIGNING_READY is true but GPG_SIGNING_KEY secret is missing"; exit 1; }
-          [ -n "${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}" ] ||
+          [ -n "$GPG_SIGNING_KEY_FINGERPRINT" ] ||
             { echo "::error::RELEASE_SIGNING_READY is true but GPG_SIGNING_KEY_FINGERPRINT var is missing"; exit 1; }
 
+      # Secrets are passed via `env:` and referenced as "$VAR", never
+      # interpolated straight into the script with ${{ }} - GitHub Actions
+      # substitutes ${{ }} as raw text before bash ever sees the script, so a
+      # secret containing $, `, or \ would be re-parsed as shell syntax
+      # instead of used literally (this bit us once already: a passphrase
+      # with a `$` in it silently became a different string mid-substitution,
+      # producing "Bad passphrase" only in CI, never locally). `env:` sets a
+      # real process environment variable instead, and "$VAR" expands to its
+      # value in one step with no re-parsing.
       - name: Import release-signing GPG subkey
         if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
-        run: gpg --batch --import <<< "${{ secrets.GPG_SIGNING_KEY }}"
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        run: gpg --batch --import <<< "$GPG_SIGNING_KEY"
 
       - name: Sign release artifacts
         if: ${{ vars.RELEASE_SIGNING_READY == 'true' }}
+        env:
+          GPG_SIGNING_KEY_PASSPHRASE: ${{ secrets.GPG_SIGNING_KEY_PASSPHRASE }}
+          GPG_SIGNING_KEY_FINGERPRINT: ${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}
         run: |
           shopt -s nullglob
           targets=(dist/*.deb dist/*.rpm dist/*-x86_64-linux.tar.gz dist/*-src.tar.gz)
           for f in "${targets[@]}"; do
             gpg --batch --yes --pinentry-mode loopback \
-              --passphrase "${{ secrets.GPG_SIGNING_KEY_PASSPHRASE }}" \
-              --local-user "${{ vars.GPG_SIGNING_KEY_FINGERPRINT }}" \
+              --passphrase "$GPG_SIGNING_KEY_PASSPHRASE" \
+              --local-user "$GPG_SIGNING_KEY_FINGERPRINT" \
               --detach-sign --armor "$f"
           done
           missing=0
