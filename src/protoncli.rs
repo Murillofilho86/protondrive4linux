@@ -250,8 +250,15 @@ impl ProtonCli {
         }
     }
 
-    fn command_with(&self, args: &[&str], cache: Option<&Path>) -> Command {
-        let mut c = Command::new(&self.binary);
+    /// Resolves `self.binary` through the hardened `which()` before building
+    /// the `Command`, rather than handing the bare name to `Command::new()`
+    /// and letting the OS's own (more permissive, relative-PATH-honouring)
+    /// exec search decide - see `which()`'s doc comment. `resolve_binary()`
+    /// exists for *display* (status/doctor); this is what actually runs.
+    fn command_with(&self, args: &[&str], cache: Option<&Path>) -> Result<Command> {
+        let resolved =
+            which(&self.binary).ok_or_else(|| anyhow!("{:?} not found on PATH", self.binary))?;
+        let mut c = Command::new(resolved);
         c.args(args);
         if let Some(cs) = &self.credentials_store {
             c.env("PROTON_DRIVE_CREDENTIALS_STORE", cs);
@@ -259,7 +266,7 @@ impl ProtonCli {
         if let Some(cd) = cache.or(self.cache_dir.as_deref()) {
             c.env("PROTON_DRIVE_CACHE_DIR", cd);
         }
-        c
+        Ok(c)
     }
 
     /// Run and capture. Returns (success, stdout, stderr).
@@ -268,7 +275,7 @@ impl ProtonCli {
     }
 
     fn run_with(&self, args: &[&str], cache: Option<&Path>) -> Result<(bool, String, String)> {
-        let mut cmd = self.command_with(args, cache);
+        let mut cmd = self.command_with(args, cache)?;
         let out = output_with_timeout(&mut cmd, self.cli_timeout)
             .with_context(|| format!("failed to run {:?}", self.binary))?;
         Ok((
@@ -372,6 +379,32 @@ impl ProtonCli {
         which(&self.binary)
     }
 
+    /// A warning to surface (status/doctor/GUI) if the resolved binary's
+    /// directory is group- or world-writable. (M2-003: "detect an unexpected
+    /// executable"). Deliberately not a whitelist of "expected" install
+    /// paths - the CLI legitimately ships via three different AUR packages,
+    /// .deb, .rpm, and manual downloads to wherever the user likes, so a
+    /// whitelist would either miss real installs or be too loose to mean
+    /// anything. A writable-by-others directory is a real, low-noise signal
+    /// instead: no package manager ever installs there, so seeing one means
+    /// something about this machine's setup deserves a second look.
+    pub fn binary_location_warning(&self) -> Option<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = which(&self.binary)?;
+        let dir = path.parent()?;
+        let mode = std::fs::metadata(dir).ok()?.permissions().mode();
+        if mode & 0o022 != 0 {
+            Some(format!(
+                "{} is in a group/world-writable directory ({}) - double-check this \
+                 is really the proton-drive CLI you expect",
+                path.display(),
+                dir.display()
+            ))
+        } else {
+            None
+        }
+    }
+
     pub fn version(&self) -> String {
         match self.run(&["version"]) {
             Ok((_, out, err)) => {
@@ -384,7 +417,7 @@ impl ProtonCli {
 
     /// Browser login. Inherits stdio so the user can interact.
     pub fn login(&self) -> Result<()> {
-        let status = self.command_with(&["auth", "login"], None).status()?;
+        let status = self.command_with(&["auth", "login"], None)?.status()?;
         if !status.success() {
             bail!("auth login failed");
         }
@@ -952,7 +985,23 @@ fn make_cache_dir() -> Option<PathBuf> {
         .map(|_| dir)
 }
 
-/// Minimal `which`: honour an explicit path, else search $PATH.
+/// Minimal `which`: honour an explicit path, else search $PATH. (M2-003)
+///
+/// PATH entries that are relative - including the classic empty-entry and
+/// bare "." spellings POSIX treats as "the current directory" - are skipped
+/// entirely. Without that, running protondrive4linux from a directory that
+/// happens to contain a file named `proton-drive` (or whatever `binary` is
+/// configured to) could execute that file instead of the real CLI, if the
+/// user's PATH has a relative entry ahead of wherever the real one lives.
+/// Every legitimate install (`/usr/bin`, `/usr/local/bin`, `~/.cargo/bin`,
+/// ...) is an absolute PATH entry, so this costs nothing legitimate.
+///
+/// An explicit path (`binary` containing `/`, e.g. a config pointing at a
+/// specific install) is a deliberate user choice, not something derived from
+/// the environment an attacker could manipulate, so it's honoured as-is
+/// (including if it's relative to the current directory) - narrowing that
+/// too would only break legitimate configs for no attacker this actually
+/// stops.
 fn which(binary: &str) -> Option<PathBuf> {
     if binary.contains('/') {
         let p = PathBuf::from(binary);
@@ -960,6 +1009,9 @@ fn which(binary: &str) -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
+        if !dir.is_absolute() {
+            continue;
+        }
         let cand = dir.join(binary);
         if is_executable(&cand) {
             return Some(cand);
@@ -977,7 +1029,189 @@ fn is_executable(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{glob_quote_local, is_not_logged_in, is_safe_component, ProtonCli};
+    use super::{glob_quote_local, is_not_logged_in, is_safe_component, which, ProtonCli};
+
+    // These two mutate the process-wide PATH env var. Safe only because no
+    // other test in this crate's unit-test binary reads or sets PATH -
+    // `set_var`/`remove_var` on a shared env would otherwise race.
+    #[test]
+    fn which_skips_relative_path_entries_to_avoid_cwd_shadowing() {
+        let tag = format!(
+            "protondrive4linux-which-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let rel_dir = std::path::PathBuf::from("target").join(&tag);
+        std::fs::create_dir_all(&rel_dir).unwrap();
+        let bin_name = "protondrive4linux-which-test-bin";
+        let bin_path = rel_dir.join(bin_name);
+        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // SAFETY: see module-level comment above - this is the only test
+        // touching PATH, and it's restored before returning.
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", rel_dir.as_os_str());
+        }
+        let found = which(bin_name);
+        unsafe {
+            match &old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&rel_dir).ok();
+
+        assert!(
+            found.is_none(),
+            "a relative PATH entry must never be honoured - a real, same-named \
+             executable sat right there, and it still must not resolve, or \
+             running from an attacker-writable directory could execute it \
+             instead of the real CLI"
+        );
+    }
+
+    #[test]
+    fn which_finds_a_binary_via_an_absolute_path_entry() {
+        let tag = format!(
+            "protondrive4linux-which-test-abs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_name = "protondrive4linux-which-test-bin";
+        let bin_path = dir.join(bin_name);
+        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // SAFETY: see module-level comment above.
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", dir.as_os_str());
+        }
+        let found = which(bin_name);
+        unsafe {
+            match &old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            found,
+            Some(bin_path),
+            "an absolute PATH entry must still resolve normally"
+        );
+    }
+
+    fn cli_with_binary(binary: &str) -> ProtonCli {
+        use crate::config::{ConflictPolicy, LocalDelete, UpdateChannel};
+        use crate::models::Compare;
+        ProtonCli::new(&crate::config::Config {
+            binary: binary.into(),
+            upload_flags: vec![],
+            download_flags: vec![],
+            credentials_store: None,
+            fresh_cache: false,
+            scan_threads: 0,
+            download_threads: 0,
+            cli_timeout_secs: 30,
+            remote_root: "/my-files".into(),
+            propagate_deletes: false,
+            auto_sync: false,
+            run_in_tray: false,
+            x11_compat: false,
+            local_delete: LocalDelete::Trash,
+            conflict: ConflictPolicy::KeepBoth,
+            compare: Compare::SizeMtime,
+            poll_interval_secs: 900,
+            scan_interval_secs: 120,
+            debounce_secs: 2,
+            update_channel: UpdateChannel::Stable,
+            check_on_launch: false,
+            state_dir: std::env::temp_dir(),
+            pairs: vec![],
+            source_path: None,
+        })
+    }
+
+    #[test]
+    fn warns_when_resolved_binary_sits_in_a_world_writable_directory() {
+        let tag = format!(
+            "protondrive4linux-locwarn-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("proton-drive");
+        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // World-writable directory - the actual signal under test.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+
+        let cli = cli_with_binary(bin_path.to_str().unwrap());
+        let warning = cli.binary_location_warning();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            warning.is_some(),
+            "a world-writable directory around the resolved binary must produce a warning"
+        );
+    }
+
+    #[test]
+    fn no_warning_for_a_normal_directory() {
+        let tag = format!(
+            "protondrive4linux-locwarn-test-safe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin_path = dir.join("proton-drive");
+        std::fs::write(&bin_path, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let cli = cli_with_binary(bin_path.to_str().unwrap());
+        let warning = cli.binary_location_warning();
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            warning.is_none(),
+            "an ordinary, non-writable-by-others directory must not warn"
+        );
+    }
 
     #[test]
     fn glob_quotes_local_metacharacters() {
