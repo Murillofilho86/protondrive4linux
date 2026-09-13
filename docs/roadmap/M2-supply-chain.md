@@ -4,22 +4,26 @@
 
 ## M2-001 — Release signing
 **Labels**: `type:security`, `area:security`, `priority:critical`
-**Status: 🔶 Chave e secrets prontos, `RELEASE_SIGNING_READY=true`, falta confirmar a primeira
-release assinada com sucesso.** Modelo escolhido: GPG com chave mestra (offline, capacidade
-`Certify` só) + subchave de assinatura (a que roda em CI) — ver
-`docs/contributing/RELEASE_SIGNING.md` pro racional e o passo a passo. O workflow
-(`.github/workflows/release.yml`) já importa a subchave, assina cada artefato (`.deb`, `.rpm`,
-tarballs) e **falha a build** se a assinatura não sair. A chave original (gerada em 2026-09-09)
-teve a senha perdida no processo de configuração e foi descartada sem nunca ter assinado um
-release real; foi gerada uma nova em 2026-09-13.
+**Status: ✅ Fechado.** Modelo: GPG com chave mestra (offline, capacidade `Certify` só) +
+subchave de assinatura (a que roda em CI) — ver `docs/contributing/RELEASE_SIGNING.md` pro
+racional e o passo a passo. O workflow (`.github/workflows/release.yml`) importa a subchave,
+assina cada artefato (`.deb`, `.rpm`, tarballs) e **falha a build** se a assinatura não sair.
+Verificado de ponta a ponta na release `v0.4.2`: `gpg --verify` confirma `Good signature` nos
+4 artefatos publicados.
+
+Duas voltas até chegar lá, ambas corrigidas e documentadas para não se repetir:
+- A chave original (gerada em 2026-09-09) teve a senha perdida no processo de configuração e foi
+  descartada sem nunca ter assinado um release real; foi gerada uma nova em 2026-09-13.
+- O workflow interpolava `${{ secrets.GPG_SIGNING_KEY_PASSPHRASE }}` direto numa string de shell
+  — uma senha com `$` era reinterpretada pelo bash antes do gpg recebê-la, causando "Bad
+  passphrase" só em CI (nunca localmente). Corrigido passando secrets via `env:` + `"$VAR"`.
 
 ### Critérios de aceite
 - [x] Chave de assinatura documentada (`docs/contributing/RELEASE_SIGNING.md`).
 - [x] Chave pública incorporada/verificável (`docs/keys/protondrive4linux-release.asc`, chave
       mestra `67A9CE00271C5DE87557AC76BBA104838E512C30`, subchave de assinatura
       `D2D1405C5D85E6268EED6CE2FA5BDA1DD50C980D`).
-- [ ] Release assinada (secrets/var já configurados no repo; falta confirmar que o rerun do
-      workflow da tag `v0.4.2` publica os `.asc` com sucesso).
+- [x] Release assinada (`v0.4.2`, verificado com `gpg --verify` contra os 4 artefatos publicados).
 - [x] Instruções de verificação (`SECURITY.md#verifying-a-release`).
 - [x] CI falha se assinatura não for gerada (uma vez `RELEASE_SIGNING_READY=true`, secret/var
       ausente ou `.asc` faltando derruba o job — não é best-effort).
@@ -79,7 +83,8 @@ versão do `Cargo.toml` contra a tag.
 - [ ] Artefatos rastreáveis ao commit de forma independente do changelog.
 
 ## M2 — Definition of Done
-- [ ] Release assinada (bloqueia reativação do updater).
+- [x] Release assinada (bloqueia reativação do updater — M2-002 ainda depende disso ficar
+      testado em produção antes de reativar).
 - [ ] `cargo deny check licenses` em CI.
 - [ ] CLI resolution hardening documentado e implementado.
 - [ ] Commit SHA no `--version`.
