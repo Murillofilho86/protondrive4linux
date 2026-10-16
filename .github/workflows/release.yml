@@ -14,7 +14,13 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # The actual shipped binaries are NOT built directly on this runner (see
+    # the "Build release binaries" step below) - this host only runs `cargo
+    # test`, and packages the .deb at the end, both of which need a real
+    # Ubuntu userspace (apt, dpkg-shlibdeps). It's pinned to 22.04 rather
+    # than `ubuntu-latest` so the native toolchain/libs here track a known
+    # quantity rather than silently drifting with GitHub's runner updates.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -62,19 +68,66 @@ jobs:
         run: cargo test --all-features
 
       - name: Install packagers
-        run: cargo install cargo-deb cargo-generate-rpm
+        run: cargo install cargo-deb
 
-      - name: Build release binaries (CLI + GUI)
-        run: cargo build --release --features gui --bins
+      # The actual shipped binaries are built inside a RockyLinux 9 container
+      # instead of directly on this (Ubuntu 22.04) runner (M3-003/M3-004).
+      # Real finding from testing this by hand: the glibc a binary links
+      # against is a hard floor on which systems can even run it, and it
+      # tracks the *build* machine's glibc, not anything in Cargo.toml.
+      # ubuntu-latest (building there until this change) is 24.04 (glibc
+      # 2.39, soon migrating to 26.04 and an even higher floor) - verified
+      # (Docker) to fail to install on Ubuntu 22.04 LTS (glibc 2.35), Debian
+      # 12 (2.36), and the entire RHEL 9 family (2.34), the last of which
+      # M3-004 explicitly requires supporting. Building on plain
+      # `ubuntu-22.04` only gets the floor down to 2.35 - one minor version
+      # above RHEL 9's own 2.34, so still not enough. RockyLinux 9 (glibc
+      # 2.34, the lowest of all our targets) is the lowest common
+      # denominator: a binary built against it runs anywhere with glibc
+      # >= 2.34, which covers everything above plus Debian 13 and current
+      # Fedora.
+      #
+      # `rpm-build` (providing /usr/lib/rpm/find-requires) must be installed
+      # *before* `cargo generate-rpm` runs: without it, cargo-generate-rpm's
+      # dependency scanner falls back to a builtin ldd-based procedure that
+      # (verified by hand) emits bogus requires like
+      # "libc.so.6(GLIBC_2.18)[WEAK](64bit)" - a literal "[WEAK]" suffix no
+      # real package ever provides, which makes the .rpm permanently
+      # uninstallable anywhere. With rpm-build present, it uses the same
+      # native find-requires a real `rpmbuild` would, and the result is
+      # clean.
+      - name: Build release binaries + package .rpm in a RockyLinux 9 container
+        run: |
+          docker run --rm -v "$PWD":/repo rockylinux:9 bash -c '
+            set -euxo pipefail
+            dnf install -y -q epel-release
+            dnf install -y -q rpm-build gcc gcc-c++ make pkgconf-pkg-config binutils git \
+              gtk3-devel libxkbcommon-devel wayland-devel \
+              libX11-devel libxcb-devel mesa-libGL-devel \
+              libxdo-devel libayatana-appindicator-gtk3-devel \
+              openssl-devel sqlite-devel
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            source "$HOME/.cargo/env"
+            git config --global --add safe.directory /repo
+            cd /repo
+            cargo build --release --features gui --bins
+            strip target/release/protondrive4linux target/release/protondrive4linux-gui || true
+            cargo install cargo-generate-rpm --quiet
+            cargo generate-rpm
+          '
+          sudo chown -R "$(id -u):$(id -g)" target
 
-      - name: Strip binaries
-        run: strip target/release/protondrive4linux target/release/protondrive4linux-gui || true
-
+      # cargo-deb still runs natively here (not in the RockyLinux 9
+      # container above): its $auto dependency detection needs
+      # dpkg-shlibdeps, which only exists on Debian/Ubuntu - verified by
+      # hand that running it against the RockyLinux-9-built binary above
+      # still correctly resolves "libc6 (>= 2.34)" (dpkg-shlibdeps reads the
+      # binary's own versioned glibc symbols, it doesn't just assume this
+      # host's libc6 version) plus the right libgtk-3-0/libxdo3/etc minimum
+      # versions, as long as the matching -dev packages (installed above,
+      # for `cargo test --all-features`) are present so it can find them.
       - name: Package .deb
         run: cargo deb --no-build --features gui
-
-      - name: Package .rpm
-        run: cargo generate-rpm
 
       - name: Source tarball
         run: |
