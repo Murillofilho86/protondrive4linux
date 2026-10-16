@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::models::Compare;
+use crate::ratelimit::RateLimiter;
 
 pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
 
@@ -60,6 +61,19 @@ pub struct Config {
     /// Concurrent file downloads during a sync (0 = auto). Bandwidth-bound, so
     /// the auto default is modest.
     pub download_threads: usize,
+    /// Upload throughput cap in KB/s, shared across every pair and worker
+    /// (M4-005); 0 = unlimited. The CLI gives no byte-level progress, so this
+    /// paces whole transfers against a scheduled departure time rather than
+    /// throttling mid-transfer - see [`crate::ratelimit`].
+    pub upload_limit_kbps: u64,
+    /// Download throughput cap in KB/s (see `upload_limit_kbps`).
+    pub download_limit_kbps: u64,
+    /// Runtime pacing clock for uploads, shared across every `Engine`/worker
+    /// that borrows this `Config` for one sync run. Not TOML data - a clone
+    /// starts its own fresh schedule (see [`RateLimiter`]'s `Clone` impl).
+    pub upload_limiter: RateLimiter,
+    /// Runtime pacing clock for downloads (see `upload_limiter`).
+    pub download_limiter: RateLimiter,
     /// Kill and fail a single `proton-drive` invocation (list, upload,
     /// download, ...) if it hasn't finished after this many seconds, instead
     /// of blocking forever. A hung/crashed CLI process previously froze the
@@ -163,6 +177,8 @@ struct RawCli {
     retry_base_delay_secs: Option<u64>,
     retry_max_delay_secs: Option<u64>,
     retry_max_attempts: Option<u32>,
+    upload_limit_kbps: Option<u64>,
+    download_limit_kbps: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -413,6 +429,10 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         retry_base_delay_secs: cli.retry_base_delay_secs.unwrap_or(30),
         retry_max_delay_secs: cli.retry_max_delay_secs.unwrap_or(1800),
         retry_max_attempts: cli.retry_max_attempts.unwrap_or(6),
+        upload_limit_kbps: cli.upload_limit_kbps.unwrap_or(0),
+        download_limit_kbps: cli.download_limit_kbps.unwrap_or(0),
+        upload_limiter: RateLimiter::new(),
+        download_limiter: RateLimiter::new(),
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
         auto_sync: opts.auto_sync.unwrap_or(false),
@@ -548,6 +568,8 @@ struct OutCli {
     retry_base_delay_secs: u64,
     retry_max_delay_secs: u64,
     retry_max_attempts: u32,
+    upload_limit_kbps: u64,
+    download_limit_kbps: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials_store: Option<String>,
 }
@@ -631,6 +653,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             retry_base_delay_secs: cfg.retry_base_delay_secs,
             retry_max_delay_secs: cfg.retry_max_delay_secs,
             retry_max_attempts: cfg.retry_max_attempts,
+            upload_limit_kbps: cfg.upload_limit_kbps,
+            download_limit_kbps: cfg.download_limit_kbps,
             credentials_store: cfg.credentials_store.clone(),
         },
         options: OutOptions {

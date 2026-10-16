@@ -50,7 +50,22 @@ não "tentou e falhou de novo") e que o backoff é limpo assim que a transferên
 
 ## M4-005 — Bandwidth limits
 **Labels**: `type:feature`, `area:performance`
-**Status: ⬜ Não iniciado.**
+**Status: ✅ Fechado.** `upload_limit_kbps`/`download_limit_kbps` (KB/s, 0 = ilimitado,
+compartilhado entre todos os pairs e workers) expostos na GUI (Settings → BANDWIDTH) e no TOML.
 
-### Escopo
-GUI: `Upload limit`, `Download limit`.
+O `proton-drive` CLI não expõe progresso byte a byte (é um subprocesso one-shot), então não há
+como estrangular uma transferência no meio — em vez disso, cada transferência inteira é agendada
+num "horário de partida" virtual calculado a partir do seu tamanho (`src/ratelimit.rs`,
+`RateLimiter`): a transferência espera a sua vez e então roda em velocidade total. Um arquivo
+grande com um limite baixo atrasa visivelmente o que está na fila atrás dele, em vez de ele
+mesmo ser desacelerado — uma simplificação aceita dado que o CLI não oferece outra alavanca.
+
+Compartilhado corretamente entre chamadores concorrentes: cada chamador recebe seu próprio slot
+não sobreposto numa linha do tempo virtual, então a vazão combinada de todos juntos (múltiplos
+workers de scan, pool de downloads) fica no limite configurado — não `threads x limite`. Sem
+nova dependência de crate (`rand` não foi necessário, nem para M4-004 nem aqui).
+
+### Critérios de aceite
+- [x] GUI: `Upload limit`, `Download limit` (Settings → BANDWIDTH, 0 = ilimitado).
+- [x] Compartilhado entre pairs/workers concorrentes (testado: `ratelimit::tests`,
+      `tests/engine.rs::upload_limit_paces_the_transfer`/`download_limit_paces_the_transfer`).

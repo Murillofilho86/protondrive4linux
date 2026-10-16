@@ -15,6 +15,13 @@ upload_flags = ["--file-conflict-strategy", "replace", "--folder-conflict-strate
 # Concurrent file downloads during a sync (0 = auto, ~4). Downloads are
 # bandwidth-bound, so more isn't always faster and can hit rate limits.
 # download_threads = 4
+# Bandwidth caps in KB/s, shared across every pair and worker combined
+# (M4-005); 0 = unlimited. The CLI gives no byte-level progress, so a transfer
+# waits its turn against a scheduled departure time rather than being
+# throttled mid-flight - a large file on a low limit will visibly delay
+# whatever is queued behind it instead of slowing down itself.
+# upload_limit_kbps = 0
+# download_limit_kbps = 0
 # download also prompts without a strategy; overwrite the local copy on download
 # (0.8 renamed the overwrite strategy from replace → remove).
 download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strategy", "remove"]
