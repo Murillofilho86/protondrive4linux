@@ -20,7 +20,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M2-002 | Secure updater | M2 | `type:security` `area:security` `risk:security` | 🔶 (desligado) |
 | M2-003 | Proton CLI resolution hardening | M2 | `type:security` `area:security` `risk:security` | ✅ |
 | M2-004 | Automated dependency audit | M2 | `type:security` `area:security` | ✅ |
-| M2-005 | Reproducible release metadata | M2 | `type:security` `area:distribution` | 🔶 |
+| M2-005 | Reproducible release metadata | M2 | `type:security` `area:distribution` | ✅ (SHA do commit em `--version`, via `build.rs`) |
 | M3-001 | Linux compatibility matrix | M3 | `type:documentation` `area:packaging` | ⬜ |
 | M3-002 | Arch package | M3 | `area:packaging` `area:distribution` | 🔶 |
 | M3-003 | Pacote Debian | M3 | `area:packaging` `area:distribution` | ⬜ |

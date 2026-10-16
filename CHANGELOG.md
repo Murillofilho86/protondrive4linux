@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- `--version` now shows the commit the binary was built from (M2-005), e.g. `0.4.2 (c499d009e67d)`; a `-dirty` suffix marks a build made from an uncommitted working tree. `status`/`doctor` show the same string. New `build.rs` (no third-party dependencies) captures it via `git rev-parse` at build time, with a `PROTONDRIVE_BUILD_SHA` env var override for packaging from a source tree without `.git`.
+
 ## [0.4.2] - 2026-09-11
 
 ### Added
