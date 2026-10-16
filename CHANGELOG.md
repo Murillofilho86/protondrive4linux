@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Added
 - `--version` now shows the commit the binary was built from (M2-005), e.g. `0.4.2 (c499d009e67d)`; a `-dirty` suffix marks a build made from an uncommitted working tree. `status`/`doctor` show the same string. New `build.rs` (no third-party dependencies) captures it via `git rev-parse` at build time, with a `PROTONDRIVE_BUILD_SHA` env var override for packaging from a source tree without `.git`.
 
+### Security
+- Bumped `rustls` (transitive, via `ureq`, GUI updater feature) 0.23.42 -> 0.23.46, fixing four advisories published 2026-10-14 (RUSTSEC-2026-0346, -0348, -0349, -0285) caught by this release's own `cargo audit` run in CI.
+
 ## [0.4.2] - 2026-09-11
 
 ### Added
