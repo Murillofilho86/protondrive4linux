@@ -245,6 +245,9 @@ fn cfg(root: &Path) -> Config {
         scan_threads: 0,
         download_threads: 0,
         cli_timeout_secs: 30,
+        retry_base_delay_secs: 30,
+        retry_max_delay_secs: 1800,
+        retry_max_attempts: 6,
         remote_root: "/my-files".into(),
         propagate_deletes: false,
         auto_sync: false,
@@ -293,6 +296,21 @@ fn try_run(cfg: &Config, remote: FakeRemote, resync: bool) -> anyhow::Result<()>
     let log = Logger::silent();
     let mut eng = Engine::new(cfg, remote, &log, false);
     eng.sync_pair(&cfg.pairs[0], resync).map(|_| ())
+}
+
+// A fresh failure puts a path in retry backoff (M4-004), so it's skipped -
+// not re-attempted - on the very next run. Tests below that simulate "the
+// underlying problem clears, then retry" (not M4-004's backoff timing itself)
+// call this between the failing run and the retry run to simulate the
+// backoff window having elapsed, by forcing every pending path's `next_at`
+// into the past while keeping its recorded attempt count.
+fn clear_retry_backoff(cfg: &Config, pair: &str) {
+    let state = neutronsync::state::retry_state(&cfg.state_dir, pair).unwrap();
+    let upserts: Vec<(String, u32, i64)> = state
+        .into_iter()
+        .map(|(rel, (attempts, _))| (rel, attempts, 0))
+        .collect();
+    neutronsync::state::apply_retry_updates(&cfg.state_dir, pair, &upserts, &[]).unwrap();
 }
 
 fn remote_files(store: &Rc<RefCell<Store>>) -> BTreeMap<String, String> {
@@ -871,6 +889,7 @@ fn failed_download_is_pending_not_deleted() {
 
     // Run 2: downloads work again -> the pending file resumes, not deleted.
     store.borrow_mut().fail_download = None;
+    clear_retry_backoff(&c, &c.pairs[0].name);
     let (fake3, _s) = reuse(&store);
     run(&c, fake3, false);
     assert_eq!(
@@ -881,6 +900,75 @@ fn failed_download_is_pending_not_deleted() {
     assert!(
         store.borrow().files.contains_key("/my-files/docs/keep.txt"),
         "remote file still present"
+    );
+}
+
+#[test]
+fn failed_op_is_skipped_while_its_retry_backoff_is_still_active() {
+    // M4-004: a file that just failed isn't retried on the very next run - it
+    // sits in backoff. Confirms the skip actually happens (no error recorded,
+    // because the op is never re-attempted at all), not just the eventual
+    // success already covered by `failed_upload_keeps_local_edit`.
+    let t = Tmp::new("backoff");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    let local = t.path().join("local/x.txt");
+    write(&local, "v1");
+    run(&c, fake, false); // both sides hold "v1"
+
+    // A different size (not just mtime) so the edit is detected even if the
+    // rewrite lands in the same wall-clock second as the baseline's mtime.
+    write(&local, "v2-local-edit");
+    store.borrow_mut().fail_upload = Some("/my-files/docs/x.txt".into());
+    let (fake2, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, fake2, &log, false);
+    let res = eng.sync_pair(&c.pairs[0], false).unwrap();
+    assert_eq!(res.errors.len(), 1, "the upload attempt itself must fail");
+
+    let state = neutronsync::state::retry_state(&c.state_dir, &c.pairs[0].name).unwrap();
+    let (attempts, next_at) = *state.get("x.txt").expect("failure must be recorded");
+    assert_eq!(attempts, 1);
+    assert!(
+        next_at > neutronsync::datefmt::now_epoch(),
+        "backoff must push the next attempt into the future"
+    );
+
+    // Still in backoff: re-running immediately must NOT re-attempt the op at
+    // all (zero errors this run - not "attempted and failed again").
+    let (fake3, _s) = reuse(&store);
+    let mut eng = Engine::new(&c, fake3, &log, false);
+    let res = eng.sync_pair(&c.pairs[0], false).unwrap();
+    assert_eq!(
+        res.errors.len(),
+        0,
+        "a path in backoff must be skipped, not re-attempted"
+    );
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/x.txt")
+            .map(String::as_str),
+        Some("v1"),
+        "nothing changed on the skipped run"
+    );
+
+    // Once the backoff window elapses (and the underlying problem clears),
+    // the retry goes through and the backoff row is cleared.
+    store.borrow_mut().fail_upload = None;
+    clear_retry_backoff(&c, &c.pairs[0].name);
+    let (fake4, _s) = reuse(&store);
+    run(&c, fake4, false);
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/x.txt")
+            .map(String::as_str),
+        Some("v2-local-edit")
+    );
+    assert!(
+        neutronsync::state::retry_state(&c.state_dir, &c.pairs[0].name)
+            .unwrap()
+            .is_empty(),
+        "a successful retry must clear the backoff row"
     );
 }
 
@@ -917,6 +1005,7 @@ fn failed_upload_keeps_local_edit() {
     // Uploads work again: the local edit must win (re-uploaded), and the stale
     // remote copy must never be pulled back over it.
     store.borrow_mut().fail_upload = None;
+    clear_retry_backoff(&c, &c.pairs[0].name);
     let (fake3, _s) = reuse(&store);
     run(&c, fake3, false);
     assert_eq!(
@@ -1148,6 +1237,7 @@ fn offline_then_reconnect_reconciles_correctly() {
     );
 
     // --- Back online: reconcile ---
+    clear_retry_backoff(&c, &c.pairs[0].name);
     let (fake3, _s) = reuse(&store);
     run(&c, fake3, false);
 

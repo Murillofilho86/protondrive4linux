@@ -31,14 +31,22 @@ Queue" inspecionável (útil pra GUI mostrar progresso granular).
 
 ## M4-004 — Retry/backoff exponencial com jitter
 **Labels**: `type:feature`, `area:performance`
-**Status: ⬜ Não iniciado — gap real.** Hoje um item que falha só "retry na próxima rodada"
-(ciclo do watcher/rescan), sem backoff exponencial nem jitter. Sob rate-limit da API da Proton
-isso pode gerar tentativas em lockstep.
+**Status: ✅ Fechado.** Um arquivo cujo upload/download falha não é mais reatacado já na
+próxima rodada — fica em backoff exponencial (`retry_base_delay_secs`, dobra a cada falha
+consecutiva, teto em `retry_max_delay_secs`) com jitter determinístico derivado do próprio
+caminho do arquivo (sem depender de uma crate `rand`), então muitos arquivos falhando juntos
+(ex.: sob rate-limit da API da Proton) não tentam de novo em lockstep. O crescimento do delay
+estaciona após `retry_max_attempts` falhas consecutivas — continua tentando no delay máximo
+indefinidamente depois disso, nunca desiste de vez (um problema transitório, como rate-limit ou
+uma instabilidade de rede, tende a passar). Estado persistido em `stats.db` (tabela
+`retry_state`, por `pair`+`rel`), então sobrevive a um restart do daemon/GUI. Testado com
+`FakeRemote` em `tests/engine.rs`: confirma que um item em backoff é pulado (zero tentativas,
+não "tentou e falhou de novo") e que o backoff é limpo assim que a transferência tem sucesso.
 
 ### Critérios de aceite
-- [ ] Exponential backoff.
-- [ ] Jitter.
-- [ ] Max attempts configurável.
+- [x] Exponential backoff (`retry_base_delay_secs`, dobra por tentativa).
+- [x] Jitter (determinístico, por caminho — sem nova dependência de crate).
+- [x] Max attempts configurável (`retry_max_attempts`; estaciona o delay, não desiste).
 
 ## M4-005 — Bandwidth limits
 **Labels**: `type:feature`, `area:performance`

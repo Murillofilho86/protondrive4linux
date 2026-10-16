@@ -8,7 +8,7 @@
 //! tables) alongside the activity feed and hot-folder stats. Legacy
 //! `baselines/*.json` files are imported once, then set aside.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -133,4 +133,19 @@ pub fn last_synced(state_dir: &Path, name: &str) -> Result<Option<i64>> {
 /// Record `name`'s last successful sync time.
 pub fn set_last_synced(state_dir: &Path, name: &str, ts: i64) -> Result<()> {
     Stats::open(state_dir)?.set_last_synced(name, ts)
+}
+
+/// Per-file retry backoff state for `name` (see [`Stats::retry_state`]).
+pub fn retry_state(state_dir: &Path, name: &str) -> Result<HashMap<String, (u32, i64)>> {
+    Stats::open(state_dir)?.retry_state(name)
+}
+
+/// Apply this run's retry outcomes (see [`Stats::apply_retry_updates`]).
+pub fn apply_retry_updates(
+    state_dir: &Path,
+    name: &str,
+    upserts: &[(String, u32, i64)],
+    clears: &[String],
+) -> Result<()> {
+    Stats::open(state_dir)?.apply_retry_updates(name, upserts, clears)
 }

@@ -9,7 +9,9 @@
 //! Safety: deletions never propagate unless enabled; a missing baseline unions
 //! both sides (never mass-deletes); conflicts keep both versions by default.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -29,6 +31,18 @@ use crate::trash::trash_local;
 /// `plan()`'s return: (the plan, the prospective new baseline, whether the
 /// scan was incomplete, and the set of baseline rows to prune).
 type PlanOutcome = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
+
+/// One run's retry-backoff bookkeeping (M4-004), bundled so it travels
+/// between `apply()` and `run_downloads()` as a single argument: `state` is
+/// this pair's current backoff state going into the run (read-only);
+/// `upserts`/`clears` accumulate this run's outcomes for the one persistence
+/// call `apply()` makes at the end, alongside the baseline commit.
+struct RetryBatch<'a> {
+    state: &'a HashMap<String, (u32, i64)>,
+    now: i64,
+    upserts: &'a mut Vec<(String, u32, i64)>,
+    clears: &'a mut Vec<String>,
+}
 
 pub struct SyncResult {
     pub pair: String,
@@ -1309,6 +1323,22 @@ impl<'a, R: Remote> Engine<'a, R> {
         let mut done: HashSet<String> = HashSet::new();
         let mut deleted_ok: HashSet<String> = HashSet::new();
 
+        // Retry backoff (M4-004): a path that failed recently is skipped this
+        // run rather than retried immediately - it stays `pending` (untouched
+        // by this run) and is picked up again once its backoff window passes.
+        // `retry_upserts`/`retry_clears` collect this run's outcomes for the
+        // one persistence call at the end, alongside the baseline commit.
+        let now = now_epoch();
+        let retry_state =
+            crate::state::retry_state(&self.cfg.state_dir, &pair.name).unwrap_or_default();
+        let in_backoff = |path: &str| {
+            retry_state
+                .get(path)
+                .is_some_and(|&(_, next_at)| next_at > now)
+        };
+        let mut retry_upserts: Vec<(String, u32, i64)> = Vec::new();
+        let mut retry_clears: Vec<String> = Vec::new();
+
         for op in &rest {
             if self.cancelled() {
                 self.log
@@ -1323,6 +1353,14 @@ impl<'a, R: Remote> Engine<'a, R> {
                 continue;
             }
             if self.dry_run {
+                continue;
+            }
+            if in_backoff(&op.path) {
+                self.log.info(&format!(
+                    "skipping {} {} — in retry backoff",
+                    op.action.label(),
+                    op.path
+                ));
                 continue;
             }
             self.emit(SyncEvent::OpStarted {
@@ -1352,11 +1390,15 @@ impl<'a, R: Remote> Engine<'a, R> {
                     // Confirm this op's provisional baseline row (harmless for
                     // deletes/no-ops, which aren't in `pending`).
                     done.insert(op.path.clone());
+                    retry_clears.push(op.path.clone());
                 }
                 Err(e) => {
                     let msg = format!("{} {}: {e}", op.action.label(), op.path);
                     self.log.error(&msg);
                     result.errors.push(msg);
+                    let attempts = retry_state.get(&op.path).map(|&(a, _)| a).unwrap_or(0) + 1;
+                    let next_at = backoff_next_at(self.cfg, &op.path, attempts, now);
+                    retry_upserts.push((op.path.clone(), attempts, next_at));
                 }
             }
             self.emit(SyncEvent::OpFinished {
@@ -1375,7 +1417,20 @@ impl<'a, R: Remote> Engine<'a, R> {
                     self.log.info(&op.describe());
                 }
             } else {
-                self.run_downloads(pair, &downloads, &new_base, &mut result, &mut done);
+                let mut retry = RetryBatch {
+                    state: &retry_state,
+                    now,
+                    upserts: &mut retry_upserts,
+                    clears: &mut retry_clears,
+                };
+                self.run_downloads(
+                    pair,
+                    &downloads,
+                    &new_base,
+                    &mut result,
+                    &mut done,
+                    &mut retry,
+                );
             }
         }
 
@@ -1419,6 +1474,17 @@ impl<'a, R: Remote> Engine<'a, R> {
                     pair.name
                 ));
             }
+            if let Err(e) = crate::state::apply_retry_updates(
+                &self.cfg.state_dir,
+                &pair.name,
+                &retry_upserts,
+                &retry_clears,
+            ) {
+                self.log.warn(&format!(
+                    "could not update retry backoff state for {:?}: {e}",
+                    pair.name
+                ));
+            }
             let retrying = pending.iter().filter(|r| !done.contains(*r)).count();
             if retrying > 0 {
                 self.log.warn(&format!(
@@ -1447,9 +1513,22 @@ impl<'a, R: Remote> Engine<'a, R> {
         new_base: &BTreeMap<String, Entry>,
         result: &mut SyncResult,
         done_down: &mut HashSet<String>,
+        retry: &mut RetryBatch,
     ) {
         let mut jobs: Vec<DownloadJob> = Vec::new();
         for op in downloads {
+            // Retry backoff (M4-004): a path that failed recently is skipped
+            // this run; it stays `pending` and is picked up again once its
+            // backoff window passes.
+            if retry
+                .state
+                .get(&op.path)
+                .is_some_and(|&(_, next_at)| next_at > retry.now)
+            {
+                self.log
+                    .info(&format!("skipping download {} — in retry backoff", op.path));
+                continue;
+            }
             // Guard the destination against a remote-controlled name escaping
             // the sync root; skip (don't abort the batch) anything unsafe.
             let local_full = match safe_join(&pair.local, &op.path) {
@@ -1480,6 +1559,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         let applied = AtomicUsize::new(0);
         let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let done_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let failed_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let fallback = AtomicBool::new(false);
         let cancel_ref: &AtomicBool = self.cancel.unwrap_or(&fallback);
 
@@ -1506,6 +1586,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                     let msg = format!("download {}: {e}", j.rel);
                     log.error(&msg);
                     errs.lock().unwrap().push(msg);
+                    failed_rels.lock().unwrap().push(j.rel.clone());
                 }
             }
             if let Some(s) = events {
@@ -1529,7 +1610,14 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         result.applied += applied.load(Ordering::Relaxed);
         result.errors.extend(errs.into_inner().unwrap());
-        done_down.extend(done_rels.into_inner().unwrap());
+        let done_rels = done_rels.into_inner().unwrap();
+        retry.clears.extend(done_rels.iter().cloned());
+        done_down.extend(done_rels);
+        for rel in failed_rels.into_inner().unwrap() {
+            let attempts = retry.state.get(&rel).map(|&(a, _)| a).unwrap_or(0) + 1;
+            let next_at = backoff_next_at(self.cfg, &rel, attempts, retry.now);
+            retry.upserts.push((rel, attempts, next_at));
+        }
     }
 
     fn apply_op(
@@ -2101,6 +2189,33 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 }
 
+/// Next epoch-second `path` is eligible to be retried after its `attempts`-th
+/// consecutive failure (M4-004): exponential backoff off
+/// `retry_base_delay_secs`, capped by `retry_max_delay_secs`, with growth
+/// plateauing once `attempts` reaches `retry_max_attempts` - a transient
+/// problem (rate limit, outage) is expected to eventually clear, so this
+/// never gives up for good, it just stops escalating. Jitter is mixed in via
+/// a hash of `(path, attempts)`, so it's deterministic (no `rand` dependency)
+/// but differs between paths - spreading out retries so many files failing
+/// together don't all retry in lockstep.
+fn backoff_next_at(cfg: &Config, path: &str, attempts: u32, now: i64) -> i64 {
+    let max_attempts = cfg.retry_max_attempts.max(1);
+    let exp = attempts.min(max_attempts).saturating_sub(1).min(20);
+    let base = cfg.retry_base_delay_secs.max(1);
+    let delay = base
+        .saturating_mul(1u64 << exp)
+        .min(cfg.retry_max_delay_secs.max(base));
+    let mut hasher = DefaultHasher::new();
+    (path, attempts).hash(&mut hasher);
+    let half = delay / 2;
+    let jitter = if half == 0 {
+        0
+    } else {
+        hasher.finish() % (half + 1)
+    };
+    now + (half + jitter) as i64
+}
+
 /// Join `rel` onto `root`, guaranteeing the result stays within `root`. Only
 /// normal path components are allowed; any `..`, absolute, or prefix component
 /// (which could escape the sync root) is rejected. Every local filesystem path
@@ -2316,7 +2431,9 @@ fn sha1_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_join;
+    use super::{backoff_next_at, safe_join};
+    use crate::config::{Config, ConflictPolicy, LocalDelete, UpdateChannel};
+    use crate::models::Compare;
     use std::path::Path;
 
     #[test]
@@ -2331,5 +2448,85 @@ mod tests {
         assert!(safe_join(root, "../escape").is_err());
         assert!(safe_join(root, "a/../../escape").is_err());
         assert!(safe_join(root, "/etc/passwd").is_err());
+    }
+
+    fn retry_cfg(base: u64, max_delay: u64, max_attempts: u32) -> Config {
+        Config {
+            binary: "proton-drive".into(),
+            upload_flags: vec![],
+            download_flags: vec![],
+            credentials_store: None,
+            fresh_cache: false,
+            scan_threads: 0,
+            download_threads: 0,
+            cli_timeout_secs: 30,
+            retry_base_delay_secs: base,
+            retry_max_delay_secs: max_delay,
+            retry_max_attempts: max_attempts,
+            remote_root: "/my-files".into(),
+            propagate_deletes: false,
+            auto_sync: false,
+            run_in_tray: false,
+            x11_compat: false,
+            local_delete: LocalDelete::Trash,
+            conflict: ConflictPolicy::KeepBoth,
+            compare: Compare::SizeMtime,
+            poll_interval_secs: 900,
+            scan_interval_secs: 120,
+            debounce_secs: 2,
+            update_channel: UpdateChannel::Stable,
+            check_on_launch: false,
+            state_dir: std::env::temp_dir(),
+            pairs: vec![],
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_then_plateaus_at_max_attempts() {
+        let cfg = retry_cfg(10, 10_000, 4);
+        let now = 1_000_000;
+        // attempts 1..4: 10, 20, 40, 80 (± jitter, which is in [delay/2, delay]).
+        let d1 = backoff_next_at(&cfg, "a.txt", 1, now) - now;
+        let d2 = backoff_next_at(&cfg, "a.txt", 2, now) - now;
+        let d3 = backoff_next_at(&cfg, "a.txt", 3, now) - now;
+        let d4 = backoff_next_at(&cfg, "a.txt", 4, now) - now;
+        let d5 = backoff_next_at(&cfg, "a.txt", 5, now) - now; // past max_attempts: plateaus
+        assert!((5..=10).contains(&d1), "attempt 1 delay was {d1}");
+        assert!((10..=20).contains(&d2), "attempt 2 delay was {d2}");
+        assert!((20..=40).contains(&d3), "attempt 3 delay was {d3}");
+        assert!((40..=80).contains(&d4), "attempt 4 delay was {d4}");
+        // Same exponent (and thus the same bounds) as attempt 4 - growth
+        // stopped, it never gives up retrying for good.
+        assert!((40..=80).contains(&d5), "attempt 5 delay was {d5}");
+    }
+
+    #[test]
+    fn backoff_is_capped_at_max_delay() {
+        let cfg = retry_cfg(1000, 1500, 10);
+        let now = 0;
+        let d = backoff_next_at(&cfg, "a.txt", 10, now) - now;
+        assert!(d <= 1500, "delay {d} exceeded the configured ceiling");
+    }
+
+    #[test]
+    fn backoff_jitter_differs_between_paths_at_the_same_attempt() {
+        let cfg = retry_cfg(10_000, 10_000_000, 6);
+        let now = 0;
+        // Full jitter is [delay/2, delay] - different paths should (almost
+        // certainly) land on different points in that range.
+        let a = backoff_next_at(&cfg, "a.txt", 3, now);
+        let b = backoff_next_at(&cfg, "b.txt", 3, now);
+        assert_ne!(a, b, "two different paths landed on identical jitter");
+    }
+
+    #[test]
+    fn backoff_next_at_is_deterministic() {
+        let cfg = retry_cfg(30, 1800, 6);
+        assert_eq!(
+            backoff_next_at(&cfg, "same.txt", 3, 500),
+            backoff_next_at(&cfg, "same.txt", 3, 500),
+            "same inputs must always produce the same next_at"
+        );
     }
 }
