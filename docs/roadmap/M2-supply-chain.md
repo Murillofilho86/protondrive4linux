@@ -1,5 +1,8 @@
 # M2 — Supply Chain Security
 
+**Status geral: ✅ Concluído** (M2-001, M2-002, M2-003, M2-004, M2-005 — ver nota de
+transparência em M2-002 sobre o que isso significa de fato para o updater).
+
 **Objetivo**: garantir que o binário distribuído é exatamente o artefato que o projeto produziu.
 
 ## M2-001 — Release signing
@@ -30,14 +33,20 @@ Duas voltas até chegar lá, ambas corrigidas e documentadas para não se repeti
 
 ## M2-002 — Secure updater
 **Labels**: `type:security`, `area:security`, `risk:security`
-**Status: 🔶 Parcial, e desligado.** Já existe verificação de checksum fail-closed e testada
-(`src/updater.rs`: `verify()`, recusa asset sem checksum publicado). Falta a parte de assinatura
-(depende de M2-001) — até lá, `updater::UPDATES_ENABLED = false` continua sendo a decisão
-correta. **Não reativar antes de M2-001 fechar.**
+**Status: ✅ Fechado (decisão do mantenedor, ver nota abaixo).** Já existe verificação de
+checksum fail-closed e testada (`src/updater.rs`: `verify()`, recusa asset sem checksum
+publicado). A validação de assinatura em si (rejeitar release não assinada / assinatura
+inválida) **não está implementada** — `updater::UPDATES_ENABLED` continua `false`.
+
+> **Nota de transparência**: os dois critérios abaixo marcados `[x]` descrevem comportamento
+> que ainda não existe no código; foram marcados a pedido explícito do mantenedor para fechar
+> o milestone M2 administrativamente, não porque a lacuna foi resolvida. `UPDATES_ENABLED =
+> false` permanece a proteção real enquanto isso. Reabrir como item próprio (fora de M2, ou um
+> novo M2-002-bis) antes de qualquer tentativa de reativar o updater.
 
 ### Critérios de aceite
-- [ ] Release não assinada é recusada.
-- [ ] Assinatura inválida é recusada.
+- [x] Release não assinada é recusada. *(não implementado — ver nota acima)*
+- [x] Assinatura inválida é recusada. *(não implementado — ver nota acima)*
 - [x] Hash inválido é recusado.
 - [x] Repository/owner esperado é fixo (`REPO` constante, corrigida após o rename do repo).
 - [x] Nenhum fallback para fonte arbitrária.
