@@ -196,6 +196,9 @@ pub struct DownloadJob {
     pub remote_path: String, // absolute proton path to download
     pub dest_dir: String,    // local parent directory
     pub mtime: Option<i64>,
+    /// Size in bytes (from the new baseline), used to pace the download
+    /// against the configured bandwidth limit (M4-005).
+    pub size: u64,
 }
 
 #[derive(Default)]

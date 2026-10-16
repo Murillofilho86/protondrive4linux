@@ -1549,11 +1549,13 @@ impl<'a, R: Remote> Engine<'a, R> {
                 remote_path: remote_join(&pair.remote, &op.path),
                 dest_dir: dest_dir.to_string_lossy().into_owned(),
                 mtime: new_base.get(&op.path).and_then(|e| e.mtime),
+                size: new_base.get(&op.path).map(|e| e.size).unwrap_or(0),
             });
         }
 
         let events = self.events;
         let log = self.log;
+        let cfg = self.cfg;
         let pair_name = pair.name.as_str();
         let local_root = &pair.local;
         let applied = AtomicUsize::new(0);
@@ -1564,6 +1566,9 @@ impl<'a, R: Remote> Engine<'a, R> {
         let cancel_ref: &AtomicBool = self.cancel.unwrap_or(&fallback);
 
         let on_start = |j: &DownloadJob| {
+            // Bandwidth limit (M4-005): blocks until it's this job's turn.
+            cfg.download_limiter
+                .acquire(j.size, cfg.download_limit_kbps);
             log.info(&format!("download    file {} (new remote)", j.rel));
             if let Some(s) = events {
                 s.emit(&SyncEvent::OpStarted {
@@ -1636,6 +1641,12 @@ impl<'a, R: Remote> Engine<'a, R> {
             Action::Upload => {
                 let parent = parent_rel(&op.path);
                 self.ensure_remote_dir(&pair.remote, parent)?;
+                // Bandwidth limit (M4-005): pace against the real on-disk
+                // size, not a possibly-stale scanned value.
+                let size = std::fs::metadata(&local_full).map(|m| m.len()).unwrap_or(0);
+                self.cfg
+                    .upload_limiter
+                    .acquire(size, self.cfg.upload_limit_kbps);
                 self.remote.upload(
                     &local_full.to_string_lossy(),
                     &remote_join(&pair.remote, parent),
@@ -2463,6 +2474,10 @@ mod tests {
             retry_base_delay_secs: base,
             retry_max_delay_secs: max_delay,
             retry_max_attempts: max_attempts,
+            upload_limit_kbps: 0,
+            download_limit_kbps: 0,
+            upload_limiter: crate::ratelimit::RateLimiter::new(),
+            download_limiter: crate::ratelimit::RateLimiter::new(),
             remote_root: "/my-files".into(),
             propagate_deletes: false,
             auto_sync: false,

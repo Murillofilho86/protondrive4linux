@@ -2027,6 +2027,25 @@ impl App {
                     }
                 });
 
+                settings_group(ui, "BANDWIDTH", |ui| {
+                    if setting_row(
+                        ui,
+                        "Upload limit",
+                        "Caps upload throughput across every pair combined. 0 = unlimited.",
+                        |ui| kbps_field(ui, &mut self.cfg.upload_limit_kbps),
+                    ) {
+                        self.dirty = true;
+                    }
+                    if setting_row(
+                        ui,
+                        "Download limit",
+                        "Caps download throughput across every pair combined. 0 = unlimited.",
+                        |ui| kbps_field(ui, &mut self.cfg.download_limit_kbps),
+                    ) {
+                        self.dirty = true;
+                    }
+                });
+
                 settings_group(ui, "ADVANCED", |ui| {
                     if setting_row(ui, "Remote root", "", |ui| {
                         ui.add(
@@ -3467,6 +3486,22 @@ fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
     changed
 }
 
+/// A KB/s input for the bandwidth-limit rows (M4-005): 0 = unlimited.
+fn kbps_field(ui: &mut egui::Ui, v: &mut u64) -> bool {
+    let mut n = *v as i64;
+    let changed = ui
+        .add(
+            egui::DragValue::new(&mut n)
+                .range(0..=1_000_000)
+                .suffix(" KB/s"),
+        )
+        .changed();
+    if changed {
+        *v = n.max(0) as u64;
+    }
+    changed
+}
+
 // -- starter config ----------------------------------------------------------
 fn starter_config(path: &Path) -> Config {
     Config {
@@ -3491,6 +3526,10 @@ fn starter_config(path: &Path) -> Config {
         retry_base_delay_secs: 30,
         retry_max_delay_secs: 1800,
         retry_max_attempts: 6,
+        upload_limit_kbps: 0,
+        download_limit_kbps: 0,
+        upload_limiter: neutronsync::ratelimit::RateLimiter::new(),
+        download_limiter: neutronsync::ratelimit::RateLimiter::new(),
         remote_root: config::DEFAULT_REMOTE_ROOT.into(),
         propagate_deletes: true,
         auto_sync: false,

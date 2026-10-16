@@ -248,6 +248,10 @@ fn cfg(root: &Path) -> Config {
         retry_base_delay_secs: 30,
         retry_max_delay_secs: 1800,
         retry_max_attempts: 6,
+        upload_limit_kbps: 0,
+        download_limit_kbps: 0,
+        upload_limiter: neutronsync::ratelimit::RateLimiter::new(),
+        download_limiter: neutronsync::ratelimit::RateLimiter::new(),
         remote_root: "/my-files".into(),
         propagate_deletes: false,
         auto_sync: false,
@@ -856,6 +860,59 @@ fn downloads_many_new_remote_files() {
         t.path().join("local/sub/deep.txt").exists(),
         "nested file should download too"
     );
+}
+
+#[test]
+fn upload_limit_paces_the_transfer() {
+    // M4-005: a configured upload_limit_kbps measurably paces uploads
+    // through the real engine path (Action::Upload in apply_op), not just
+    // the RateLimiter unit in isolation. The very first transfer against a
+    // fresh limiter is never delayed (nothing queued ahead of it yet), so
+    // this writes TWO files - the second is the one that actually waits.
+    let t = Tmp::new("bwup");
+    let mut c = cfg(t.path());
+    c.upload_limit_kbps = 10; // 10,000 bytes/sec
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), &"x".repeat(10_000));
+    write(&t.path().join("local/b.txt"), &"y".repeat(10_000));
+    let start = std::time::Instant::now();
+    run(&c, fake, false);
+    assert!(
+        start.elapsed().as_secs_f64() >= 0.9,
+        "the second 10000-byte upload at a 10KB/s limit should add ~1s, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(remote_files(&store).len(), 2, "both files still uploaded");
+}
+
+#[test]
+fn download_limit_paces_the_transfer() {
+    // Mirrors `upload_limit_paces_the_transfer` for the download path (the
+    // concurrent pool in `run_downloads`'s `on_start`).
+    let t = Tmp::new("bwdown");
+    let mut c = cfg(t.path());
+    c.download_limit_kbps = 10;
+    let (fake, store) = FakeRemote::new();
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    run(&c, fake, false); // establish empty baseline (unlimited for this one)
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/a.txt".into(), vec![b'x'; 10_000]);
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/b.txt".into(), vec![b'y'; 10_000]);
+    let (fake2, _s2) = reuse(&store);
+    let start = std::time::Instant::now();
+    run(&c, fake2, false);
+    assert!(
+        start.elapsed().as_secs_f64() >= 0.9,
+        "the second 10000-byte download at a 10KB/s limit should add ~1s, took {:?}",
+        start.elapsed()
+    );
+    assert!(t.path().join("local/a.txt").exists());
+    assert!(t.path().join("local/b.txt").exists());
 }
 
 #[test]

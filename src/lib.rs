@@ -16,6 +16,7 @@ pub mod ignore;
 pub mod logger;
 pub mod models;
 pub mod protoncli;
+pub mod ratelimit;
 pub mod service;
 pub mod state;
 pub mod stats;
