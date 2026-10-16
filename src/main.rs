@@ -44,10 +44,20 @@ impl EventSink for DbSink {
     }
 }
 
+/// `<version> (<commit-sha>)`, e.g. `0.4.2 (a1b2c3d4e5f6)`; `build.rs` sets
+/// `PROTONDRIVE_BUILD_SHA` to "unknown" when `.git` isn't available (e.g.
+/// building from the `git archive` source tarball instead of a checkout).
+const VERSION_WITH_SHA: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PROTONDRIVE_BUILD_SHA"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "protondrive4linux",
-    version,
+    version = VERSION_WITH_SHA,
     about = "Bidirectional Proton Drive folder sync built on the official proton-drive CLI"
 )]
 struct Cli {
@@ -172,7 +182,7 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
         .resolve_binary()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "NOT FOUND on PATH".to_string());
-    println!("protondrive4linux {}", env!("CARGO_PKG_VERSION"));
+    println!("protondrive4linux {VERSION_WITH_SHA}");
     if let Some(p) = &cfg.source_path {
         println!("config          {}", p.display());
     }

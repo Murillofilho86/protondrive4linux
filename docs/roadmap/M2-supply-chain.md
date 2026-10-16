@@ -92,20 +92,35 @@ em todo push/PR (`.github/workflows/ci.yml`). Config e as exceções documentada
 
 ## M2-005 — Reproducible release metadata
 **Labels**: `type:security`, `area:distribution`
-**Status: 🔶 Parcial.** `scripts/release.sh` já recusa tag sem seção de changelog e valida a
-versão do `Cargo.toml` contra a tag.
+**Status: ✅ Fechado.** `build.rs` (novo, sem dependências de terceiros — só `std::process::Command`)
+captura `git rev-parse --short=12 HEAD` em tempo de build e expõe via `PROTONDRIVE_BUILD_SHA`;
+`--version` agora mostra `<versão> (<sha>[-dirty])`, ex. `0.4.2 (c499d009e67d)`. `status`/`doctor`
+usam a mesma string. Working tree sujo no momento do build soma um sufixo `-dirty` (prática comum
+em `rustc`/`cargo`), então um build de dev nunca é confundido com o build de release do mesmo commit.
+
+Dois casos sem `.git` disponível, cobertos:
+- **Tarball de source** (gerado via `git archive` no `release.yml`, que exclui `.git` por
+  natureza): rebuilder a partir dele cai em `"unknown"` em vez de falhar o build.
+- **Empacotadores/CI que buildam fora de um checkout git** (ex. AUR/`.deb`/`.rpm` a partir de um
+  tarball extraído): podem fixar o SHA explicitamente via `PROTONDRIVE_BUILD_SHA=<sha> cargo build`,
+  sem precisar de `.git`.
+
+Os builds reais de `.deb`/`.rpm`/tarball binário em CI partem de um `actions/checkout@v4` normal
+(`.git` presente), então pegam o SHA real automaticamente — nenhuma mudança em `release.yml` foi
+necessária.
 
 ### Critérios de aceite
 - [x] Versão identificável (`Cargo.toml`, tag).
-- [ ] Commit SHA associado embutido no binário (`--version` hoje não mostra de qual commit veio
-      o build).
-- [ ] Build metadata.
+- [x] Commit SHA associado embutido no binário (`build.rs` + `PROTONDRIVE_BUILD_SHA`, usado em
+      `--version`/`status`/`doctor`).
+- [x] Build metadata — sufixo `-dirty` quando o working tree não está limpo no momento do build.
 - [x] Checksums (SHA-256 por asset, publicado pelo GitHub Release).
-- [ ] Artefatos rastreáveis ao commit de forma independente do changelog.
+- [x] Artefatos rastreáveis ao commit de forma independente do changelog — `--version` já basta,
+      sem precisar abrir o `CHANGELOG.md` pra saber de qual commit um binário específico veio.
 
 ## M2 — Definition of Done
 - [x] Release assinada (bloqueia reativação do updater — M2-002 ainda depende disso ficar
       testado em produção antes de reativar).
 - [x] `cargo deny check licenses` em CI.
 - [x] CLI resolution hardening documentado e implementado.
-- [ ] Commit SHA no `--version`.
+- [x] Commit SHA no `--version`.
