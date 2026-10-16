@@ -1,7 +1,14 @@
 # M7 — Distribution
 
 ## M7-001 — Flatpak
-**Status: 🔒 Bloqueado por M3-005.** Não implementar antes da pesquisa de viabilidade concluir.
+**Status: 🔒 Bloqueado indefinidamente — decisão de M3-005: não viável hoje.** A pesquisa de
+viabilidade (`M3-linux-compatibility.md#m3-005`) concluiu que tanto `GUI only` quanto
+`GUI + sync daemon` dependem de alcançar o `proton-drive` CLI de dentro do sandbox, e isso só é
+possível via sandbox escape total (`flatpak-spawn --host`, `--talk-name=org.freedesktop.Flatpak`)
+ou embutindo um binário proprietário de terceiro sem necessidade reduzida de permissões — nenhuma
+das duas é uma distribuição Flathub aceitável. Bloqueado até a Proton distribuir o CLI de forma
+compatível com sandbox (Flatpak/AppImage oficial próprio, ou MIT sem depender do runtime `bun`).
+Não implementar enquanto essa condição não mudar.
 
 ### Critérios de aceite (quando desbloqueado)
 - [ ] Manifest.

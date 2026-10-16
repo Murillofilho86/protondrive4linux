@@ -86,10 +86,74 @@ Dois achados reais ao fechar isso, ambos documentados com o racional completo em
 
 ## M3-005 — Pesquisa de viabilidade Flatpak
 **Labels**: `type:research`, `area:distribution`, `priority:high`
-**Status: ⬜ Não iniciado.** Investigar antes de qualquer código: filesystem permissions,
-portals, background services, tray, keyring, acesso ao `proton-drive` CLI de dentro do sandbox,
-autostart.
+**Status: ✅ Fechado. Decisão: Flatpak não é viável hoje — nem como `GUI only`, nem como
+`GUI + sync daemon`.** Ambos os formatos dependem do mesmo requisito, e esse requisito é
+bloqueado por um fator fora do nosso controle.
+
+### O bloqueador: o `proton-drive` CLI não tem distribuição sandbox-friendly
+
+protondrive4linux é, por design (ver `CLAUDE.md`), um wrapper fino sobre o `proton-drive` CLI
+oficial — todo login, autenticação e acesso à API da Proton passam por ele (`protoncli.rs`
+resolve `proton-drive` via `$PATH`, nunca reimplementa o protocolo). Qualquer formato de Flatpak
+precisa alcançar esse binário, inclusive um `GUI only` (login/status já dependem dele).
+
+Levantamento sobre o próprio `proton-drive` CLI:
+- É um binário de terceiro, não vendorizado neste repo. Upstream é TypeScript empacotado com
+  Bun; a AUR tem três variantes — `proton-drive-cli-bin` (binário precompilado, **licença
+  proprietária**, ~100MB self-contained), `proton-drive-cli` (builda da fonte, MIT, mas mantém
+  `bun` como dependência de runtime pra ficar em ~12MB), `proton-drive-cli-git`.
+- Não existe Flatpak, AppImage ou Snap oficial da Proton pra ele — só os binários Linux
+  avulsos (x64/arm64) e os pacotes da comunidade.
+- Ele mesmo guarda a sessão de login via `libsecret`/Secret Service — ou seja, mesmo se
+  conseguíssemos invocá-lo de dentro de um sandbox, ele teria sua própria necessidade de
+  `--talk-name=org.freedesktop.secrets`, independente da nossa.
+
+Dentro de um sandbox Flatpak, as únicas duas formas de alcançar esse binário são:
+1. **`flatpak-spawn --host`** (`--talk-name=org.freedesktop.Flatpak`): documentado pelo próprio
+   Flatpak como acesso que permite rodar qualquer comando no host com os privilégios do
+   usuário — na prática, anula o sandbox por completo. Historicamente tratado como bandeira
+   vermelha em revisão do Flathub (casos documentados de apps como o Atom sendo citados como
+   exemplo do que não fazer); viável só pra distribuição fora do Flathub (repo próprio, `.flatpak`
+   direto).
+2. **Embutir o binário no manifest**: barrado pela licença proprietária da variante `-bin`; a
+   variante MIT exige trazer o runtime `bun` inteiro pro sandbox (viola o princípio de "CLI
+   dependency-light" do projeto) e, mesmo assim, não reduz nenhum dos acessos amplos abaixo —
+   o binário embutido ainda precisaria do mesmo filesystem/keyring que o processo seria capaz
+   de acessar de qualquer forma.
+
+### Outros achados (relevantes se isso for revisitado no futuro)
+
+- **Filesystem (sync de pastas arbitrárias)**: o Document Portal (FUSE por arquivo, escolhido via
+  `FileChooser`) não serve pra um daemon que faz `inotify` + leitura/escrita direta e contínua.
+  O padrão real usado por apps comparáveis (ex.: Dropbox Flatpak) é a permissão estática
+  `--filesystem=home`, que a própria documentação do Flatpak orienta a evitar quando possível —
+  aceitável como precedente, mas não elimina o bloqueador do CLI acima.
+- **Tray (ícone na bandeja)**: viável em princípio via StatusNotifierItem
+  (`--talk-name=org.kde.StatusNotifierWatcher`), mas crates como a usada aqui (`tray_icon`,
+  mesma família do `ksni`) historicamente tentam registrar um nome `org.kde.StatusNotifierItem-
+  $PID-$ID` — dentro do sandbox o PID costuma colidir (sempre baixo, isolado no próprio pid
+  namespace), então precisaria registrar pelo nome único da conexão D-Bus (é o que Electron/Qt
+  já fazem hoje) em vez do nome baseado em PID.
+- **Keyring**: a sessão de login do `proton-drive` CLI via `libsecret` teria que passar pelo
+  Secret Service (`--talk-name=org.freedesktop.secrets`) — há relatos reais de persistência
+  quebrada (secret não sobrevive a um restart do app) mesmo com a permissão concedida.
+- **Background + autostart**: o mecanismo correto dentro do sandbox é o portal
+  `org.freedesktop.portal.Background` (`RequestBackground`, com a opção `autostart`) — não dá
+  pra simplesmente escrever em `~/.config/autostart/*.desktop` como o `set_autostart()` atual
+  faz (`src/bin/gui.rs`), isso exigiria reescrever essa função pra chamar o portal. Há relatos
+  de bugs reais de autostart via portal não disparando mesmo após retornar sucesso, e um CVE
+  antigo (CVE-2024-32462) de sandbox escape via esse mesmo portal (corrigido em
+  xdg-desktop-portal ≥ 1.18.4).
 
 ### Critério de aceite
-Documento de decisão: Flatpak será `GUI only` ou `GUI + sync daemon`. Bloqueia M7-001 (Flatpak
-em `M7-distribution.md`) até esta decisão existir.
+- [x] Filesystem permissions investigado.
+- [x] Portals (FileChooser/Document, Background, Secret) investigados.
+- [x] Background services / autostart investigado.
+- [x] Tray investigado.
+- [x] Keyring investigado.
+- [x] Acesso ao `proton-drive` CLI de dentro do sandbox investigado — **é o bloqueador real**.
+- [x] Documento de decisão publicado (esta seção): **Flatpak não é viável hoje**, por uma
+      dependência externa fora do nosso controle. M7-001 (`M7-distribution.md`) permanece
+      bloqueado indefinidamente; reabrir só se a Proton passar a distribuir o CLI de forma
+      compatível com sandbox (Flatpak/AppImage oficial próprio, ou variante MIT sem a
+      dependência de runtime do `bun`).

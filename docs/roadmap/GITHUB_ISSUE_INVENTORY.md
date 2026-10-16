@@ -25,7 +25,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M3-002 | Arch package | M3 | `area:packaging` `area:distribution` | 🔶 |
 | M3-003 | Pacote Debian | M3 | `area:packaging` `area:distribution` | ✅ |
 | M3-004 | Pacote RPM | M3 | `area:packaging` `area:distribution` | ✅ |
-| M3-005 | Pesquisa de viabilidade Flatpak | M3 | `type:research` `area:distribution` `priority:high` | ⬜ |
+| M3-005 | Pesquisa de viabilidade Flatpak | M3 | `type:research` `area:distribution` `priority:high` | ✅ (decisão: não viável hoje — bloqueio no `proton-drive` CLI, não no nosso código) |
 | M4-001 | Benchmark framework | M4 | `type:test` `area:performance` | ⬜ |
 | M4-002 | Transfer queue | M4 | `type:feature` `area:performance` | ✅ (essência) |
 | M4-003 | Parallel transfers | M4 | `type:feature` `area:performance` | ✅ (essência) |
@@ -36,7 +36,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M5-003 | File status indicators | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-004 | File manager integration | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-005 | Onboarding, tray, notificações | M5 | `type:feature` `area:gui` | ⬜ |
-| M7-001 | Flatpak | M7 | `type:feature` `area:distribution` | 🔒 (bloqueado por M3-005) |
+| M7-001 | Flatpak | M7 | `type:feature` `area:distribution` | 🔒 (bloqueado indefinidamente — ver decisão em M3-005) |
 | M7-002 | Instalador universal (.sh) | M7 | `type:feature` `area:distribution` | ⬜ |
 | M7-003 | `doctor` expandido | M7 | `type:feature` `area:packaging` | 🔶 |
 | M7-004 | Publicação real na AUR | M7 | `area:distribution` | 🔒 (bloqueado externamente) |
