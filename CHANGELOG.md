@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Fixed
+- The published `.deb`/`.rpm` were built against a newer glibc than intended (M3-003/M3-004): `ubuntu-latest` (glibc 2.39) made them fail to install on Ubuntu 22.04 LTS, Debian 12, and the entire RHEL 9 family (Rocky Linux 9, AlmaLinux 9), all still actively supported. `release.yml` now builds the shipped binaries inside a RockyLinux 9 container (glibc 2.34, the lowest of our supported targets) and packages the `.rpm` there too; the `.deb` is still packaged on Ubuntu 22.04 (needs `dpkg-shlibdeps`, which only exists on Debian/Ubuntu) but against that lower-glibc binary. Verified in Docker: clean install on Ubuntu 22.04/24.04, Debian 12/13, Fedora, and Rocky Linux 9.
+- A related `.rpm`-only bug found while fixing the above: `cargo-generate-rpm` silently produces an unconditionally uninstallable package (`Requires: libc.so.6(GLIBC_2.18)[WEAK](64bit)` - a literal `[WEAK]` suffix no real package ever provides) unless the `rpm-build` package is present in the build environment. `release.yml` now installs it explicitly.
+
 ## [0.4.3] - 2026-10-16
 
 ### Added
