@@ -22,6 +22,15 @@ download_flags = ["--file-conflict-strategy", "remove", "--folder-conflict-strat
 # hasn't finished after this many seconds, instead of blocking forever. Bump
 # this if you regularly transfer very large files over a slow connection.
 # cli_timeout_secs = 1800
+# A file whose upload/download fails is retried with exponential backoff
+# (doubling from retry_base_delay_secs, capped at retry_max_delay_secs) plus
+# jitter, instead of being hammered again on the very next run - useful under
+# a Proton API rate limit, where many files failing together would otherwise
+# all retry in lockstep. Growth plateaus after retry_max_attempts failures;
+# it keeps retrying at that capped delay indefinitely rather than giving up.
+# retry_base_delay_secs = 30
+# retry_max_delay_secs = 1800
+# retry_max_attempts = 6
 # Optional: force where the CLI stores your session credentials.
 # One of "keychain", "pass", "unsafe_file". Omit to use the CLI default.
 # credentials_store = "keychain"

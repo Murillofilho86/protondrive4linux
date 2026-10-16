@@ -29,7 +29,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M4-001 | Benchmark framework | M4 | `type:test` `area:performance` | ⬜ |
 | M4-002 | Transfer queue | M4 | `type:feature` `area:performance` | ✅ (essência) |
 | M4-003 | Parallel transfers | M4 | `type:feature` `area:performance` | ✅ (essência) |
-| M4-004 | Retry/backoff exponencial | M4 | `type:feature` `area:performance` | ⬜ |
+| M4-004 | Retry/backoff exponencial | M4 | `type:feature` `area:performance` | ✅ |
 | M4-005 | Bandwidth limits | M4 | `type:feature` `area:performance` | ⬜ |
 | M5-001 | Sistema de temas | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-002 | Temas customizados | M5 | `type:feature` `area:gui` | ⬜ (bloqueado por M5-001) |

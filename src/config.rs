@@ -67,6 +67,19 @@ pub struct Config {
     /// itself) with no way to recover short of killing it by hand. Generous
     /// by default so a legitimately large/slow transfer isn't cut off.
     pub cli_timeout_secs: u64,
+    /// Base delay before retrying a file whose transfer failed; doubles on
+    /// each consecutive failure for that same file (M4-004). Jitter (derived
+    /// from the path, so it's stable per path but differs between paths) is
+    /// mixed in so many files failing together - e.g. under a Proton API
+    /// rate limit - don't all retry in lockstep.
+    pub retry_base_delay_secs: u64,
+    /// Ceiling for the exponential backoff delay above.
+    pub retry_max_delay_secs: u64,
+    /// Consecutive-failure count at which the backoff stops escalating. It
+    /// keeps retrying at the plateaued delay indefinitely after that rather
+    /// than giving up for good - a transient problem (rate limit, outage) is
+    /// expected to eventually clear.
+    pub retry_max_attempts: u32,
     pub remote_root: String,
     pub propagate_deletes: bool,
     /// Start the watch daemon on launch (the GUI's global "Auto sync").
@@ -147,6 +160,9 @@ struct RawCli {
     scan_threads: Option<u64>,
     download_threads: Option<u64>,
     cli_timeout_secs: Option<u64>,
+    retry_base_delay_secs: Option<u64>,
+    retry_max_delay_secs: Option<u64>,
+    retry_max_attempts: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -394,6 +410,9 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         scan_threads: cli.scan_threads.map(|n| n as usize).unwrap_or(0),
         download_threads: cli.download_threads.map(|n| n as usize).unwrap_or(0),
         cli_timeout_secs: cli.cli_timeout_secs.unwrap_or(1800),
+        retry_base_delay_secs: cli.retry_base_delay_secs.unwrap_or(30),
+        retry_max_delay_secs: cli.retry_max_delay_secs.unwrap_or(1800),
+        retry_max_attempts: cli.retry_max_attempts.unwrap_or(6),
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
         auto_sync: opts.auto_sync.unwrap_or(false),
@@ -526,6 +545,9 @@ struct OutCli {
     scan_threads: usize,
     download_threads: usize,
     cli_timeout_secs: u64,
+    retry_base_delay_secs: u64,
+    retry_max_delay_secs: u64,
+    retry_max_attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials_store: Option<String>,
 }
@@ -606,6 +628,9 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             scan_threads: cfg.scan_threads,
             download_threads: cfg.download_threads,
             cli_timeout_secs: cfg.cli_timeout_secs,
+            retry_base_delay_secs: cfg.retry_base_delay_secs,
+            retry_max_delay_secs: cfg.retry_max_delay_secs,
+            retry_max_attempts: cfg.retry_max_attempts,
             credentials_store: cfg.credentials_store.clone(),
         },
         options: OutOptions {

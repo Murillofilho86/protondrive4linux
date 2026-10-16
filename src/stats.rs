@@ -107,6 +107,13 @@ impl Stats {
              CREATE TABLE IF NOT EXISTS pair_state (
                  pair        TEXT PRIMARY KEY,
                  last_synced INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS retry_state (
+                 pair     TEXT    NOT NULL,
+                 rel      TEXT    NOT NULL,
+                 attempts INTEGER NOT NULL,
+                 next_at  INTEGER NOT NULL,
+                 PRIMARY KEY (pair, rel)
              );",
         )
         .context("initialising stats schema")?;
@@ -141,7 +148,8 @@ impl Stats {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "CREATE TABLE events (pair TEXT NOT NULL, folder TEXT NOT NULL, ts INTEGER NOT NULL);
-             CREATE TABLE ops (pair TEXT NOT NULL, action TEXT NOT NULL, path TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL, error TEXT);",
+             CREATE TABLE ops (pair TEXT NOT NULL, action TEXT NOT NULL, path TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL, error TEXT);
+             CREATE TABLE retry_state (pair TEXT NOT NULL, rel TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, PRIMARY KEY (pair, rel));",
         )?;
         Ok(Stats {
             conn: Mutex::new(conn),
@@ -356,6 +364,58 @@ impl Stats {
         Ok(())
     }
 
+    /// Per-file retry backoff state for `pair` (rel -> (consecutive failures,
+    /// epoch seconds it's next eligible to be retried)). A path with no row
+    /// has never failed, or already recovered (M4-004).
+    pub fn retry_state(&self, pair: &str) -> Result<HashMap<String, (u32, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT rel, attempts, next_at FROM retry_state WHERE pair = ?1")?;
+        let rows = stmt.query_map(params![pair], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)?),
+            ))
+        })?;
+        let mut m = HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            m.insert(k, v);
+        }
+        Ok(m)
+    }
+
+    /// Apply one run's retry outcomes: clear the backoff row for every path
+    /// that succeeded this run (a no-op if it never had one), and upsert the
+    /// new `(attempts, next_at)` for every path that failed again.
+    pub fn apply_retry_updates(
+        &self,
+        pair: &str,
+        upserts: &[(String, u32, i64)],
+        clears: &[String],
+    ) -> Result<()> {
+        if upserts.is_empty() && clears.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO retry_state(pair, rel, attempts, next_at) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(pair, rel) DO UPDATE SET attempts=?3, next_at=?4",
+            )?;
+            for (rel, attempts, next_at) in upserts {
+                ins.execute(params![pair, rel, *attempts as i64, next_at])?;
+            }
+            let mut del = tx.prepare("DELETE FROM retry_state WHERE pair = ?1 AND rel = ?2")?;
+            for rel in clears {
+                del.execute(params![pair, rel])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Whether `pair` has any baseline rows (i.e. it has synced before).
     pub fn has_baseline(&self, pair: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
@@ -479,6 +539,44 @@ mod tests {
         // outside the window -> nothing
         let old = s.hot_folders("p", 10, 1, 1_000_000).unwrap();
         assert!(old.is_empty());
+    }
+
+    #[test]
+    fn retry_state_round_trips_and_clears() {
+        let s = Stats::memory().unwrap();
+        assert!(s.retry_state("p").unwrap().is_empty());
+
+        s.apply_retry_updates(
+            "p",
+            &[("a.txt".into(), 1, 100), ("b.txt".into(), 2, 200)],
+            &[],
+        )
+        .unwrap();
+        let state = s.retry_state("p").unwrap();
+        assert_eq!(state.get("a.txt"), Some(&(1, 100)));
+        assert_eq!(state.get("b.txt"), Some(&(2, 200)));
+
+        // A later failure for the same path overwrites, not accumulates.
+        s.apply_retry_updates("p", &[("a.txt".into(), 2, 150)], &[])
+            .unwrap();
+        assert_eq!(s.retry_state("p").unwrap().get("a.txt"), Some(&(2, 150)));
+
+        // Clearing (a success) removes the row entirely.
+        s.apply_retry_updates("p", &[], &["a.txt".into()]).unwrap();
+        let state = s.retry_state("p").unwrap();
+        assert!(!state.contains_key("a.txt"));
+        assert!(state.contains_key("b.txt"), "unrelated row must survive");
+    }
+
+    #[test]
+    fn retry_state_is_isolated_per_pair() {
+        let s = Stats::memory().unwrap();
+        s.apply_retry_updates("p1", &[("a.txt".into(), 1, 100)], &[])
+            .unwrap();
+        s.apply_retry_updates("p2", &[("a.txt".into(), 5, 999)], &[])
+            .unwrap();
+        assert_eq!(s.retry_state("p1").unwrap().get("a.txt"), Some(&(1, 100)));
+        assert_eq!(s.retry_state("p2").unwrap().get("a.txt"), Some(&(5, 999)));
     }
 
     #[test]
