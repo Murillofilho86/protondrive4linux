@@ -18,7 +18,9 @@ use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontFamily, FontId, Rect, RichText, Sense, Stroke,
 };
 
-use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
+use neutronsync::config::{
+    self, Config, ConflictPolicy, LocalDelete, Pair, ThemePref, UpdateChannel,
+};
 use neutronsync::events::ConflictResolution;
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::{ProtonCli, Remote};
@@ -28,29 +30,118 @@ use neutronsync::service::{
 use neutronsync::stats::Stats;
 use neutronsync::updater::{self, UpdateInfo};
 
-// --- palette (reference/gui/palette/palette.md) -----------------------------
-// Derived from assets/logo.png's actual pixel colors (sampled, not eyeballed)
-// to match the app icon's visual identity: a deep indigo-violet base, a
-// vivid violet-purple accent, and the icon's bright green for success states.
-const NAV_BG: Color32 = Color32::from_rgb(0x14, 0x10, 0x22);
-const PANEL: Color32 = Color32::from_rgb(0x1B, 0x16, 0x2A);
-const PANEL2: Color32 = Color32::from_rgb(0x22, 0x1C, 0x34);
-const SEL: Color32 = Color32::from_rgb(0x2A, 0x20, 0x3E);
-const TEXT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-const DIM: Color32 = Color32::from_rgb(0x8E, 0x8B, 0x9A);
-const DIM2: Color32 = Color32::from_rgb(0x6C, 0x6A, 0x7A);
-const ACCENT: Color32 = Color32::from_rgb(0x64, 0x28, 0xFA);
-const ACCENT_HI: Color32 = Color32::from_rgb(0x7B, 0x48, 0xFB);
-const ACCENT_LO: Color32 = Color32::from_rgb(0x50, 0x20, 0xC8);
-const OK: Color32 = Color32::from_rgb(0x52, 0xE6, 0x5C);
-const DANGER: Color32 = Color32::from_rgb(0xE0, 0x50, 0x64);
-const WARN: Color32 = Color32::from_rgb(0xD8, 0xA0, 0x50);
+// --- palette ----------------------------------------------------------------
+// Every color the UI draws with is a semantic token of a `Palette` (M5-001),
+// read through `th()`, so the whole GUI can switch between light and dark.
+// The dark palette is derived from assets/logo.png's actual pixel colors
+// (sampled, not eyeballed) to match the app icon's visual identity: a deep
+// indigo-violet base, a vivid violet-purple accent, and the icon's bright
+// green for success states. The light one keeps the same hues on a pale
+// lavender base, with the status colors darkened until they read on it.
+#[derive(Clone, Copy)]
+struct Palette {
+    dark: bool,
+    /// Sidebar and the deepest surface.
+    nav_bg: Color32,
+    /// Page background.
+    panel: Color32,
+    /// Cards and raised surfaces.
+    panel2: Color32,
+    /// Selected / hovered rows and widgets.
+    sel: Color32,
+    /// Primary text.
+    text: Color32,
+    /// Secondary and tertiary text.
+    dim: Color32,
+    dim2: Color32,
+    accent: Color32,
+    accent_hi: Color32,
+    accent_lo: Color32,
+    /// Text and icons drawn ON an accent-colored surface (primary buttons).
+    on_accent: Color32,
+    ok: Color32,
+    danger: Color32,
+    warn: Color32,
+    /// Hairline borders and hover washes: translucent, so they work on any surface.
+    line: Color32,
+    hover: Color32,
+}
+
+fn dark_palette() -> Palette {
+    Palette {
+        dark: true,
+        nav_bg: Color32::from_rgb(0x14, 0x10, 0x22),
+        panel: Color32::from_rgb(0x1B, 0x16, 0x2A),
+        panel2: Color32::from_rgb(0x22, 0x1C, 0x34),
+        sel: Color32::from_rgb(0x2A, 0x20, 0x3E),
+        text: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        dim: Color32::from_rgb(0x8E, 0x8B, 0x9A),
+        dim2: Color32::from_rgb(0x6C, 0x6A, 0x7A),
+        accent: Color32::from_rgb(0x64, 0x28, 0xFA),
+        accent_hi: Color32::from_rgb(0x7B, 0x48, 0xFB),
+        accent_lo: Color32::from_rgb(0x50, 0x20, 0xC8),
+        on_accent: Color32::WHITE,
+        ok: Color32::from_rgb(0x52, 0xE6, 0x5C),
+        danger: Color32::from_rgb(0xE0, 0x50, 0x64),
+        warn: Color32::from_rgb(0xD8, 0xA0, 0x50),
+        line: Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+        hover: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    }
+}
+
+fn light_palette() -> Palette {
+    Palette {
+        dark: false,
+        nav_bg: Color32::from_rgb(0xEC, 0xE8, 0xF7),
+        panel: Color32::from_rgb(0xF6, 0xF4, 0xFC),
+        panel2: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        sel: Color32::from_rgb(0xE1, 0xDA, 0xF5),
+        text: Color32::from_rgb(0x1B, 0x16, 0x2A),
+        dim: Color32::from_rgb(0x5A, 0x56, 0x6E),
+        dim2: Color32::from_rgb(0x76, 0x72, 0x8A),
+        accent: Color32::from_rgb(0x64, 0x28, 0xFA),
+        accent_hi: Color32::from_rgb(0x7B, 0x48, 0xFB),
+        accent_lo: Color32::from_rgb(0x50, 0x20, 0xC8),
+        on_accent: Color32::WHITE,
+        ok: Color32::from_rgb(0x1A, 0x8A, 0x35),
+        danger: Color32::from_rgb(0xC4, 0x2B, 0x45),
+        warn: Color32::from_rgb(0x9A, 0x62, 0x00),
+        line: Color32::from_rgba_unmultiplied(0, 0, 0, 28),
+        hover: Color32::from_rgba_unmultiplied(0, 0, 0, 16),
+    }
+}
+
+thread_local! {
+    /// The palette for the frame being drawn. Set once at the top of each
+    /// frame (from the theme in effect) and read everywhere through `th()`;
+    /// the UI is drawn on one thread, so a thread-local is all it takes.
+    static ACTIVE: std::cell::Cell<Palette> = std::cell::Cell::new(dark_palette());
+}
+
+fn th() -> Palette {
+    ACTIVE.with(|c| c.get())
+}
+
+fn set_active_palette(dark: bool) {
+    ACTIVE.with(|c| {
+        c.set(if dark {
+            dark_palette()
+        } else {
+            light_palette()
+        })
+    });
+}
+
+/// The amber conflict-count pill is the same in both themes (the light
+/// palette's `warn` is too dark to carry dark ink): a fixed fill and ink.
+const BADGE_FILL: Color32 = Color32::from_rgb(0xD8, 0xA0, 0x50);
+const BADGE_INK: Color32 = Color32::from_rgb(0x14, 0x10, 0x22);
 
 fn line_col() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+    th().line
 }
 fn hover_col() -> Color32 {
-    Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+    th().hover
 }
 
 fn ff_bold() -> FontFamily {
@@ -132,7 +223,7 @@ fn draw_logo(painter: &egui::Painter, rect: Rect, tex: Option<&egui::TextureHand
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         painter.image(tex.id(), fitted, uv, Color32::WHITE);
     } else {
-        painter.circle_filled(rect.center(), rect.width() * 0.5, ACCENT);
+        painter.circle_filled(rect.center(), rect.width() * 0.5, th().accent);
     }
 }
 
@@ -239,6 +330,104 @@ mod downscale_tests {
     }
 }
 
+#[cfg(test)]
+mod palette_tests {
+    use super::Color32;
+    use super::{dark_palette, light_palette, Palette};
+
+    /// WCAG relative luminance of an sRGB color.
+    fn luminance(c: Color32) -> f64 {
+        let lin = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+
+    /// WCAG contrast ratio between two opaque colors.
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    fn surfaces(p: &Palette) -> [(&'static str, Color32); 4] {
+        [
+            ("nav_bg", p.nav_bg),
+            ("panel", p.panel),
+            ("panel2", p.panel2),
+            ("sel", p.sel),
+        ]
+    }
+
+    /// Every `(foreground, minimum ratio)` must hold on the first `n` surfaces
+    /// (nav_bg, panel, panel2, sel - in that order).
+    fn check(p: &Palette, name: &str, n: usize, fgs: &[(&str, Color32, f64)]) {
+        for (sname, surface) in surfaces(p).into_iter().take(n) {
+            for (fname, fg, min) in fgs {
+                let got = contrast(*fg, surface);
+                assert!(
+                    got >= *min,
+                    "{name}: {fname} on {sname} is {got:.2}:1, needs >= {min}:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_palettes_keep_text_readable_on_every_surface() {
+        for (name, p) in [("dark", dark_palette()), ("light", light_palette())] {
+            // Everything that can sit on a selected/hovered row too.
+            check(
+                &p,
+                name,
+                4,
+                &[
+                    ("text", p.text, 7.0),
+                    ("dim", p.dim, 4.5),
+                    // status colors are drawn as small text and icons
+                    ("ok", p.ok, 3.0),
+                    ("danger", p.danger, 3.0),
+                    ("warn", p.warn, 3.0),
+                ],
+            );
+            // Tertiary captions live on the sidebar, page and cards, never on a
+            // selected row (the app's own dark palette sits near 3:1 there).
+            check(&p, name, 3, &[("dim2", p.dim2, 3.0)]);
+        }
+    }
+
+    #[test]
+    fn text_on_an_accent_surface_is_readable_in_both_themes() {
+        for (name, p) in [("dark", dark_palette()), ("light", light_palette())] {
+            for (aname, accent) in [
+                ("accent", p.accent),
+                ("accent_hi", p.accent_hi),
+                ("accent_lo", p.accent_lo),
+            ] {
+                let got = contrast(p.on_accent, accent);
+                assert!(
+                    got >= 4.5,
+                    "{name}: on_accent over {aname} is {got:.2}:1, needs >= 4.5:1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_palettes_really_differ_and_are_flagged_correctly() {
+        let (d, l) = (dark_palette(), light_palette());
+        assert!(d.dark && !l.dark);
+        assert!(luminance(d.panel) < 0.05, "dark page background is dark");
+        assert!(luminance(l.panel) > 0.8, "light page background is light");
+        assert!(luminance(d.text) > luminance(d.panel));
+        assert!(luminance(l.text) < luminance(l.panel));
+    }
+}
+
 // ============================================================================
 // small helpers
 // ============================================================================
@@ -266,7 +455,7 @@ fn rel_time(ts: i64) -> String {
 
 fn galley_w(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
     ui.painter()
-        .layout_no_wrap(text.to_owned(), font, TEXT)
+        .layout_no_wrap(text.to_owned(), font, th().text)
         .size()
         .x
 }
@@ -292,7 +481,7 @@ fn elide_front(ui: &egui::Ui, text: &str, font: FontId, max_w: f32) -> String {
 /// A raised surface (card / banner) with a soft drop shadow.
 fn card_frame() -> egui::Frame {
     egui::Frame::default()
-        .fill(PANEL2)
+        .fill(th().panel2)
         .stroke(Stroke::new(1.0, line_col()))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(16))
@@ -350,30 +539,30 @@ fn button(
     let (bg, fg) = match kind {
         Btn::Primary => {
             let base = if down {
-                ACCENT_LO
+                th().accent_lo
             } else {
-                mix(ACCENT, ACCENT_HI, hov)
+                mix(th().accent, th().accent_hi, hov)
             };
-            (base, TEXT)
+            (base, th().on_accent)
         }
         Btn::Secondary => {
-            let base = mix(PANEL2, mix(PANEL2, TEXT, 0.10), hov);
-            (if down { ACCENT_LO } else { base }, TEXT)
+            let base = mix(th().panel2, mix(th().panel2, th().text, 0.10), hov);
+            if down {
+                (th().accent_lo, th().on_accent)
+            } else {
+                (base, th().text)
+            }
         }
         Btn::Ghost => (
             mix(Color32::TRANSPARENT, hover_col(), hov),
-            if enabled { TEXT } else { DIM2 },
+            if enabled { th().text } else { th().dim2 },
         ),
         Btn::Danger => (
-            mix(
-                Color32::TRANSPARENT,
-                Color32::from_rgba_unmultiplied(224, 80, 100, 40),
-                hov,
-            ),
-            DANGER,
+            mix(Color32::TRANSPARENT, th().danger.gamma_multiply(0.16), hov),
+            th().danger,
         ),
     };
-    let fg = if enabled { fg } else { DIM2 };
+    let fg = if enabled { fg } else { th().dim2 };
     if bg.a() > 0 {
         painter.rect_filled(rect, 8.0, bg);
     }
@@ -402,11 +591,17 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, on, 0.16);
     let painter = ui.painter();
-    let track = mix(PANEL2, ACCENT, t);
+    // Off track is `sel`, not the card color: switches sit on cards, where a
+    // card-colored track would vanish (it did in the light theme).
+    let track = mix(th().sel, th().accent, t);
     painter.rect_filled(rect, h / 2.0, track);
     let kr = h / 2.0 - 3.0;
     let cx = rect.left() + h / 2.0 + t * (w - h);
-    painter.circle_filled(pos2(cx, rect.center().y), kr, mix(DIM, TEXT, t));
+    painter.circle_filled(
+        pos2(cx, rect.center().y),
+        kr,
+        mix(th().dim, th().on_accent, t),
+    );
     resp.clicked()
 }
 
@@ -414,7 +609,7 @@ fn switch(ui: &mut egui::Ui, on: bool) -> bool {
 fn meter(ui: &mut egui::Ui, width: f32, frac: f32, col: Color32, id: egui::Id) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, PANEL2);
+    painter.rect_filled(rect, 3.0, th().panel2);
     let f = ui
         .ctx()
         .animate_value_with_time(id, frac.clamp(0.0, 1.0), 0.5);
@@ -698,6 +893,11 @@ struct App {
     conflict_count: usize,
     conflicts_polled: f64,
     show_resolved: bool,
+
+    // theme (M5-001): the desktop's light/dark preference, watched on a
+    // background thread, and which theme egui was last told to use.
+    system_theme: neutronsync::appearance::SystemTheme,
+    applied_dark: Option<bool>,
 }
 
 impl App {
@@ -756,6 +956,8 @@ impl App {
             conflict_count: 0,
             conflicts_polled: f64::NEG_INFINITY,
             show_resolved: false,
+            system_theme: neutronsync::appearance::SystemTheme::spawn(),
+            applied_dark: None,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
         // the daemon owns the watcher (only one watcher may hold the lock).
@@ -811,6 +1013,36 @@ impl App {
 
     fn auto_names(&self) -> Vec<String> {
         auto_names_of(&self.cfg)
+    }
+
+    /// Whether the dark theme is in effect: the user's choice, or - for
+    /// "System" - the desktop's, falling back to what egui itself can see and
+    /// finally to dark (the app's original look).
+    fn want_dark(&self, ctx: &egui::Context) -> bool {
+        match self.cfg.theme {
+            ThemePref::Dark => true,
+            ThemePref::Light => false,
+            ThemePref::System => self
+                .system_theme
+                .prefers_dark()
+                .or_else(|| ctx.system_theme().map(|t| t == egui::Theme::Dark))
+                .unwrap_or(true),
+        }
+    }
+
+    /// Point `th()` at this frame's palette and, when the theme changed, tell
+    /// egui to switch its own visuals to match.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let dark = self.want_dark(ctx);
+        set_active_palette(dark);
+        if self.applied_dark != Some(dark) {
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            self.applied_dark = Some(dark);
+        }
     }
 
     /// Re-read the conflict badge, and the list when the Conflicts page is up.
@@ -892,15 +1124,15 @@ impl App {
                 if self.excl_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Loading folders…").color(DIM));
+                        ui.label(RichText::new("Loading folders…").color(th().dim));
                     });
                 } else if let Some(e) = self.excl_error.clone() {
-                    ui.label(RichText::new(e).size(12.0).color(WARN));
+                    ui.label(RichText::new(e).size(12.0).color(th().warn));
                 } else if self.excl_entries.is_empty() {
                     ui.label(
                         RichText::new("This Proton folder has no subfolders to choose from.")
                             .size(12.0)
-                            .color(DIM),
+                            .color(th().dim),
                     );
                 } else {
                     ui.label(
@@ -909,7 +1141,7 @@ impl App {
                              alone — the Proton copy is never touched.",
                         )
                         .size(12.0)
-                        .color(DIM),
+                        .color(th().dim),
                     );
                     ui.add_space(8.0);
                     let entries = self.excl_entries.clone();
@@ -969,10 +1201,14 @@ impl App {
                 ui.label(
                     RichText::new("These folders will no longer sync:")
                         .size(13.0)
-                        .color(TEXT),
+                        .color(th().text),
                 );
                 for f in &folders {
-                    ui.label(RichText::new(format!("   • {f}")).size(12.0).color(DIM));
+                    ui.label(
+                        RichText::new(format!("   • {f}"))
+                            .size(12.0)
+                            .color(th().dim),
+                    );
                 }
                 ui.add_space(8.0);
                 ui.label(
@@ -981,7 +1217,7 @@ impl App {
                          stays untouched, and they re-download if you include them again.",
                     )
                     .size(12.0)
-                    .color(DIM),
+                    .color(th().dim),
                 );
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -1073,6 +1309,29 @@ impl App {
     }
 }
 
+/// egui's widget visuals for `p`: the stock dark or light base, with the
+/// palette's surfaces, text and accent laid over it.
+fn visuals_for(p: &Palette) -> egui::Visuals {
+    let mut visuals = if p.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = p.panel;
+    visuals.window_fill = p.panel;
+    visuals.window_stroke = Stroke::new(1.0, p.line);
+    visuals.extreme_bg_color = p.nav_bg;
+    visuals.override_text_color = Some(p.text);
+    visuals.selection.bg_fill = p.accent.gamma_multiply(0.5);
+    visuals.hyperlink_color = p.accent_hi;
+    visuals.widgets.inactive.bg_fill = p.panel2;
+    visuals.widgets.inactive.weak_bg_fill = p.panel2;
+    visuals.widgets.hovered.bg_fill = p.sel;
+    visuals.widgets.hovered.weak_bg_fill = p.sel;
+    visuals.widgets.active.bg_fill = p.sel;
+    visuals
+}
+
 fn install_theme(ctx: &egui::Context) {
     // fonts: Noto Sans as the proportional face + a bold family for headings.
     let mut fonts = egui::FontDefinitions::default();
@@ -1102,20 +1361,9 @@ fn install_theme(ctx: &egui::Context) {
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = PANEL;
-    visuals.window_fill = PANEL;
-    visuals.window_stroke = Stroke::new(1.0, line_col());
-    visuals.extreme_bg_color = NAV_BG;
-    visuals.override_text_color = Some(TEXT);
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.5);
-    visuals.hyperlink_color = ACCENT_HI;
-    visuals.widgets.inactive.bg_fill = PANEL2;
-    visuals.widgets.inactive.weak_bg_fill = PANEL2;
-    visuals.widgets.hovered.bg_fill = SEL;
-    visuals.widgets.hovered.weak_bg_fill = SEL;
-    visuals.widgets.active.bg_fill = SEL;
-    ctx.set_visuals(visuals);
+    // egui keeps a set of visuals per theme and picks by the theme in effect.
+    ctx.set_visuals_of(egui::Theme::Dark, visuals_for(&dark_palette()));
+    ctx.set_visuals_of(egui::Theme::Light, visuals_for(&light_palette()));
 
     ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = vec2(8.0, 8.0);
@@ -1127,7 +1375,7 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text)
             .font(FontId::new(26.0, ff_bold()))
-            .color(TEXT),
+            .color(th().text),
     );
 }
 
@@ -1135,6 +1383,7 @@ impl eframe::App for App {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let ctx = &ctx;
+        self.apply_theme(ctx);
         if self.logo_tex.is_none() {
             if let Ok(ic) =
                 eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png"))
@@ -1307,7 +1556,7 @@ impl App {
     fn nav_rail(&mut self, root_ui: &mut egui::Ui, snap: &AppState) {
         let logo = self.logo_tex.clone();
         let frame = egui::Frame::default()
-            .fill(NAV_BG)
+            .fill(th().nav_bg)
             .inner_margin(egui::Margin::same(10));
         egui::containers::Panel::left("nav")
             .exact_size(224.0)
@@ -1324,9 +1573,13 @@ impl App {
                         ui.label(
                             RichText::new("protondrive4linux")
                                 .font(FontId::new(13.5, ff_bold()))
-                                .color(TEXT),
+                                .color(th().text),
                         );
-                        ui.label(RichText::new("protondrive for linux").size(11.0).color(DIM));
+                        ui.label(
+                            RichText::new("protondrive for linux")
+                                .size(11.0)
+                                .color(th().dim),
+                        );
                     });
                 });
                 ui.add_space(16.0);
@@ -1362,12 +1615,12 @@ impl App {
                 painter.rect_filled(
                     Rect::from_min_size(pos2(x, cur_y), vec2(w, row_h)),
                     8.0,
-                    SEL,
+                    th().sel,
                 );
                 painter.rect_filled(
                     Rect::from_min_size(pos2(x, cur_y + 9.0), vec2(3.0, row_h - 18.0)),
                     2.0,
-                    ACCENT,
+                    th().accent,
                 );
 
                 // labels/icons on top
@@ -1386,8 +1639,12 @@ impl App {
                             mix(Color32::TRANSPARENT, hover_col(), hov),
                         );
                     }
-                    let col = if selected { TEXT } else { mix(DIM, TEXT, hov) };
-                    let icol = if selected { ACCENT } else { col };
+                    let col = if selected {
+                        th().text
+                    } else {
+                        mix(th().dim, th().text, hov)
+                    };
+                    let icol = if selected { th().accent } else { col };
                     let ir = Rect::from_center_size(
                         pos2(rect.left() + 24.0, rect.center().y),
                         vec2(18.0, 18.0),
@@ -1409,14 +1666,14 @@ impl App {
                     );
                     if *nav == Nav::Conflicts && self.conflict_count > 0 {
                         let c = pos2(rect.right() - 22.0, rect.center().y);
-                        ui.painter().circle_filled(c, 10.0, WARN);
+                        ui.painter().circle_filled(c, 10.0, BADGE_FILL);
                         let n = self.conflict_count;
                         ui.painter().text(
                             c,
                             Align2::CENTER_CENTER,
                             if n > 99 { "99+".into() } else { n.to_string() },
                             FontId::new(11.0, ff_bold()),
-                            NAV_BG,
+                            BADGE_INK,
                         );
                     }
                     if resp.clicked() {
@@ -1431,7 +1688,7 @@ impl App {
                 egui::containers::Panel::bottom("nav_foot")
                     .frame(
                         egui::Frame::default()
-                            .fill(NAV_BG)
+                            .fill(th().nav_bg)
                             .inner_margin(egui::Margin {
                                 left: 4,
                                 right: 4,
@@ -1459,20 +1716,20 @@ impl App {
         let last = snap.pairs.iter().filter_map(|p| p.last_synced).max();
         let any_err = snap.pairs.iter().any(|p| p.phase == Phase::Error);
         let (col, pulse, text) = if snap.busy {
-            (ACCENT, true, "Syncing…".to_string())
+            (th().accent, true, "Syncing…".to_string())
         } else if snap.watching {
-            (ACCENT, true, "Auto sync on".to_string())
+            (th().accent, true, "Auto sync on".to_string())
         } else if any_err {
-            (DANGER, false, "Sync error".to_string())
+            (th().danger, false, "Sync error".to_string())
         } else if let Some(ts) = last {
-            (OK, false, format!("Synced {}", rel_time(ts)))
+            (th().ok, false, format!("Synced {}", rel_time(ts)))
         } else {
-            (DIM, false, "Idle".to_string())
+            (th().dim, false, "Idle".to_string())
         };
         ui.horizontal(|ui| {
             status_dot(ui, col, pulse);
             ui.add_space(2.0);
-            ui.label(RichText::new(text).size(12.5).color(TEXT));
+            ui.label(RichText::new(text).size(12.5).color(th().text));
         });
     }
 
@@ -1497,7 +1754,7 @@ impl App {
             ui,
             |ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Auto sync").size(12.5).color(TEXT));
+                    ui.label(RichText::new("Auto sync").size(12.5).color(th().text));
                     let sub = if on && mode_daemon {
                         format!(
                             "On · tray is watching {n} folder{}",
@@ -1508,7 +1765,7 @@ impl App {
                     } else {
                         "Off · sync on demand".to_string()
                     };
-                    ui.label(RichText::new(sub).size(11.0).color(DIM));
+                    ui.label(RichText::new(sub).size(11.0).color(th().dim));
                 });
             },
             |ui| {
@@ -1602,14 +1859,14 @@ impl App {
             // A signed-out session is surfaced explicitly — everything else is
             // blocked on it, so it takes priority over scan/sync/idle states.
             (
-                DANGER,
+                th().danger,
                 Icon::Info,
                 "Signed out of Proton",
                 "Sign in on the Account tab to resume syncing".into(),
             )
         } else if active {
             (
-                ACCENT,
+                th().accent,
                 Icon::Sync,
                 if never_synced {
                     "Initializing…"
@@ -1623,7 +1880,7 @@ impl App {
         } else if retrying_total(snap) > 0 {
             let n = retrying_total(snap);
             (
-                WARN,
+                th().warn,
                 Icon::Info,
                 "Some files failed to sync",
                 format!(
@@ -1633,20 +1890,20 @@ impl App {
             )
         } else if watching {
             (
-                ACCENT,
+                th().accent,
                 Icon::Cloud,
                 "Auto sync on",
                 format!("Watching {} folder(s) for changes", self.auto_names().len()),
             )
         } else if snap.pairs.iter().any(|p| p.phase == Phase::Error) {
             (
-                DANGER,
+                th().danger,
                 Icon::Info,
                 "Last sync had errors",
                 "See the log below".into(),
             )
         } else {
-            (OK, Icon::Check, "Synced", last_synced_line(snap))
+            (th().ok, Icon::Check, "Synced", last_synced_line(snap))
         };
         activity_banner(ui, bcol, bicon, btitle, &bsub, busy);
 
@@ -1657,7 +1914,7 @@ impl App {
             ui.label(
                 RichText::new(format!("{} files in flight", snap.active.len()))
                     .font(FontId::new(11.0, ff_bold()))
-                    .color(ACCENT),
+                    .color(th().accent),
             );
             ui.add_space(4.0);
         }
@@ -1689,9 +1946,9 @@ impl App {
         if has_files {
             ui.scope(|ui| {
                 ui.set_max_width((ui.available_width() - 15.0).max(200.0));
-                activity_cols(ui, "FOLDER", DIM2, "WHEN", DIM2, false, |ui| {
+                activity_cols(ui, "FOLDER", th().dim2, "WHEN", th().dim2, false, |ui| {
                     ui.add_space(32.0);
-                    ui.label(RichText::new("NAME").size(11.0).color(DIM2));
+                    ui.label(RichText::new("NAME").size(11.0).color(th().dim2));
                 });
                 ui.add_space(4.0);
                 ui.separator();
@@ -1732,20 +1989,36 @@ impl App {
                         }
                         None => {
                             // a real error with no file attached
-                            activity_cols(ui, "", DIM2, &rel_time(item.ts), DIM2, false, |ui| {
-                                let (ir, _) =
-                                    ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-                                ui.painter()
-                                    .rect_filled(ir, 6.0, DANGER.gamma_multiply(0.16));
-                                draw_icon(ui.painter(), ir.shrink(5.0), Icon::Info, DANGER);
-                                ui.add_space(8.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&item.text).size(13.0).color(DANGER),
-                                    )
-                                    .truncate(),
-                                );
-                            });
+                            activity_cols(
+                                ui,
+                                "",
+                                th().dim2,
+                                &rel_time(item.ts),
+                                th().dim2,
+                                false,
+                                |ui| {
+                                    let (ir, _) =
+                                        ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                                    ui.painter().rect_filled(
+                                        ir,
+                                        6.0,
+                                        th().danger.gamma_multiply(0.16),
+                                    );
+                                    draw_icon(
+                                        ui.painter(),
+                                        ir.shrink(5.0),
+                                        Icon::Info,
+                                        th().danger,
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&item.text).size(13.0).color(th().danger),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
                             ui.add_space(4.0);
                         }
                     }
@@ -1779,7 +2052,7 @@ impl App {
             }
         });
 
-        ui.label(RichText::new("Each pair keeps a local folder and a Proton Drive folder in sync, both ways. Sync one on demand, or set it to Auto to keep it live while Auto sync is on.").size(13.0).color(DIM));
+        ui.label(RichText::new("Each pair keeps a local folder and a Proton Drive folder in sync, both ways. Sync one on demand, or set it to Auto to keep it live while Auto sync is on.").size(13.0).color(th().dim));
         ui.add_space(12.0);
 
         let mut remove: Option<usize> = None;
@@ -1807,8 +2080,8 @@ impl App {
                         ui.horizontal(|ui| {
                             let (ir, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                             ui.painter()
-                                .rect_filled(ir, 8.0, ACCENT.gamma_multiply(0.18));
-                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Folder, ACCENT);
+                                .rect_filled(ir, 8.0, th().accent.gamma_multiply(0.18));
+                            draw_icon(ui.painter(), ir.shrink(7.0), Icon::Folder, th().accent);
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 let name_before = self.cfg.pairs[i].name.clone();
@@ -1877,7 +2150,7 @@ impl App {
                                         sync_one = Some(self.cfg.pairs[i].name.clone());
                                     }
                                     ui.add_space(4.0);
-                                    ui.label(RichText::new("Auto").size(12.0).color(DIM));
+                                    ui.label(RichText::new("Auto").size(12.0).color(th().dim));
                                     if switch(ui, self.cfg.pairs[i].auto) {
                                         self.cfg.pairs[i].auto = !self.cfg.pairs[i].auto;
                                         changed = true;
@@ -1894,7 +2167,7 @@ impl App {
                                     ui,
                                     ui.available_width(),
                                     p.progress.fraction(),
-                                    ACCENT,
+                                    th().accent,
                                     egui::Id::new(("pm", i)),
                                 );
                             }
@@ -1912,7 +2185,7 @@ impl App {
                             );
                             ui.add_space(2.0);
                             let (ar, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                            draw_icon(ui.painter(), ar, Icon::Arrow, ACCENT);
+                            draw_icon(ui.painter(), ar, Icon::Arrow, th().accent);
                             ui.add_space(2.0);
                             chip(ui, Icon::Cloud, &self.cfg.pairs[i].remote.clone(), each);
                         });
@@ -2005,14 +2278,14 @@ impl App {
                              was done about each. Nothing is ever deleted to settle one.",
                         )
                         .size(12.5)
-                        .color(DIM),
+                        .color(th().dim),
                     )
                     .wrap(),
                 );
             },
             |ui| {
                 toggled = switch(ui, resolved_on);
-                ui.label(RichText::new("Show resolved").size(12.5).color(DIM));
+                ui.label(RichText::new("Show resolved").size(12.5).color(th().dim));
             },
         );
         if toggled {
@@ -2057,7 +2330,11 @@ impl App {
                                             egui::Label::new(
                                                 RichText::new(&c.rel)
                                                     .font(FontId::new(14.0, ff_bold()))
-                                                    .color(if c.dismissed { DIM } else { TEXT }),
+                                                    .color(if c.dismissed {
+                                                        th().dim
+                                                    } else {
+                                                        th().text
+                                                    }),
                                             )
                                             .truncate(),
                                         );
@@ -2065,7 +2342,7 @@ impl App {
                                             egui::Label::new(
                                                 RichText::new(conflict_explanation(c))
                                                     .size(12.0)
-                                                    .color(DIM),
+                                                    .color(th().dim),
                                             )
                                             .wrap(),
                                         );
@@ -2076,7 +2353,7 @@ impl App {
                                                 rel_time(c.ts)
                                             ))
                                             .size(11.5)
-                                            .color(DIM2),
+                                            .color(th().dim2),
                                         );
                                     });
                                 });
@@ -2132,6 +2409,17 @@ impl App {
             .show(ui, |ui| {
                 // leave a little room on the right so cards clear the scrollbar
                 ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+
+                settings_group(ui, "APPEARANCE", |ui| {
+                    if setting_row(
+                        ui,
+                        "Theme",
+                        "System follows your desktop's light or dark setting.",
+                        |ui| combo_theme(ui, &mut self.cfg.theme),
+                    ) {
+                        self.dirty = true;
+                    }
+                });
 
                 settings_group(ui, "GENERAL", |ui| {
                     let tray = self.cfg.run_in_tray;
@@ -2299,7 +2587,7 @@ impl App {
                     }
                 });
 
-                settings_group(ui, "DANGER ZONE", |ui| {
+                settings_group(ui, "th().danger ZONE", |ui| {
                     if setting_row(
                         ui,
                         "Reset protondrive4linux",
@@ -2320,13 +2608,13 @@ impl App {
         self.page_header(ui, "Account", |_ui, _app| {});
         let acc = &snap.account;
         let (col, label) = if !acc.checked {
-            (DIM, "Checking…")
+            (th().dim, "Checking…")
         } else if acc.signed_in {
-            (OK, "Signed in")
+            (th().ok, "Signed in")
         } else if acc.binary_found {
-            (DANGER, "Not signed in")
+            (th().danger, "Not signed in")
         } else {
-            (WARN, "proton-drive not found")
+            (th().warn, "proton-drive not found")
         };
         ui.horizontal(|ui| {
             status_dot(ui, col, false);
@@ -2334,12 +2622,12 @@ impl App {
             ui.label(
                 RichText::new(label)
                     .font(FontId::new(16.0, ff_bold()))
-                    .color(TEXT),
+                    .color(th().text),
             );
         });
         ui.add_space(10.0);
-        ui.label(RichText::new("proton-drive").color(DIM));
-        ui.label(RichText::new(&acc.version).size(12.5).color(DIM));
+        ui.label(RichText::new("proton-drive").color(th().dim));
+        ui.label(RichText::new(&acc.version).size(12.5).color(th().dim));
         ui.add_space(16.0);
         let waiting = self.login_poll_until.is_some();
         let checking = acc.checking || waiting;
@@ -2382,7 +2670,7 @@ impl App {
                     } else {
                         "Checking…"
                     })
-                    .color(DIM),
+                    .color(th().dim),
                 );
             }
         });
@@ -2393,32 +2681,32 @@ impl App {
         ui.label(
             RichText::new(format!("protondrive4linux {}", env!("CARGO_PKG_VERSION")))
                 .font(FontId::new(16.0, ff_bold()))
-                .color(TEXT),
+                .color(th().text),
         );
         ui.add_space(6.0);
         ui.label(
             RichText::new(
                 "Bidirectional Proton Drive folder sync, built on the official proton-drive CLI.",
             )
-            .color(DIM),
+            .color(th().dim),
         );
         ui.add_space(12.0);
         ui.label(
             RichText::new(format!("Config   {}", self.config_path.display()))
                 .size(12.0)
-                .color(DIM2),
+                .color(th().dim2),
         );
         ui.label(
             RichText::new(format!("State    {}", self.cfg.state_dir.display()))
                 .size(12.0)
-                .color(DIM2),
+                .color(th().dim2),
         );
         if !self.config_loaded {
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Config not yet saved — add folders and Save.")
                     .size(12.0)
-                    .color(WARN),
+                    .color(th().warn),
             );
         }
 
@@ -2426,7 +2714,7 @@ impl App {
         ui.label(
             RichText::new("HOW IT WORKS")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(th().accent),
         );
         ui.add_space(8.0);
         ui.label(
@@ -2438,7 +2726,7 @@ impl App {
                  keyring, and all encryption and decryption is done by Proton's own software.",
             )
             .size(12.5)
-            .color(DIM),
+            .color(th().dim),
         );
         ui.add_space(6.0);
         ui.label(
@@ -2447,14 +2735,14 @@ impl App {
                  \"Proton Drive\" are trademarks of Proton AG.",
             )
             .size(11.5)
-            .color(DIM2),
+            .color(th().dim2),
         );
 
         ui.add_space(16.0);
         ui.label(
             RichText::new("DETECTING CHANGES")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(th().accent),
         );
         ui.add_space(8.0);
         ui.label(
@@ -2470,14 +2758,14 @@ impl App {
                  therefore appear on the next pass, not instantly.",
             )
             .size(12.5)
-            .color(DIM),
+            .color(th().dim),
         );
 
         ui.add_space(20.0);
         ui.label(
             RichText::new("UPDATES")
                 .font(FontId::new(11.0, ff_bold()))
-                .color(ACCENT),
+                .color(th().accent),
         );
         ui.add_space(8.0);
         let channel = self.cfg.update_channel;
@@ -2501,11 +2789,11 @@ impl App {
                     ui.label(
                         RichText::new(format!("You're on {}.", updater::current_version()))
                             .size(12.0)
-                            .color(DIM),
+                            .color(th().dim),
                     );
                 }
                 UpdateState::Checking => {
-                    ui.label(RichText::new("Checking…").size(12.0).color(DIM));
+                    ui.label(RichText::new("Checking…").size(12.0).color(th().dim));
                 }
                 UpdateState::Done(Ok(info)) if info.newer => {
                     ui.label(
@@ -2514,21 +2802,21 @@ impl App {
                             info.latest, info.current
                         ))
                         .size(12.0)
-                        .color(ACCENT),
+                        .color(th().accent),
                     );
                 }
                 UpdateState::Done(Ok(info)) => {
                     ui.label(
                         RichText::new(format!("Up to date ({}).", info.current))
                             .size(12.0)
-                            .color(DIM),
+                            .color(th().dim),
                     );
                 }
                 UpdateState::Done(Err(e)) => {
                     ui.label(
                         RichText::new(format!("Couldn't check: {e}"))
                             .size(12.0)
-                            .color(WARN),
+                            .color(th().warn),
                     );
                 }
                 UpdateState::Downloading { done, total } => {
@@ -2542,38 +2830,38 @@ impl App {
                     } else {
                         format!("Downloading… {}", human_bytes(*done))
                     };
-                    ui.label(RichText::new(text).size(12.0).color(ACCENT));
+                    ui.label(RichText::new(text).size(12.0).color(th().accent));
                 }
                 UpdateState::Verifying => {
                     ui.label(
                         RichText::new("Verifying checksum…")
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(th().accent),
                     );
                 }
                 UpdateState::Installing => {
                     ui.label(
                         RichText::new("Installing… (confirm the password prompt)")
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(th().accent),
                     );
                 }
                 UpdateState::Installed { version } => {
                     ui.label(
                         RichText::new(format!("{version} installed. Restart to finish."))
                             .size(12.0)
-                            .color(ACCENT),
+                            .color(th().accent),
                     );
                 }
                 UpdateState::Downloaded { path } => {
                     ui.label(
                         RichText::new(format!("Downloaded to {}", path.display()))
                             .size(12.0)
-                            .color(DIM),
+                            .color(th().dim),
                     );
                 }
                 UpdateState::Failed(e) => {
-                    ui.label(RichText::new(e.clone()).size(12.0).color(WARN));
+                    ui.label(RichText::new(e.clone()).size(12.0).color(th().warn));
                 }
             }
         });
@@ -2656,7 +2944,7 @@ impl App {
                  installed without you choosing to. {how}"
             ))
             .size(11.5)
-            .color(DIM2),
+            .color(th().dim2),
         );
     }
 
@@ -2669,19 +2957,19 @@ impl App {
         let step = |ui: &mut egui::Ui, n: &str, title: &str| {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 10.0, SEL);
+                ui.painter().circle_filled(r.center(), 10.0, th().sel);
                 ui.painter().text(
                     r.center(),
                     Align2::CENTER_CENTER,
                     n,
                     FontId::new(11.5, ff_bold()),
-                    ACCENT_HI,
+                    th().accent_hi,
                 );
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(title)
                         .font(FontId::new(13.5, ff_bold()))
-                        .color(TEXT),
+                        .color(th().text),
                 );
             });
         };
@@ -2706,7 +2994,7 @@ impl App {
                     ui.label(
                         RichText::new(title)
                             .font(FontId::new(24.0, ff_bold()))
-                            .color(TEXT),
+                            .color(th().text),
                     );
                     ui.add_space(10.0);
                     let sub = if found {
@@ -2718,7 +3006,7 @@ impl App {
                          isn't installed yet (or isn't on your PATH). Two steps and you're \
                          syncing:"
                     };
-                    ui.label(RichText::new(sub).size(13.5).color(TEXT));
+                    ui.label(RichText::new(sub).size(13.5).color(th().text));
                 });
 
                 if !found {
@@ -2740,14 +3028,14 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space(28.0);
                             egui::Frame::default()
-                                .fill(NAV_BG)
+                                .fill(th().nav_bg)
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::symmetric(10, 6))
                                 .show(ui, |ui| {
                                     ui.label(
                                         RichText::new("proton-drive --version")
                                             .font(FontId::new(12.5, egui::FontFamily::Monospace))
-                                            .color(TEXT),
+                                            .color(th().text),
                                     );
                                 });
                             ui.add_space(6.0);
@@ -2807,7 +3095,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
                             ui.spinner();
-                            ui.label(RichText::new("Waiting for sign-in…").color(DIM));
+                            ui.label(RichText::new("Waiting for sign-in…").color(th().dim));
                         });
                     }
                     ui.add_space(14.0);
@@ -2816,7 +3104,7 @@ impl App {
                     } else {
                         format!("Checked for \"{}\" on your PATH.", self.cfg.binary)
                     };
-                    ui.label(RichText::new(caption).size(11.5).color(DIM2));
+                    ui.label(RichText::new(caption).size(11.5).color(th().dim2));
                 });
             });
         });
@@ -2860,13 +3148,13 @@ impl App {
                 ui.label(
                     RichText::new("Log out of Proton Drive?")
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(th().text),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("You'll need to sign in again before the next sync.")
                         .size(12.5)
-                        .color(DIM),
+                        .color(th().dim),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -2901,7 +3189,7 @@ impl App {
                 ui.label(
                     RichText::new("Reset protondrive4linux?")
                         .font(FontId::new(15.0, ff_bold()))
-                        .color(TEXT),
+                        .color(th().text),
                 );
                 ui.add_space(4.0);
                 ui.label(
@@ -2910,7 +3198,7 @@ impl App {
                          Your actual files are left untouched.",
                     )
                     .size(12.5)
-                    .color(DIM),
+                    .color(th().dim),
                 );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -2983,10 +3271,10 @@ fn activity_banner(
                     ui.label(
                         RichText::new(title)
                             .font(FontId::new(15.0, ff_bold()))
-                            .color(TEXT),
+                            .color(th().text),
                     );
                     ui.add_space(1.0);
-                    ui.label(RichText::new(sub).size(12.0).color(DIM));
+                    ui.label(RichText::new(sub).size(12.0).color(th().dim));
                 });
             });
         });
@@ -3265,14 +3553,17 @@ fn active_row(ui: &mut egui::Ui, op: &ActivityOp) {
         "Syncing"
     };
     let name = op.path.rsplit('/').next().unwrap_or(&op.path).to_owned();
-    activity_cols(ui, &op.pair, DIM, "now", ACCENT, false, |ui| {
-        ui.add_sized([24.0, 24.0], egui::Spinner::new().size(16.0).color(ACCENT));
+    activity_cols(ui, &op.pair, th().dim, "now", th().accent, false, |ui| {
+        ui.add_sized(
+            [24.0, 24.0],
+            egui::Spinner::new().size(16.0).color(th().accent),
+        );
         ui.add_space(8.0);
         ui.add(
             egui::Label::new(
                 RichText::new(format!("{verb} {name}"))
                     .size(13.0)
-                    .color(TEXT),
+                    .color(th().text),
             )
             .truncate(),
         );
@@ -3301,43 +3592,53 @@ fn op_error_text(op: &ActivityOp, line: &str) -> Option<String> {
 fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Option<Open> {
     let a = op.action.to_lowercase();
     let (icon, base) = if a.contains("rename") || a.contains("move") {
-        (Icon::Arrow, ACCENT)
+        (Icon::Arrow, th().accent)
     } else if a.contains("upload") {
-        (Icon::Upload, ACCENT)
+        (Icon::Upload, th().accent)
     } else if a.contains("download") {
-        (Icon::Download, ACCENT)
+        (Icon::Download, th().accent)
     } else if a.contains("delete") || a.contains("trash") {
-        (Icon::Trash, WARN)
+        (Icon::Trash, th().warn)
     } else {
-        (Icon::Check, OK)
+        (Icon::Check, th().ok)
     };
-    let col = if op.ok { base } else { DANGER };
+    let col = if op.ok { base } else { th().danger };
     let name = op.path.rsplit('/').next().unwrap_or(&op.path).to_owned();
     let mut name_clicked = false;
-    let folder_clicked = activity_cols(ui, &op.pair, DIM, &rel_time(ts), DIM2, true, |ui| {
-        let (ir, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-        ui.painter().rect_filled(ir, 6.0, col.gamma_multiply(0.16));
-        draw_icon(ui.painter(), ir.shrink(5.0), icon, col);
-        ui.add_space(8.0);
-        let r = ui.add(
-            egui::Label::new(RichText::new(name).size(13.0).color(TEXT))
-                .truncate()
-                .sense(Sense::click()),
-        );
-        let r = r.on_hover_text(&op.path);
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        name_clicked = r.clicked();
-        // A failed row says why on the row itself: the reason used to live only
-        // in sync.log, so the feed showed a red filename and nothing else.
-        if let Some(err) = op_error_text(op, line) {
-            ui.add_space(6.0);
-            let tip = err.clone();
-            ui.add(egui::Label::new(RichText::new(err).size(11.5).color(DANGER)).truncate())
+    let folder_clicked = activity_cols(
+        ui,
+        &op.pair,
+        th().dim,
+        &rel_time(ts),
+        th().dim2,
+        true,
+        |ui| {
+            let (ir, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            ui.painter().rect_filled(ir, 6.0, col.gamma_multiply(0.16));
+            draw_icon(ui.painter(), ir.shrink(5.0), icon, col);
+            ui.add_space(8.0);
+            let r = ui.add(
+                egui::Label::new(RichText::new(name).size(13.0).color(th().text))
+                    .truncate()
+                    .sense(Sense::click()),
+            );
+            let r = r.on_hover_text(&op.path);
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            name_clicked = r.clicked();
+            // A failed row says why on the row itself: the reason used to live only
+            // in sync.log, so the feed showed a red filename and nothing else.
+            if let Some(err) = op_error_text(op, line) {
+                ui.add_space(6.0);
+                let tip = err.clone();
+                ui.add(
+                    egui::Label::new(RichText::new(err).size(11.5).color(th().danger)).truncate(),
+                )
                 .on_hover_text(tip);
-        }
-    });
+            }
+        },
+    );
     ui.add_space(4.0);
     if name_clicked {
         Some(Open::File)
@@ -3368,13 +3669,13 @@ fn start_page() -> Option<Nav> {
 /// kind that needs the user, so it alone gets the warning treatment.
 fn conflict_look(c: &ConflictRecord) -> (Color32, Icon) {
     if c.dismissed {
-        return (DIM2, Icon::Check);
+        return (th().dim2, Icon::Check);
     }
     match c.resolution {
-        ConflictResolution::Skipped => (WARN, Icon::Warning),
-        ConflictResolution::KeptBoth => (ACCENT, Icon::Copy),
-        ConflictResolution::KeptLocal => (ACCENT, Icon::Upload),
-        ConflictResolution::KeptRemote => (ACCENT, Icon::Download),
+        ConflictResolution::Skipped => (th().warn, Icon::Warning),
+        ConflictResolution::KeptBoth => (th().accent, Icon::Copy),
+        ConflictResolution::KeptLocal => (th().accent, Icon::Upload),
+        ConflictResolution::KeptRemote => (th().accent, Icon::Download),
     }
 }
 
@@ -3410,7 +3711,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
     let first_run = ps.is_some_and(|p| p.last_synced.is_none());
     let (col, text) = match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
-            ACCENT,
+            th().accent,
             if first_run {
                 "Initializing…"
             } else {
@@ -3419,7 +3720,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             .to_string(),
         ),
         Some(Phase::Syncing) => (
-            ACCENT,
+            th().accent,
             if first_run {
                 "Initializing…"
             } else {
@@ -3428,7 +3729,7 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             .to_string(),
         ),
         Some(Phase::Error) => (
-            DANGER,
+            th().danger,
             ps.and_then(|p| p.last_error.clone())
                 .unwrap_or_else(|| "Error".into()),
         ),
@@ -3436,25 +3737,25 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             let retrying = ps.map_or(0, |p| p.retrying);
             if retrying > 0 {
                 (
-                    WARN,
+                    th().warn,
                     format!(
                         "{retrying} file{} waiting to retry",
                         if retrying == 1 { "" } else { "s" }
                     ),
                 )
             } else if watching {
-                (ACCENT, "Auto · watching".to_string())
+                (th().accent, "Auto · watching".to_string())
             } else {
                 match ps.and_then(|p| p.last_synced) {
-                    Some(ts) => (OK, format!("Synced · {}", rel_time(ts))),
-                    None => (DIM, "Not synced yet".to_string()),
+                    Some(ts) => (th().ok, format!("Synced · {}", rel_time(ts))),
+                    None => (th().dim, "Not synced yet".to_string()),
                 }
             }
         }
     };
     ui.horizontal(|ui| {
         status_dot_small(ui, col);
-        ui.label(RichText::new(text).size(12.0).color(DIM));
+        ui.label(RichText::new(text).size(12.0).color(th().dim));
     });
 }
 
@@ -3474,18 +3775,18 @@ fn chip(ui: &mut egui::Ui, icon: Icon, text: &str, max_w: f32) {
     let w = pad * 2.0 + icon_w + gap + tw;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 7.0, NAV_BG);
+    painter.rect_filled(rect, 7.0, th().nav_bg);
     let ir = Rect::from_center_size(
         pos2(rect.left() + pad + icon_w / 2.0, rect.center().y),
         vec2(icon_w, icon_w),
     );
-    draw_icon(painter, ir, icon, DIM);
+    draw_icon(painter, ir, icon, th().dim);
     painter.text(
         pos2(rect.left() + pad + icon_w + gap, rect.center().y),
         Align2::LEFT_CENTER,
         &shown,
         font,
-        TEXT,
+        th().text,
     );
     // full path on hover, since we elide
     if shown != text {
@@ -3497,14 +3798,14 @@ fn empty_state(ui: &mut egui::Ui, title: &str, sub: &str) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         let (ir, _) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::hover());
-        draw_icon(ui.painter(), ir, Icon::Cloud, DIM2);
+        draw_icon(ui.painter(), ir, Icon::Cloud, th().dim2);
         ui.add_space(10.0);
         ui.label(
             RichText::new(title)
                 .font(FontId::new(15.0, ff_bold()))
-                .color(DIM),
+                .color(th().dim),
         );
-        ui.label(RichText::new(sub).size(12.5).color(DIM2));
+        ui.label(RichText::new(sub).size(12.5).color(th().dim2));
     });
 }
 
@@ -3527,7 +3828,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.multiply_opacity(alpha);
                 let frame = egui::Frame::default()
-                    .fill(SEL)
+                    .fill(th().sel)
                     .stroke(Stroke::new(1.0, line_col()))
                     .corner_radius(10.0)
                     .inner_margin(egui::Margin {
@@ -3538,8 +3839,8 @@ impl App {
                     });
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        status_dot_small(ui, if err { DANGER } else { OK });
-                        ui.label(RichText::new(msg).size(13.0).color(TEXT));
+                        status_dot_small(ui, if err { th().danger } else { th().ok });
+                        ui.label(RichText::new(msg).size(13.0).color(th().text));
                     });
                 });
             });
@@ -3577,18 +3878,18 @@ impl App {
                     self.load_browser();
                 }
             }
-            ui.label(RichText::new(&self.browser_path).color(DIM));
+            ui.label(RichText::new(&self.browser_path).color(th().dim));
         });
         ui.separator();
         if self.browser_loading {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Loading…").color(DIM));
+                ui.label(RichText::new("Loading…").color(th().dim));
             });
             return;
         }
         if let Some(err) = self.browser_error.clone() {
-            ui.label(RichText::new(err).color(DANGER));
+            ui.label(RichText::new(err).color(th().danger));
             return;
         }
         let mut open_into: Option<String> = None;
@@ -3597,14 +3898,14 @@ impl App {
             .max_height(300.0)
             .show(ui, |ui| {
                 if self.browser_entries.is_empty() {
-                    ui.label(RichText::new("(no sub-folders here)").color(DIM));
+                    ui.label(RichText::new("(no sub-folders here)").color(th().dim));
                 }
                 for e in &self.browser_entries {
                     let full = config::remote_join(&self.browser_path, &e.path);
                     ui.horizontal(|ui| {
                         let (ir, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                        draw_icon(ui.painter(), ir, Icon::Folder, ACCENT);
-                        if ui.link(RichText::new(&e.path).color(TEXT)).clicked() {
+                        draw_icon(ui.painter(), ir, Icon::Folder, th().accent);
+                        if ui.link(RichText::new(&e.path).color(th().text)).clicked() {
                             open_into = Some(full.clone());
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3633,7 +3934,7 @@ impl App {
             ui.label(
                 RichText::new("(pick a local folder next)")
                     .size(11.5)
-                    .color(DIM2),
+                    .color(th().dim2),
             );
         });
         if let Some(p) = open_into {
@@ -3654,7 +3955,7 @@ fn settings_group(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::U
     ui.label(
         RichText::new(title)
             .font(FontId::new(11.0, ff_bold()))
-            .color(ACCENT),
+            .color(th().accent),
     );
     ui.add_space(6.0);
     card_frame().show(ui, |ui| {
@@ -3684,9 +3985,11 @@ fn setting_row<R>(
         ui,
         |ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new(title).size(13.5).color(TEXT));
+                ui.label(RichText::new(title).size(13.5).color(th().text));
                 if !desc.is_empty() {
-                    ui.add(egui::Label::new(RichText::new(desc).size(11.5).color(DIM2)));
+                    ui.add(egui::Label::new(
+                        RichText::new(desc).size(11.5).color(th().dim2),
+                    ));
                 }
             });
         },
@@ -3749,6 +4052,26 @@ fn combo_update_channel(ui: &mut egui::Ui, v: &mut UpdateChannel) -> bool {
             for (val, lbl) in [
                 (UpdateChannel::Stable, "Stable"),
                 (UpdateChannel::Prerelease, "Pre-release"),
+            ] {
+                changed |= ui.selectable_value(v, val, lbl).clicked();
+            }
+        });
+    changed
+}
+fn combo_theme(ui: &mut egui::Ui, v: &mut ThemePref) -> bool {
+    let text = match v {
+        ThemePref::System => "System",
+        ThemePref::Light => "Light",
+        ThemePref::Dark => "Dark",
+    };
+    let mut changed = false;
+    egui::ComboBox::from_id_salt("theme")
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            for (val, lbl) in [
+                (ThemePref::System, "System"),
+                (ThemePref::Light, "Light"),
+                (ThemePref::Dark, "Dark"),
             ] {
                 changed |= ui.selectable_value(v, val, lbl).clicked();
             }
@@ -3834,6 +4157,7 @@ fn starter_config(path: &Path) -> Config {
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
         notifications: true,
+        theme: config::ThemePref::System,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)

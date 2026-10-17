@@ -266,6 +266,7 @@ fn cfg(root: &Path) -> Config {
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
         notifications: true,
+        theme: neutronsync::config::ThemePref::System,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

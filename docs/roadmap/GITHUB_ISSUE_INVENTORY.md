@@ -31,8 +31,8 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M4-003 | Parallel transfers | M4 | `type:feature` `area:performance` | ✅ (essência) |
 | M4-004 | Retry/backoff exponencial | M4 | `type:feature` `area:performance` | ✅ |
 | M4-005 | Bandwidth limits | M4 | `type:feature` `area:performance` | ✅ |
-| M5-001 | Sistema de temas | M5 | `type:feature` `area:gui` | ⬜ |
-| M5-002 | Temas customizados | M5 | `type:feature` `area:gui` | ⬜ (bloqueado por M5-001) |
+| M5-001 | Sistema de temas | M5 | `type:feature` `area:gui` | ✅ |
+| M5-002 | Temas customizados | M5 | `type:feature` `area:gui` | ⬜ (desbloqueado: M5-001 entregou os tokens) |
 | M5-003 | File status indicators | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-004 | File manager integration | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-005 | Onboarding, tray, notificações | M5 | `type:feature` `area:gui` | ✅ |
