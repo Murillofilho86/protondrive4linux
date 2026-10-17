@@ -101,6 +101,14 @@ debounce = 2
 # never nags. On by default.
 # notifications = true
 
+# Show the synced folders in the file manager: sidebar bookmarks for the GTK
+# managers (Nautilus, Nemo, Thunar, PCManFM) and two "Proton Drive" entries in
+# Nautilus's right-click Scripts menu. Off by default - it writes outside this
+# app's own folders (~/.config/gtk-3.0/bookmarks, ~/.local/share/nautilus/
+# scripts) - and turning it off removes exactly what it added. Also in
+# Settings -> File manager.
+# file_manager = false
+
 # In-app updater (GUI). It only checks GitHub Releases and notifies you; it
 # never downloads or installs anything.
 #   update_channel  - "stable" follows releases that have been promoted off

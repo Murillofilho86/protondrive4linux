@@ -877,6 +877,11 @@ impl App {
 
     fn commit(&mut self) {
         self.ctrl.commit_config(self.cfg.clone());
+        // Keep the file manager's sidebar in step with the folder list (the
+        // switch itself applies on toggle; this covers add/remove/rename).
+        if self.cfg.file_manager {
+            neutronsync::fileman::apply(&self.cfg);
+        }
     }
 
     /// When the tray is on, the headless daemon owns it. This window just makes
@@ -2364,6 +2369,26 @@ impl App {
                             egui::Label::new(RichText::new(note).size(11.5).color(th().warn))
                                 .wrap(),
                         );
+                    }
+                });
+
+                settings_group(ui, "FILE MANAGER", |ui| {
+                    let on = self.cfg.file_manager;
+                    if setting_row(
+                        ui,
+                        "Show in the file manager",
+                        "Adds your synced folders to the file manager's sidebar (Nautilus, \
+                         Nemo, Thunar...) and two \"Proton Drive\" entries to Nautilus's \
+                         right-click Scripts menu. Turn it off to remove them again.",
+                        |ui| switch(ui, on),
+                    ) {
+                        self.cfg.file_manager = !on;
+                        self.dirty = true;
+                        let done = neutronsync::fileman::apply(&self.cfg);
+                        if !done.errors.is_empty() {
+                            let msg = format!("File manager: {}", done.errors.join("; "));
+                            self.toast(&ui.ctx().clone(), msg, true);
+                        }
                     }
                 });
 
@@ -4136,6 +4161,7 @@ fn starter_config(path: &Path) -> Config {
         check_on_launch: false,
         notifications: true,
         theme: config::ThemePref::System,
+        file_manager: false,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
@@ -4231,6 +4257,7 @@ fn run_daemon() {
         }
     };
     ensure_desktop_integration();
+    neutronsync::fileman::apply(&cfg);
 
     let ctrl = std::sync::Arc::new(Controller::new(cfg.clone()));
     if cfg.auto_sync {
@@ -4321,6 +4348,7 @@ fn run_daemon() {
                 let pairs = newcfg.pairs.len();
                 want_watch = newcfg.auto_sync;
                 notify_on = newcfg.notifications;
+                neutronsync::fileman::apply(&newcfg);
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
                 pending_restart = true;

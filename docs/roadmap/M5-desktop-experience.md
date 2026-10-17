@@ -71,16 +71,45 @@ componente. Formato e tokens em `docs/THEMES.md`.
 Pending`.
 
 ## M5-004 — File manager integration
-**Status: ⬜ Não iniciado.** Prioridade: Nautilus → Dolphin → Nemo → Thunar.
+**Status: 🔶 Parcial.** Prioridade original: Nautilus → Dolphin → Nemo → Thunar. Escopo
+decidido com o mantenedor: **Nautilus/Nemo/GTK, opt-in** (Settings → *File manager*,
+`file_manager = true`, desligado por padrão — escreve fora das pastas do app). COSMIC Files e
+Dolphin guardam favoritos em formatos próprios e não são cobertos.
+
+### Pronto (`src/fileman.rs`)
+- **Marcadores na barra lateral** em `~/.config/gtk-3.0/bookmarks` — o arquivo que Nautilus,
+  Nemo, Thunar e PCManFM leem. Cada pasta sincronizada vira `file:///caminho Nome (Proton Drive)`
+  (URI com percent-encoding por byte UTF-8).
+- **Menu de contexto**: dois scripts em `~/.local/share/nautilus/scripts/` — *Proton Drive - Sync
+  now* e *Proton Drive - Conflicts* (abre a janela direto na página, via `--page conflicts`).
+  Usam o caminho absoluto do executável ao lado do binário em execução, com aspas de shell.
+- **Só mexe no que é seu.** Marcadores nossos são identificados pelo rótulo `… (Proton Drive)`;
+  scripts, por uma linha-marca na primeira linha. Os marcadores do usuário passam intactos (na
+  ordem); uma pasta que ele já marcou não é duplicada nem "adotada"; um script dele com o mesmo
+  nome nunca é sobrescrito nem apagado. Desligar remove exatamente o que foi adicionado — e não
+  cria arquivo nenhum que não existisse. Idempotente, escrita atômica (temp + rename) que mantém
+  as permissões do arquivo.
+- **Quando aplica**: o daemon da bandeja na partida e a cada reload do config; a janela ao virar
+  o switch e ao adicionar/remover/renomear uma pasta.
+- **Testado**: URIs, merge (ordem, idempotência, remoção/renome, duplicata do usuário), arquivo
+  criado/sem-mudança, permissões, scripts (executável, marcados, namesake do usuário), `apply`
+  inteiro contra um config real (pasta ausente é pulada; desligado não cria nada) e falha de
+  escrita sem derrubar nada. E de ponta a ponta com o daemon real num sandbox XDG: ligar adiciona,
+  desligar via hot reload remove, o marcador do usuário sobrevive.
+- *Abrir a pasta local* já existia (a página *Folders*).
+
+### Falta
+- [ ] Ícone/status por arquivo/pasta (emblemas — é o M5-003, próximo PR).
+- [ ] Sync status no gerenciador (idem).
 
 > **Nota de arquitetura**: isto é um atalho/bookmark para a pasta local sincronizada, **não** um
 > mount virtual — não depende de FUSE (ver `docs/architecture/ARCHITECTURE_PRINCIPLES.md`).
 
 ### Critérios de aceite
-- [ ] Ícone/status por arquivo/pasta.
-- [ ] Context menu.
-- [ ] Open local folder.
-- [ ] Sync status.
+- [ ] Ícone/status por arquivo/pasta (M5-003).
+- [x] Context menu (scripts do Nautilus).
+- [x] Open local folder (+ marcadores na barra lateral).
+- [ ] Sync status (M5-003).
 
 ## M5-005 — Onboarding, tray, notificações desktop
 **Status: ✅ Concluído.** A maior parte já existia no código — o status "não iniciado" estava

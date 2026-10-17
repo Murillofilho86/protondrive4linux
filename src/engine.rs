@@ -2538,6 +2538,7 @@ mod tests {
             check_on_launch: false,
             notifications: true,
             theme: crate::config::ThemePref::System,
+            file_manager: false,
             state_dir: std::env::temp_dir(),
             pairs: vec![],
             source_path: None,
