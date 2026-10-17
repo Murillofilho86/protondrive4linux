@@ -150,7 +150,7 @@ compare = "size+mtime"        # size | size+mtime | sha1
 poll_interval = 900           # watch: seconds between full rescans
 update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
-# notifications = true        # tray: desktop notifications for conflicts, lasting problems, sign-out
+# notifications = true        # tray: desktop notifications for conflicts, lasting problems, sign-out, background sync stopping
 # theme = "system"            # GUI: system | light | dark | the name of a custom theme
 # file_manager = false        # add synced folders to the file manager sidebar + Nautilus Scripts menu
 

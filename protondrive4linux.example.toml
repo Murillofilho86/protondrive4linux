@@ -97,8 +97,9 @@ debounce = 2
 # x11_compat = false
 # Desktop notifications from the tray daemon (needs run_in_tray): a file that
 # conflicts, a sync problem that lasts more than a minute or two (a brief
-# rate-limit blip stays quiet), and a signed-out session. Rate-limited so it
-# never nags. On by default.
+# rate-limit blip stays quiet), a signed-out session, and the tray failing so
+# often that it is no longer restarted (at most once an hour). Rate-limited so
+# it never nags. On by default.
 # notifications = true
 
 # Show the synced folders in the file manager: sidebar bookmarks for the GTK
