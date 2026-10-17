@@ -265,6 +265,7 @@ fn cfg(root: &Path) -> Config {
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
+        notifications: true,
         state_dir: root.join("state"),
         pairs: vec![Pair {
             name: "docs".into(),

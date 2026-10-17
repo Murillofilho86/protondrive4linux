@@ -3335,6 +3335,7 @@ dependencies = [
  "ureq",
  "walkdir",
  "winit",
+ "zbus",
 ]
 
 [[package]]

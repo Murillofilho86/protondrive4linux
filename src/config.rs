@@ -116,6 +116,9 @@ pub struct Config {
     pub update_channel: UpdateChannel,
     /// Check for updates when the GUI launches (notify only; never installs).
     pub check_on_launch: bool,
+    /// Send desktop notifications for conflicts, sync problems that persist,
+    /// and a signed-out session (GUI/tray only).
+    pub notifications: bool,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -197,6 +200,7 @@ struct RawOptions {
     x11_compat: Option<bool>,
     update_channel: Option<String>,
     check_on_launch: Option<bool>,
+    notifications: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -446,6 +450,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         debounce_secs: opts.debounce.unwrap_or(2),
         update_channel,
         check_on_launch: opts.check_on_launch.unwrap_or(false),
+        notifications: opts.notifications.unwrap_or(true),
         state_dir,
         pairs,
         source_path: Some(path),
@@ -589,6 +594,7 @@ struct OutOptions {
     debounce: u64,
     update_channel: String,
     check_on_launch: bool,
+    notifications: bool,
     state_dir: String,
 }
 
@@ -671,6 +677,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             debounce: cfg.debounce_secs,
             update_channel: update_channel_str(cfg.update_channel).to_string(),
             check_on_launch: cfg.check_on_launch,
+            notifications: cfg.notifications,
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg

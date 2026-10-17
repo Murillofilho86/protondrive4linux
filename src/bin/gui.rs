@@ -25,6 +25,7 @@ use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
     ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
 };
+use neutronsync::stats::Stats;
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
@@ -2161,6 +2162,17 @@ impl App {
                             set_autostart(true, &self.cfg);
                         }
                     }
+                    let notes = self.cfg.notifications;
+                    if setting_row(
+                        ui,
+                        "Desktop notifications",
+                        "Tell me when a file conflicts, a sync problem lasts, or I get \
+                         signed out. Sent by the tray, so it needs \"Run in system tray\".",
+                        |ui| switch(ui, notes),
+                    ) {
+                        self.cfg.notifications = !notes;
+                        self.dirty = true;
+                    }
                     let auto = autostart_enabled();
                     if setting_row(
                         ui,
@@ -3821,6 +3833,7 @@ fn starter_config(path: &Path) -> Config {
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
+        notifications: true,
         state_dir: {
             let base = std::env::var("XDG_STATE_HOME")
                 .map(PathBuf::from)
@@ -3841,6 +3854,55 @@ fn auto_names_of(cfg: &Config) -> Vec<String> {
         .filter(|p| p.auto)
         .map(|p| p.name.clone())
         .collect()
+}
+
+/// Feeds the desktop-notification state machine for the tray daemon: it polls
+/// the shared stats DB (at most once a second) for conflicts recorded since it
+/// last looked - by this process or any other - and combines them with the
+/// app's overall status. Only conflicts that happen after it starts count, so a
+/// restart never replays old ones.
+struct NoticeFeed {
+    notifier: neutronsync::notify::Notifier,
+    stats: Option<Stats>,
+    last_conflict_id: i64,
+    polled_at: std::time::Instant,
+}
+
+impl NoticeFeed {
+    fn new(state_dir: &std::path::Path, initial: OverallStatus) -> Self {
+        let stats = Stats::open(state_dir).ok();
+        let last_conflict_id = stats
+            .as_ref()
+            .and_then(|s| s.max_conflict_id().ok())
+            .unwrap_or(0);
+        NoticeFeed {
+            notifier: neutronsync::notify::Notifier::new(initial),
+            stats,
+            last_conflict_id,
+            polled_at: std::time::Instant::now(),
+        }
+    }
+
+    /// What to announce right now (usually nothing). Cheap to call every tick.
+    fn poll(
+        &mut self,
+        status: OverallStatus,
+        line: &str,
+    ) -> Vec<neutronsync::notify::Notification> {
+        if self.polled_at.elapsed() < std::time::Duration::from_secs(1) {
+            return Vec::new();
+        }
+        self.polled_at = std::time::Instant::now();
+        let new = self
+            .stats
+            .as_ref()
+            .and_then(|s| s.conflicts_since(self.last_conflict_id, 50).ok())
+            .unwrap_or_default();
+        if let Some(last) = new.last() {
+            self.last_conflict_id = last.id;
+        }
+        self.notifier.tick(now_secs(), status, line, new)
+    }
 }
 
 /// Headless tray daemon (`--tray`): owns the system tray (GTK/AppIndicator) and
@@ -3882,6 +3944,8 @@ fn run_daemon() {
     }
 
     let (mut last_status, mut last_line) = ctrl.status_summary();
+    let mut feed = NoticeFeed::new(&cfg.state_dir, last_status);
+    let mut notify_on = cfg.notifications;
     let menu = Menu::new();
     // Disabled: a read-only status line, kept current by the tick below.
     let status_i = MenuItem::new(&last_line, false, None);
@@ -3954,6 +4018,7 @@ fn run_daemon() {
             if let Ok(newcfg) = config::load(None) {
                 let pairs = newcfg.pairs.len();
                 want_watch = newcfg.auto_sync;
+                notify_on = newcfg.notifications;
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
                 pending_restart = true;
@@ -3975,6 +4040,13 @@ fn run_daemon() {
         // status line follows too, but it changes with every file during a big
         // sync, so text-only changes are throttled to once a second.
         let (status, line) = ctrl_cb.status_summary();
+        // Desktop notifications. Polled even when switched off, so turning them
+        // on later doesn't replay whatever piled up meanwhile.
+        for note in feed.poll(status, &line) {
+            if notify_on {
+                neutronsync::notify::send_async(note);
+            }
+        }
         let status_changed = status != last_status;
         if status_changed {
             if let Some((_, icon)) = icons.iter().find(|(s, _)| *s == status) {

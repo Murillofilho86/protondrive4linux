@@ -87,6 +87,11 @@ debounce = 2
 # auto_sync = false
 # run_in_tray = false
 # x11_compat = false
+# Desktop notifications from the tray daemon (needs run_in_tray): a file that
+# conflicts, a sync problem that lasts more than a minute or two (a brief
+# rate-limit blip stays quiet), and a signed-out session. Rate-limited so it
+# never nags. On by default.
+# notifications = true
 
 # In-app updater (GUI). It only checks GitHub Releases and notifies you; it
 # never downloads or installs anything.

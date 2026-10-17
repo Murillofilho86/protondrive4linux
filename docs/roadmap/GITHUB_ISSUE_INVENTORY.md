@@ -35,7 +35,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M5-002 | Temas customizados | M5 | `type:feature` `area:gui` | ⬜ (bloqueado por M5-001) |
 | M5-003 | File status indicators | M5 | `type:feature` `area:gui` | ⬜ |
 | M5-004 | File manager integration | M5 | `type:feature` `area:gui` | ⬜ |
-| M5-005 | Onboarding, tray, notificações | M5 | `type:feature` `area:gui` | 🔶 (ícone de estados ✅; faltam notificações nativas) |
+| M5-005 | Onboarding, tray, notificações | M5 | `type:feature` `area:gui` | ✅ |
 | M7-001 | Flatpak | M7 | `type:feature` `area:distribution` | 🔒 (bloqueado indefinidamente — ver decisão em M3-005) |
 | M7-002 | Instalador universal (.sh) | M7 | `type:feature` `area:distribution` | ⬜ |
 | M7-003 | `doctor` expandido | M7 | `type:feature` `area:packaging` | 🔶 |
