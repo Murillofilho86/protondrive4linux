@@ -120,6 +120,9 @@ pub struct Op {
     /// `None` for ordinary ops, and for `Action::Conflict` (keep-both), whose
     /// resolution is reported by `resolve_conflict` itself with the copy's name.
     pub conflict: Option<ConflictResolution>,
+    /// For a download: what the plan saw at the destination, so the file is only
+    /// replaced if it is still that. `None` for every other action.
+    pub local_seen: Option<LocalSeen>,
 }
 
 impl Op {
@@ -136,7 +139,14 @@ impl Op {
             reason: reason.into(),
             from: None,
             conflict: None,
+            local_seen: None,
         }
+    }
+
+    /// Record what the plan saw at the destination (see [`Op::local_seen`]).
+    pub fn seeing(mut self, seen: LocalSeen) -> Self {
+        self.local_seen = Some(seen);
+        self
     }
 
     /// Mark this op as how a conflict gets settled (see [`Op::conflict`]).
@@ -159,6 +169,7 @@ impl Op {
             reason: reason.into(),
             from: Some(from.into()),
             conflict: None,
+            local_seen: None,
         }
     }
 
@@ -203,18 +214,51 @@ pub struct TreeScan {
     pub root_missing: bool,
 }
 
-/// One file to fetch, for the concurrent download pool. `mtime` (from the new
-/// baseline) is stamped onto the local file after a successful download so it
-/// matches the remote, keeping size+mtime comparisons stable next run.
+/// What was on disk at a path when the plan was made. A download that is about
+/// to replace a file checks it is still that file (see [`crate::staged`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalSeen {
+    /// Nothing there.
+    Absent,
+    /// A file of this size and modification time (whole seconds).
+    File { size: u64, mtime: Option<i64> },
+}
+
+impl LocalSeen {
+    /// What the local scan found at a path: `None` for nothing.
+    pub fn of(entry: Option<&Entry>) -> LocalSeen {
+        match entry {
+            Some(e) if !e.is_dir => LocalSeen::File {
+                size: e.size,
+                mtime: e.mtime,
+            },
+            _ => LocalSeen::Absent,
+        }
+    }
+}
+
+/// One file to fetch, for the concurrent download pool. The file is written into
+/// a private staging folder (`dest_dir`) and only moved to `final_dir/name` once
+/// it has arrived whole ([`crate::staged`]); `mtime` (from the new baseline) is
+/// stamped on it first so it matches the remote, keeping size+mtime comparisons
+/// stable next run.
 #[derive(Clone)]
 pub struct DownloadJob {
     pub rel: String,         // pair-relative path (events, logging)
     pub remote_path: String, // absolute proton path to download
-    pub dest_dir: String,    // local parent directory
+    /// Where the `Remote` writes: the staging folder.
+    pub dest_dir: String,
+    /// The folder the file belongs in (the staging folder's parent).
+    pub final_dir: String,
+    /// The file's name in `final_dir`.
+    pub name: String,
     pub mtime: Option<i64>,
-    /// Size in bytes (from the new baseline), used to pace the download
-    /// against the configured bandwidth limit (M4-005).
+    /// Size in bytes (from the new baseline): paces the download against the
+    /// configured bandwidth limit (M4-005) and is what the file must measure
+    /// when it arrives (0 = the listing gave none).
     pub size: u64,
+    /// What was at the destination when the plan was made.
+    pub local_seen: LocalSeen,
 }
 
 #[derive(Default)]

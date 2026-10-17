@@ -20,6 +20,11 @@
 //! - `FAKE_CLI_VERSION`: the line `version` prints (default `fake-cli-drive
 //!   0.0.0-test`), to test how a CLI version is judged.
 //!
+//! One for the download scenarios in `tests/disaster/`:
+//! - `FAKE_CLI_HALF_WRITE_MS`: `download` writes the first half of the file,
+//!   waits this long, then writes the rest - so a test can kill the run while a
+//!   half-written file exists, as a CLI killed or a disk filling mid-download would.
+//!
 //! And one for `tests/watch_session.rs`:
 //! - `FAKE_CLI_KEYRING_FLAG`: a path. While a file exists there, every command
 //!   but `version` fails the way the real CLI does when it can't reach its
@@ -197,13 +202,35 @@ fn cmd_download(root: &Path, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match fs::copy(&src, Path::new(local_dest_dir).join(name)) {
-        Ok(_) => ExitCode::SUCCESS,
+    let dest = Path::new(local_dest_dir).join(name);
+    let half_ms = env::var("FAKE_CLI_HALF_WRITE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let result = match half_ms {
+        Some(ms) => half_write(&src, &dest, ms),
+        None => fs::copy(&src, &dest).map(|_| ()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Copy `src` to `dest` in two halves with a pause between them, flushing the
+/// first half to the file so another process can see it.
+fn half_write(src: &Path, dest: &Path, pause_ms: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let data = fs::read(src)?;
+    let mid = data.len() / 2;
+    let mut f = fs::File::create(dest)?;
+    f.write_all(&data[..mid])?;
+    f.sync_all()?;
+    std::thread::sleep(Duration::from_millis(pause_ms));
+    f.write_all(&data[mid..])?;
+    Ok(())
 }
 
 fn cmd_trash(root: &Path, args: &[String]) -> ExitCode {

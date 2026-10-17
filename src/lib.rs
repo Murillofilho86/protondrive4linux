@@ -28,6 +28,7 @@ pub mod process_lock;
 pub mod protoncli;
 pub mod ratelimit;
 pub mod service;
+pub mod staged;
 pub mod state;
 pub mod stats;
 #[cfg(all(test, feature = "gui"))]

@@ -137,6 +137,36 @@ fn spawn_sync(env: &Env, extra_env: &BTreeMap<&str, String>) -> std::process::Ch
     cmd.spawn().expect("failed to spawn protondrive4linux")
 }
 
+/// Like [`spawn_sync`], but in a process group of its own, so a signal sent to
+/// the group reaches the CLI children as well - as a power cut, an OOM kill of
+/// the whole session, or the CLI hitting its timeout would. Killing only the
+/// parent leaves its children to finish what they were writing, which is not
+/// the disaster being tested.
+fn spawn_sync_in_own_group(env: &Env, extra_env: &BTreeMap<&str, String>) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let bin = env!("CARGO_BIN_EXE_protondrive4linux");
+    let mut cmd = Command::new(bin);
+    cmd.args(["--config", env.config_path.to_str().unwrap(), "sync", "p"])
+        .env("FAKE_REMOTE_ROOT", &env.remote_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.spawn().expect("failed to spawn protondrive4linux")
+}
+
+/// Send `signal` to every process in the group `pid` leads.
+fn signal_group(signal: &str, pid: u32) {
+    let status = Command::new("kill")
+        .args([format!("-{signal}"), format!("-{pid}")])
+        .status()
+        .expect("failed to invoke kill(1)");
+    assert!(status.success(), "kill -{signal} -{pid} failed");
+}
+
 /// Run one full, uninterrupted sync (no artificial delay/crash) and wait for
 /// it to finish - used both to establish a baseline and to prove recovery.
 fn run_clean_sync(env: &Env) {
@@ -307,4 +337,151 @@ fn crashing_cli_does_not_corrupt_state() {
         10,
         "once the CLI is healthy again, a normal run must converge fully"
     );
+}
+
+// --- killed mid-download -------------------------------------------------------
+
+/// The names in the pair's local folder that are not hidden staging folders.
+fn visible_local(env: &Env) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(&env.local)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Is a download half written right now - a file called `file-NNNN.txt` that
+/// has some of its bytes but not all, wherever it is (under its real name, or in
+/// a staging folder)? Looks at nothing about *how* the run stages its files, so
+/// the test means the same against any implementation.
+fn a_download_is_half_written(env: &Env, full_len: &dyn Fn(usize) -> usize) -> bool {
+    walkdir::WalkDir::new(&env.local)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(i) = name
+                .strip_prefix("file-")
+                .and_then(|r| r.get(..4))
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return false;
+            };
+            let len = e.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            len > 0 && len < full_len(i)
+        })
+}
+
+/// Kill a sync (`signal`) while a download is half written, and check that no
+/// file under its real name is ever partial, whatever was there before.
+fn killed_mid_download(signal: &str, had_old_copies: bool) {
+    let env = setup(&format!("dl-{signal}-{had_old_copies}"));
+    const N: usize = 12;
+    // Different versions have different sizes (size+mtime cannot tell two edits
+    // of one length within one second apart, which is not what this tests).
+    let body = |i: usize, v: u32| {
+        format!(
+            "version {v} of file {i}: {}",
+            "x".repeat(2000 + i + 97 * v as usize)
+        )
+    };
+    let remote = remote_docs_dir(&env);
+    std::fs::create_dir_all(&remote).unwrap();
+    if had_old_copies {
+        // v1 on both sides, synced; then the remote moves on to v2.
+        for i in 0..N {
+            std::fs::write(remote.join(format!("file-{i:04}.txt")), body(i, 1)).unwrap();
+        }
+        run_clean_sync(&env);
+        assert_eq!(count_local_files(&env), N);
+    }
+    let latest = if had_old_copies { 2 } else { 1 };
+    for i in 0..N {
+        std::fs::write(remote.join(format!("file-{i:04}.txt")), body(i, latest)).unwrap();
+    }
+
+    let mut extra = BTreeMap::new();
+    extra.insert("FAKE_CLI_HALF_WRITE_MS", "1500".to_string());
+    let mut child = spawn_sync_in_own_group(&env, &extra);
+    let pid = child.id();
+
+    // Wait until a download is genuinely half written, then pull the plug. (When
+    // the old copies are being replaced, a v1 file is shorter than v2, so only a
+    // file shorter than ITS OWN latest version counts - and a v1 file is, so look
+    // for one that is neither complete v1 nor complete v2.)
+    let complete = |i: usize| body(i, latest).len();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !a_download_is_half_written(&env, &|i| {
+        if had_old_copies {
+            // Anything between "v1 whole" and "v2 whole" would be a complete older
+            // file or a partial new one; a partial is shorter than v1 itself.
+            body(i, 1).len()
+        } else {
+            complete(i)
+        }
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw a download in progress"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The whole group, CLI children included: they die mid-write, as in a crash.
+    signal_group(signal, pid);
+    child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("the killed process must terminate");
+    // Nothing is left running to finish what was being written.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Every file under its real name is whole: the old version or the new one,
+    // never half of either.
+    for name in visible_local(&env) {
+        let got = std::fs::read_to_string(env.local.join(&name)).unwrap();
+        let i: usize = name["file-".len().."file-".len() + 4].parse().unwrap();
+        let ok = got == body(i, latest) || (had_old_copies && got == body(i, 1));
+        assert!(ok, "{name} is partial or corrupt after the kill: {got:?}");
+    }
+
+    // Recovery converges on the remote's content, with no conflict copies and
+    // no partial file ever uploaded back over the good ones.
+    run_clean_sync(&env);
+    for i in 0..N {
+        let name = format!("file-{i:04}.txt");
+        assert_eq!(
+            std::fs::read_to_string(env.local.join(&name)).unwrap(),
+            body(i, latest),
+            "{name} local after recovery"
+        );
+        assert_eq!(
+            std::fs::read_to_string(remote.join(&name)).unwrap(),
+            body(i, latest),
+            "{name} on the remote after recovery"
+        );
+    }
+    let visible = visible_local(&env);
+    assert_eq!(visible.len(), N, "stray files after recovery: {visible:?}");
+    assert!(
+        visible.iter().all(|n| !n.contains("conflict")),
+        "{visible:?}"
+    );
+}
+
+#[test]
+fn sigkill_mid_download_never_leaves_a_partial_file_under_its_real_name() {
+    killed_mid_download("KILL", false);
+}
+
+#[test]
+fn sigkill_mid_download_over_existing_files_keeps_each_old_or_new_never_half() {
+    killed_mid_download("KILL", true);
+}
+
+#[test]
+fn sigterm_mid_download_never_leaves_a_partial_file_under_its_real_name() {
+    killed_mid_download("TERM", false);
 }
