@@ -358,10 +358,26 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
             default_config_path().display()
         )
     })?;
+    load_path(&path)
+}
+
+/// Load the config file at exactly `path` (no searching). Split from [`load`]
+/// so `doctor` can tell "no config anywhere" from "a config that won't parse".
+pub fn load_path(path: &Path) -> Result<Config> {
     let text =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let raw: RawConfig =
-        toml::from_str(&text).with_context(|| format!("{}: invalid TOML", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_str(&text, Some(path.to_path_buf()))
+}
+
+/// Parse and validate config text. `source` is the file it came from (recorded
+/// in [`Config::source_path`] so a running daemon can reload it); `None` is for
+/// text that isn't a file - an empty string gives the built-in defaults, which
+/// is how `doctor` still has a usable config when the real one is missing.
+pub fn parse_str(text: &str, source: Option<PathBuf>) -> Result<Config> {
+    let raw: RawConfig = toml::from_str(text).with_context(|| match &source {
+        Some(p) => format!("{}: invalid TOML", p.display()),
+        None => "invalid TOML".to_string(),
+    })?;
 
     let cli = raw.cli.unwrap_or_default();
     let opts = raw.options.unwrap_or_default();
@@ -488,7 +504,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         file_manager: opts.file_manager.unwrap_or(false),
         state_dir,
         pairs,
-        source_path: Some(path),
+        source_path: source,
     })
 }
 
@@ -751,6 +767,15 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
 /// created 0700 and the file 0600 (modes apply when this process creates
 /// them, same as the sync log — see logger.rs).
 pub fn save(cfg: &Config, path: &Path) -> Result<()> {
+    write_private(path, &to_toml(cfg)?)
+}
+
+/// Write `contents` to `path`, creating the parent directory 0700 and the file
+/// 0600. Shared by [`save`] (the GUI) and `protondrive4linux init`, so a config
+/// is private to the user however it came to exist - and `doctor` can hold it
+/// to that. The modes apply to what this call creates; an existing file keeps
+/// the mode it has.
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if let Some(parent) = path.parent() {
         let _ = std::fs::DirBuilder::new()
@@ -758,7 +783,6 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
             .mode(0o700)
             .create(parent);
     }
-    let toml = to_toml(cfg)?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -767,14 +791,16 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
     use std::io::Write;
-    f.write_all(toml.as_bytes())
+    f.write_all(contents.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load, migrate_transfer_flags, to_toml, ThemePref, TransferKind};
+    use super::{
+        load, migrate_transfer_flags, parse_str, to_toml, write_private, ThemePref, TransferKind,
+    };
 
     /// Write `toml` to a fresh temp file and load it as a config.
     fn load_str(tag: &str, toml: &str) -> anyhow::Result<super::Config> {
@@ -908,5 +934,43 @@ mod tests {
             migrate_transfer_flags(flags.clone(), TransferKind::Upload),
             flags
         );
+    }
+
+    #[test]
+    fn empty_text_parses_to_the_built_in_defaults_without_a_source_file() {
+        let cfg = parse_str("", None).expect("an empty config is valid");
+        assert_eq!(cfg.binary, "proton-drive");
+        assert_eq!(cfg.remote_root, "/my-files");
+        assert!(cfg.pairs.is_empty());
+        // Nothing to reload from: a daemon given this config keeps it as is.
+        assert!(cfg.source_path.is_none());
+    }
+
+    #[test]
+    fn invalid_text_is_an_error_that_names_the_file_when_there_is_one() {
+        let with_file = parse_str("[cli", Some("/tmp/x.toml".into())).unwrap_err();
+        assert!(format!("{with_file:#}").contains("/tmp/x.toml: invalid TOML"));
+        let without = parse_str("[cli", None).unwrap_err();
+        assert!(format!("{without:#}").starts_with("invalid TOML"));
+    }
+
+    #[test]
+    fn write_private_creates_the_directory_0700_and_the_file_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-config-private-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("nested").join("c.toml");
+        write_private(&path, "# hello\n").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "the file");
+        assert_eq!(mode(path.parent().unwrap()), 0o700, "its directory");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# hello\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

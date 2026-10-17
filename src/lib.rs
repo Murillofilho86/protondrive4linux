@@ -12,6 +12,7 @@ pub mod appearance;
 pub mod auth_signal;
 pub mod config;
 pub mod datefmt;
+pub mod doctor;
 pub mod emblems;
 pub mod engine;
 pub mod events;

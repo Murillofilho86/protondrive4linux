@@ -97,7 +97,7 @@ protondrive4linux sync                        # apply
 protondrive4linux watch                       # live sync: FS events + periodic rescan
 ```
 
-`init` writes an empty config; add your own `[[pair]]` entries. Other commands: `status`, `doctor [REMOTE_PATH]` (probe the CLI and show list parsing), `logout`. `sync` takes `--dry-run`, `--resync` (rebuild the baseline from the union of both sides), and `--json`; passing pair names syncs only those.
+`init` writes a starter config (private to you: folder `0700`, file `0600`); add your own `[[pair]]` entries. Other commands: `status`, `doctor` (see [Troubleshooting](#troubleshooting-doctor)), `logout`. `sync` takes `--dry-run`, `--resync` (rebuild the baseline from the union of both sides), and `--json`; passing pair names syncs only those.
 
 ## How it works
 
@@ -176,6 +176,33 @@ systemctl --user enable --now protondrive4linux.timer
 ```
 
 The packaged units target `/usr/bin/protondrive4linux`. If you installed with `cargo install`, edit `ExecStart` to `%h/.cargo/bin/protondrive4linux`. Proton Drive is rate-limited, so keep the sync set modest and the rescan interval sane.
+
+## Troubleshooting: `doctor`
+
+When something doesn't sync, start with:
+
+```sh
+protondrive4linux doctor
+```
+
+It checks the installation and changes nothing: one line per check, and under anything that needs attention, what to do about it.
+
+| Check | What it looks at |
+|---|---|
+| Version | The binary that's answering: version, commit, where it's installed. |
+| Config | Found, parses, how many folder pairs. A config that's missing or broken doesn't stop the checks that don't need it. |
+| Proton CLI | `proton-drive` on your `PATH`, its version (this build is verified against 0.8.0 and newer), and a warning if it sits in a directory other users can write to. |
+| Network | Whether an HTTPS connection to `drive-api.proton.me` can be opened. Nothing is sent over it. |
+| Credentials | Whether the CLI has a working session, asked the same way the app asks. The session itself is never read. It tells an unreachable keyring (locked, no D-Bus session, headless) from never having signed in, since signing in again won't fix the first. |
+| Folders | Each pair's local folder exists. |
+| Permissions | Your config and state folder belong to you and are closed to others (`0600` / `0700`; a config owned by root, set up by an administrator, is only noted). Anyone who can write the config can choose which program runs as `cli.binary`, and the state folder holds logs and a database that list your file names. |
+| systemd | The packaged user units: running, failed, enabled but stopped, or the live service and the timer both active (use one). |
+| Watcher | Whether a watcher (the tray app, `protondrive4linux watch`, or the service) is running right now. |
+| Desktop entry | The launcher and the GUI binary installed together, and whether launch-at-login is on. |
+
+The exit status is 0 unless a check failed (warnings don't count), so it works in scripts: `--json` prints the report as JSON, and `--offline` skips the checks that use the network (reachability and sign-in). `--probe`, or a `REMOTE_PATH` argument, additionally lists that remote folder through the CLI and shows how its JSON is parsed - for when a CLI update changes the output.
+
+The report names paths on your system (your home folder, your synced folders), so skim it before pasting it into a public bug report. It never prints credentials.
 
 ## Updates
 

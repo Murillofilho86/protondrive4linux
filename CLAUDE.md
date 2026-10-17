@@ -40,6 +40,7 @@ Not something to do casually — see `docs/contributing/CONTRIBUTING.md` for ful
 - `ignore` — exclude-path handling; excludes are pruned from scans entirely, never listed/downloaded/deleted.
 - `events` — structured sync events emitted by the engine.
 - `stats`, `datefmt`, `logger`, `auth_signal` — supporting utilities.
+- `doctor` — read-only installation health check behind `protondrive4linux doctor`: returns a `Report` (it never prints); everything it looks at outside the process goes through `Env`/`Host` so tests need no Proton account, systemd or network. It asks the CLI whether a session exists and never reads credentials itself.
 - `service` — `Controller`: the backend API frontends (CLI and GUI) are built on. Non-blocking commands (`sync`, `cancel`, `start_watch`, `stop_watch`), cheap `snapshot()` for rendering, engine events surfaced as observable `AppState`. See `docs/GUI_API.md`.
 - `updater` (gui feature only) — checks GitHub releases by channel (stable/prerelease), verifies checksum, installs via the system package manager.
 

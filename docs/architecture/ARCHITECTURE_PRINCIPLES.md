@@ -61,7 +61,7 @@ Remote Provider / Storage / Security / Configuration) e os módulos reais:
 | CLI | `src/main.rs` — wrapper fino sobre a lib |
 | GUI | `src/bin/gui.rs` (feature `gui`) — thin sobre `service::Controller`; **não** depende do CLI do Proton diretamente |
 | Security (auditoria) | permissões de arquivo (`0700`/`0600` em `state_dir`/config), resolução do binário `proton-drive` — ver `SECURITY_AUDIT.md` |
-| Supporting | `models`, `events`, `stats`, `datefmt`, `logger`, `auth_signal`, `updater` (feature `gui`) |
+| Supporting | `models`, `events`, `stats`, `datefmt`, `logger`, `auth_signal`, `doctor` (diagnóstico só-leitura da instalação; devolve um `Report`, quem imprime é a CLI), `updater` (feature `gui`) |
 
 O critério de aceite mais importante de M0-001 já está satisfeito: a GUI não depende do CLI do
 Proton diretamente, e o Sync Engine não conhece detalhes da GUI.

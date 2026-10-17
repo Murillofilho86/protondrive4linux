@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use neutronsync::config::{self, Config};
+use neutronsync::doctor;
 use neutronsync::engine::Engine;
 use neutronsync::events::{EventSink, SyncEvent};
 use neutronsync::logger::Logger;
@@ -96,8 +97,23 @@ enum Cmd {
     Logout,
     /// Show config, resolved pairs and CLI availability.
     Status,
-    /// Probe the CLI and show how a listing is parsed.
-    Doctor { path: Option<String> },
+    /// Check the installation: CLI, sign-in, network, file permissions,
+    /// systemd, desktop entry. Changes nothing.
+    Doctor {
+        /// Also list this remote path and show how its JSON is parsed.
+        path: Option<String>,
+        /// Also list the remote root and show how its JSON is parsed
+        /// (debugging the CLI adapter).
+        #[arg(long, conflicts_with = "json")]
+        probe: bool,
+        /// Skip the checks that use the network (reachability and sign-in). A
+        /// listing you ask for with --probe or PATH still runs.
+        #[arg(long)]
+        offline: bool,
+        /// Print the report as JSON.
+        #[arg(long, conflicts_with_all = ["probe", "path"])]
+        json: bool,
+    },
     /// Run the bidirectional sync.
     Sync {
         /// Pair name(s) to sync (default: all).
@@ -133,7 +149,12 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         Cmd::Login => cmd_login(cli),
         Cmd::Logout => cmd_logout(cli),
         Cmd::Status => cmd_status(cli),
-        Cmd::Doctor { path } => cmd_doctor(cli, path.as_deref()),
+        Cmd::Doctor {
+            path,
+            probe,
+            offline,
+            json,
+        } => cmd_doctor(cli, path.as_deref(), *probe, *offline, *json),
         Cmd::Sync {
             pair,
             dry_run,
@@ -160,10 +181,15 @@ fn cmd_init(cli: &Cli, force: bool) -> anyhow::Result<ExitCode> {
         );
         return Ok(ExitCode::from(1));
     }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Private to the user (folder 0700, file 0600) like every other way the
+    // config gets written; `doctor` checks for exactly that.
+    config::write_private(&dest, EXAMPLE_CONFIG)?;
+    {
+        // The mode above only applies to a file this call creates; `--force` over
+        // an older, looser one should tighten it too.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::write(&dest, EXAMPLE_CONFIG)?;
     println!("Wrote starter config: {}", dest.display());
     println!("Edit it, then run:  protondrive4linux login  &&  protondrive4linux sync --dry-run");
     Ok(ExitCode::SUCCESS)
@@ -231,21 +257,47 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_doctor(cli: &Cli, path: Option<&str>) -> anyhow::Result<ExitCode> {
-    let cfg = load_cfg(cli)?;
-    let proton = ProtonCli::new(&cfg);
-    println!(
-        "binary: {}",
-        proton
-            .resolve_binary()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "NOT FOUND".into())
+fn cmd_doctor(
+    cli: &Cli,
+    path: Option<&str>,
+    probe: bool,
+    offline: bool,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let state = doctor::load_config(cli.config.as_deref());
+    let env = doctor::Env::from_process();
+    let host = doctor::SystemHost::new(&env);
+    let report = doctor::run(
+        VERSION_WITH_SHA,
+        &state,
+        &doctor::Options { offline },
+        &env,
+        &host,
     );
-    if let Some(w) = proton.binary_location_warning() {
-        println!("  ⚠ {w}");
+    let mut code = u8::from(report.has_failures());
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+        return Ok(ExitCode::from(code));
     }
-    println!("version: {}", proton.version());
-    let target = path.unwrap_or(&cfg.remote_root);
+    print!("{}", report.render());
+    if probe || path.is_some() {
+        match &state {
+            doctor::ConfigState::Loaded(cfg) => {
+                let target = path.unwrap_or(&cfg.remote_root);
+                if adapter_probe(cfg, target)? != ExitCode::SUCCESS {
+                    code = 1;
+                }
+            }
+            _ => println!("\nThe CLI probe needs a usable config; see the Config line above."),
+        }
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// List `target` through the CLI and show both the raw JSON and what the
+/// adapter makes of it - for when a CLI update changes the output shape.
+fn adapter_probe(cfg: &Config, target: &str) -> anyhow::Result<ExitCode> {
+    let proton = ProtonCli::new(cfg);
     println!("\nProbing `filesystem list -j {target}` ...");
     let raw = proton.raw_list(target)?;
     println!("--- raw JSON (first 1500 chars) ---");

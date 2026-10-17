@@ -38,7 +38,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M5-005 | Onboarding, tray, notificações | M5 | `type:feature` `area:gui` | ✅ |
 | M7-001 | Flatpak | M7 | `type:feature` `area:distribution` | 🔒 (bloqueado indefinidamente — ver decisão em M3-005) |
 | M7-002 | Instalador universal (.sh) | M7 | `type:feature` `area:distribution` | ⬜ |
-| M7-003 | `doctor` expandido | M7 | `type:feature` `area:packaging` | 🔶 |
+| M7-003 | `doctor` expandido | M7 | `type:feature` `area:packaging` | ✅ |
 | M7-004 | Publicação real na AUR | M7 | `area:distribution` | 🔒 (bloqueado externamente) |
 | M7-005 | `.SRCINFO` + `namcap` | M7 | `area:packaging` | ⬜ |
 | M9-001 | End-to-end test matrix | M9 | `type:test` `area:testing` | ⬜ |
