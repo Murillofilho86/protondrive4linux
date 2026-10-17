@@ -27,7 +27,8 @@ use neutronsync::models::{Compare, Entry};
 use neutronsync::process_lock::{self, ProcessLock};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
-    ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
+    AccountState, ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus,
+    PairState, Phase,
 };
 use neutronsync::stats::Stats;
 use neutronsync::themes::{self, Base, Catalog, ThemeColors};
@@ -1435,7 +1436,8 @@ impl eframe::App for App {
                         // daemon's possibly stale signed_out flag (up to 20s lag
                         // without a refresh signal).
                         if mine.account.checked {
-                            pubd.signed_out = mine.account.binary_found && !mine.account.signed_in;
+                            (pubd.signed_out, pubd.keyring_unreachable) =
+                                window_session_view(&mine.account);
                         }
                         pubd
                     }
@@ -1472,6 +1474,13 @@ impl eframe::App for App {
                 self.last_account_poll = now;
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        // A keyring the CLI can't reach is waited out: look again now and then,
+        // so the waiting page goes away by itself once the keyring answers.
+        let now = ctx.input(|i| i.time);
+        if keyring_recheck_due(&snap.account, now, self.last_account_poll) {
+            self.last_account_poll = now;
+            self.ctrl.refresh_account(true);
         }
 
         // advance page-fade animation
@@ -1704,7 +1713,11 @@ impl App {
     fn footer_status(&self, ui: &mut egui::Ui, snap: &AppState) {
         let last = snap.pairs.iter().filter_map(|p| p.last_synced).max();
         let any_err = snap.pairs.iter().any(|p| p.phase == Phase::Error);
-        let (col, pulse, text) = if snap.busy {
+        let (col, pulse, text) = if snap.signed_out {
+            (th().danger, false, "Signed out".to_string())
+        } else if snap.keyring_unreachable {
+            (th().warn, false, "Waiting for keyring".to_string())
+        } else if snap.busy {
             (th().accent, true, "Syncing…".to_string())
         } else if snap.watching {
             (th().accent, true, "Auto sync on".to_string())
@@ -1847,15 +1860,11 @@ impl App {
         let (bcol, bicon, btitle, bsub) = if let Some(b) = self.daemon_banner {
             // Background sync itself is down: nothing below is current.
             daemon_banner_text(b)
-        } else if snap.signed_out {
-            // A signed-out session is surfaced explicitly — everything else is
-            // blocked on it, so it takes priority over scan/sync/idle states.
-            (
-                th().danger,
-                Icon::Info,
-                "Signed out of Proton",
-                "Sign in on the Account tab to resume syncing".into(),
-            )
+        } else if let Some((tone, title, sub)) = session_banner(snap) {
+            // A session that can't be used is surfaced explicitly — everything
+            // else is blocked on it, so it takes priority over scan/sync/idle
+            // states.
+            (tone.color(), Icon::Info, title, sub.into())
         } else if active {
             (
                 th().accent,
@@ -3006,6 +3015,9 @@ impl App {
 
     fn page_signin(&mut self, ui: &mut egui::Ui, snap: &AppState) {
         let found = snap.account.binary_found;
+        // The CLI is there and may well hold a session, but can't reach the
+        // keyring it keeps it in: waiting for that is not a sign-in.
+        let keyring = found && snap.account.keyring_unreachable;
         let logo = self.logo_tex.clone();
         let col_w: f32 = 470.0;
 
@@ -3031,7 +3043,13 @@ impl App {
         };
 
         // Center the whole block vertically as one unit.
-        let est_h = if found { 300.0 } else { 470.0 };
+        let est_h = if keyring {
+            330.0
+        } else if found {
+            300.0
+        } else {
+            470.0
+        };
         ui.add_space(((ui.available_height() - est_h) / 2.0).max(24.0));
         let side = ((ui.available_width() - col_w) / 2.0).max(0.0);
         ui.horizontal(|ui| {
@@ -3042,7 +3060,9 @@ impl App {
                     let (lr, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
                     draw_logo(ui.painter(), lr, logo.as_ref());
                     ui.add_space(20.0);
-                    let title = if found {
+                    let title = if keyring {
+                        "Waiting for your keyring"
+                    } else if found {
                         "Sign in to Proton Drive"
                     } else {
                         "Get the proton-drive CLI"
@@ -3053,7 +3073,12 @@ impl App {
                             .color(th().text),
                     );
                     ui.add_space(10.0);
-                    let sub = if found {
+                    let sub = if keyring {
+                        "Your Proton session is kept in your system keyring, which can't be \
+                         reached right now: it is locked, or none is running in this \
+                         session. Unlock it and this screen goes away by itself. You don't \
+                         need to sign in again."
+                    } else if found {
                         "Signing in opens Proton's own login in your browser and signs in \
                          the official CLI. protondrive4linux never sees your password or \
                          credentials."
@@ -3109,7 +3134,7 @@ impl App {
                 ui.add_space(22.0);
                 let waiting = self.login_poll_until.is_some();
                 ui.vertical_centered(|ui| {
-                    if found {
+                    if found && !keyring {
                         ui.horizontal(|ui| {
                             ui.add_space((ui.available_width() - 290.0).max(0.0) / 2.0);
                             if button(
@@ -3139,23 +3164,35 @@ impl App {
                         "Check again",
                         Btn::Primary,
                         false,
-                        true,
+                        !(keyring && snap.account.checking),
                     )
                     .clicked()
                     {
                         self.last_account_poll = ui.ctx().input(|i| i.time);
-                        self.ctrl.refresh_account(false);
+                        // A keyring that answers wakes the background sync too.
+                        self.ctrl.refresh_account(keyring);
                     }
-                    if waiting {
+                    if waiting || keyring {
                         ui.add_space(14.0);
+                        // The row is centred by its estimated width.
+                        let row_w = if keyring { 176.0 } else { 150.0 };
                         ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 150.0).max(0.0) / 2.0);
+                            ui.add_space((ui.available_width() - row_w).max(0.0) / 2.0);
                             ui.spinner();
-                            ui.label(RichText::new("Waiting for sign-in…").color(th().dim));
+                            ui.label(
+                                RichText::new(if keyring {
+                                    "Waiting for the keyring…"
+                                } else {
+                                    "Waiting for sign-in…"
+                                })
+                                .color(th().dim),
+                            );
                         });
                     }
                     ui.add_space(14.0);
-                    let caption = if found {
+                    let caption = if keyring {
+                        "Still stuck? Run protondrive4linux doctor in a terminal.".to_string()
+                    } else if found {
                         snap.account.version.clone()
                     } else {
                         format!("Checked for \"{}\" on your PATH.", self.cfg.binary)
@@ -3788,6 +3825,51 @@ fn daemon_banner_text(b: DaemonBanner) -> (Color32, Icon, &'static str, String) 
     }
 }
 
+/// How long the window leaves a keyring it could not reach alone before looking
+/// again. Each look is a CLI call, and with a locked keyring that call can be
+/// what makes the keyring ask for its password, so this is slower than the
+/// sign-in poll; the Check again button looks at once.
+const KEYRING_RECHECK_SECS: f64 = 30.0;
+
+/// Whether the window should check the account again now because the CLI could
+/// not reach its keyring: the waiting page stays up only until it answers, and
+/// nothing else would tell this window. Never while a check is already running.
+fn keyring_recheck_due(account: &AccountState, now: f64, last_check: f64) -> bool {
+    account.keyring_unreachable && !account.checking && now - last_check >= KEYRING_RECHECK_SECS
+}
+
+/// The session as this window's own account check sees it, as
+/// `(signed_out, keyring_unreachable)`. A keyring that cannot be reached is not
+/// a sign-out, and no CLI at all is neither.
+fn window_session_view(account: &AccountState) -> (bool, bool) {
+    let cli = account.binary_found;
+    (
+        cli && !account.signed_in && !account.keyring_unreachable,
+        cli && account.keyring_unreachable,
+    )
+}
+
+/// The Activity banner for a session that can't be used, or `None` while it can.
+/// Signing in fixes one of these; nothing done in this app fixes the other, so
+/// it must not ask for a sign-in.
+fn session_banner(snap: &AppState) -> Option<(Tone, &'static str, &'static str)> {
+    if snap.signed_out {
+        Some((
+            Tone::Danger,
+            "Signed out of Proton",
+            "Sign in on the Account tab to resume syncing",
+        ))
+    } else if snap.keyring_unreachable {
+        Some((
+            Tone::Warn,
+            "Waiting for your keyring",
+            "Unlock it, or start one in this session, and syncing resumes by itself",
+        ))
+    } else {
+        None
+    }
+}
+
 /// Files across every pair that failed and are waiting out a retry backoff.
 fn retrying_total(snap: &AppState) -> usize {
     snap.pairs.iter().map(|p| p.retrying).sum()
@@ -3922,6 +4004,88 @@ mod status_text_tests {
     }
 
     const NOW: i64 = 10_000;
+
+    fn account(found: bool, signed_in: bool, keyring_unreachable: bool) -> AccountState {
+        AccountState {
+            checked: true,
+            binary_found: found,
+            signed_in,
+            keyring_unreachable,
+            ..AccountState::default()
+        }
+    }
+
+    #[test]
+    fn the_window_reads_the_session_off_its_own_account_check() {
+        assert_eq!(
+            window_session_view(&account(true, true, false)),
+            (false, false)
+        );
+        assert_eq!(
+            window_session_view(&account(true, false, false)),
+            (true, false),
+            "no session: signed out"
+        );
+        assert_eq!(
+            window_session_view(&account(true, false, true)),
+            (false, true),
+            "a keyring out of reach is waited for, not a sign-out"
+        );
+        assert_eq!(
+            window_session_view(&account(false, false, false)),
+            (false, false),
+            "no CLI at all is its own page, not a sign-out"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_keyring_is_looked_at_again_when_it_is_time_and_nothing_is_running() {
+        let waiting = account(true, false, true);
+        assert!(!keyring_recheck_due(
+            &waiting,
+            100.0,
+            100.0 - KEYRING_RECHECK_SECS + 1.0
+        ));
+        assert!(keyring_recheck_due(
+            &waiting,
+            100.0,
+            100.0 - KEYRING_RECHECK_SECS
+        ));
+        // A check already running is not doubled up: with a locked keyring each
+        // one can be a password prompt.
+        let mut running = waiting.clone();
+        running.checking = true;
+        assert!(!keyring_recheck_due(&running, 1_000.0, 0.0));
+        // Only the keyring wait polls; a plain sign-out waits for the user.
+        assert!(!keyring_recheck_due(
+            &account(true, false, false),
+            1_000.0,
+            0.0
+        ));
+        assert!(!keyring_recheck_due(
+            &account(true, true, false),
+            1_000.0,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn the_banner_never_sends_a_waiting_keyring_to_sign_in() {
+        let mut snap = AppState::default();
+        assert_eq!(session_banner(&snap), None);
+
+        snap.signed_out = true;
+        let (tone, title, sub) = session_banner(&snap).unwrap();
+        assert_eq!((tone, title), (Tone::Danger, "Signed out of Proton"));
+        assert!(sub.contains("Sign in"));
+
+        snap.signed_out = false;
+        snap.keyring_unreachable = true;
+        let (tone, title, sub) = session_banner(&snap).unwrap();
+        assert_eq!((tone, title), (Tone::Warn, "Waiting for your keyring"));
+        assert!(!sub.to_lowercase().contains("sign in"), "{sub}");
+        assert!(sub.contains("Unlock"), "{sub}");
+    }
 
     #[test]
     fn a_synced_folder_says_when_and_how_many_files() {

@@ -355,8 +355,12 @@ impl ProtonCli {
             // Auth failures FIRST: the keyring message ends in "No such file or
             // directory", which the not-found classifier below would swallow,
             // turning "signed out" into "remote folder is empty".
-            if is_not_logged_in(&low) {
-                return Err(anyhow!("not signed in: {}", first_nonempty(&err, &out)));
+            if let Some(problem) = session_problem(&low) {
+                let what = match problem {
+                    SessionProblem::SignedOut => "not signed in",
+                    SessionProblem::SecretStoreUnreachable => "the CLI can't reach its keyring",
+                };
+                return Err(anyhow!("{what}: {}", first_nonempty(&err, &out)));
             }
             if ["not found", "no such", "does not exist"]
                 .iter()
@@ -919,11 +923,38 @@ const SESSION_LOAD_FAILED: &str = "failed to load session";
 
 /// Whether an error is the CLI failing to reach its secret store (keyring
 /// locked, no D-Bus session, a headless box) rather than the user simply never
-/// having signed in. Both read as "not signed in" to the app, but the fix is
-/// different - signing in again won't help while the keyring is out of reach -
-/// so `doctor` says which.
+/// having signed in. Both stop every call, but the fix is different - signing
+/// in again won't help while the keyring is out of reach, and the session may
+/// well still be in it - so `doctor` and the app say which
+/// (see [`session_problem`]).
 pub fn is_secret_store_unreachable(s: &str) -> bool {
     s.to_ascii_lowercase().contains(SESSION_LOAD_FAILED)
+}
+
+/// Why the CLI has no usable session, when an error says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionProblem {
+    /// There is no session: never signed in, expired, or logged out. Signing
+    /// in fixes it.
+    SignedOut,
+    /// The CLI could not reach the secret store its session lives in (keyring
+    /// locked, no D-Bus session, a headless box). The session may be intact:
+    /// the app waits for the store and does not ask for a sign-in.
+    SecretStoreUnreachable,
+}
+
+/// What a failed CLI call says about the session, or `None` when the failure is
+/// about something else (a bad path, a network blip, a rate limit). The
+/// unreachable store is checked first because [`is_not_logged_in`] also matches
+/// it, on purpose: it must never be mistaken for "folder not found".
+pub fn session_problem(s: &str) -> Option<SessionProblem> {
+    if is_secret_store_unreachable(s) {
+        Some(SessionProblem::SecretStoreUnreachable)
+    } else if is_not_logged_in(s) {
+        Some(SessionProblem::SignedOut)
+    } else {
+        None
+    }
 }
 
 /// The oldest `proton-drive` CLI this build is verified against. 0.8.0 is where
@@ -1326,6 +1357,35 @@ mod tests {
             "You need to login first"
         ));
         assert!(!super::is_secret_store_unreachable(""));
+    }
+
+    #[test]
+    fn a_session_problem_says_whether_signing_in_would_help() {
+        use super::{session_problem, SessionProblem};
+        let keyring = "Failed to load session from secrets (ensure you have secrets \
+                       available): Could not connect: No such file or directory (code: 1)";
+        // The unreachable store also reads as "not logged in" to
+        // `is_not_logged_in` (so it is never taken for "folder not found"), but
+        // it must not be reported as a plain sign-out: signing in won't fix it.
+        assert_eq!(
+            session_problem(keyring),
+            Some(SessionProblem::SecretStoreUnreachable)
+        );
+        for signed_out in [
+            "You need to login first",
+            "Error: not logged in",
+            "no active session",
+        ] {
+            assert_eq!(
+                session_problem(signed_out),
+                Some(SessionProblem::SignedOut),
+                "{signed_out}"
+            );
+        }
+        // Anything that is not about the session is not a session problem.
+        for other in ["Node not found", "connection reset", "rate limited", ""] {
+            assert_eq!(session_problem(other), None, "{other:?}");
+        }
     }
 
     #[test]

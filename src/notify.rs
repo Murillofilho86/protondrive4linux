@@ -16,6 +16,9 @@
 //! - conflicts arriving together are batched into one notice, and notices are at
 //!   least [`CONFLICT_COOLDOWN_SECS`] apart (the rest wait and join the next);
 //! - a signed-out session notifies on the transition into it, not while it lasts;
+//! - a keyring the CLI can't reach is, at login, usually one its owner is about
+//!   to unlock, so that only notifies once it has lasted [`KEYRING_GRACE_SECS`],
+//!   then once per episode;
 //! - the tray supervisor giving up on a tray that keeps dying notifies at most
 //!   once an hour ([`announce_give_up`]).
 
@@ -35,12 +38,17 @@ pub const ERROR_COOLDOWN_SECS: i64 = 600;
 pub const CONFLICT_BATCH_SECS: i64 = 3;
 /// Minimum gap between two conflict notifications.
 pub const CONFLICT_COOLDOWN_SECS: i64 = 30;
+/// How long the keyring must stay out of reach before it's worth a notification:
+/// well past the minute it takes to type a password into the unlock prompt.
+pub const KEYRING_GRACE_SECS: i64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
     Conflict,
     Error,
     SignedOut,
+    /// The CLI has been unable to reach its keyring for a while.
+    WaitingForKeyring,
     /// The tray supervisor stopped restarting a tray that keeps failing.
     BackgroundSyncStopped,
 }
@@ -59,6 +67,8 @@ pub struct Notifier {
     error_since: Option<i64>,
     error_notified: bool,
     last_error_notice: Option<i64>,
+    keyring_since: Option<i64>,
+    keyring_notified: bool,
     pending: Vec<ConflictRecord>,
     pending_since: Option<i64>,
     last_conflict_notice: Option<i64>,
@@ -73,6 +83,8 @@ impl Notifier {
             error_since: None,
             error_notified: false,
             last_error_notice: None,
+            keyring_since: None,
+            keyring_notified: false,
             pending: Vec::new(),
             pending_since: None,
             last_conflict_notice: None,
@@ -97,6 +109,23 @@ impl Notifier {
                 summary: "Signed out of Proton".into(),
                 body: "Syncing is stopped until you sign in again.".into(),
             });
+        }
+
+        if status == OverallStatus::WaitingForKeyring {
+            let since = *self.keyring_since.get_or_insert(now);
+            if !self.keyring_notified && now - since >= KEYRING_GRACE_SECS {
+                out.push(Notification {
+                    kind: NoticeKind::WaitingForKeyring,
+                    summary: "Waiting for your keyring".into(),
+                    body: "Syncing is paused because the keyring can't be reached. Unlock it, \
+                           or start one in this session, and syncing resumes by itself."
+                        .into(),
+                });
+                self.keyring_notified = true;
+            }
+        } else {
+            self.keyring_since = None;
+            self.keyring_notified = false;
         }
 
         if status == OverallStatus::Error {
@@ -465,6 +494,95 @@ mod tests {
         assert!(n.tick(100, OverallStatus::Synced, "x", vec![]).is_empty());
         assert_eq!(
             kinds(&n.tick(101, OverallStatus::SignedOut, "x", vec![])),
+            [NoticeKind::SignedOut]
+        );
+    }
+
+    #[test]
+    fn a_keyring_that_stays_out_of_reach_notifies_once_after_the_grace_period() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        // The usual login: the keyring is unlocked within moments. Silence.
+        for t in 0..KEYRING_GRACE_SECS {
+            assert!(
+                n.tick(t, OverallStatus::WaitingForKeyring, "x", vec![])
+                    .is_empty(),
+                "t={t}"
+            );
+        }
+        let out = n.tick(
+            KEYRING_GRACE_SECS,
+            OverallStatus::WaitingForKeyring,
+            "x",
+            vec![],
+        );
+        assert_eq!(kinds(&out), [NoticeKind::WaitingForKeyring]);
+        assert_eq!(out[0].summary, "Waiting for your keyring");
+        assert!(
+            !out[0].body.to_lowercase().contains("sign in"),
+            "it must not send the user to sign in: {}",
+            out[0].body
+        );
+        // The same episode never repeats, however long it lasts.
+        for t in (KEYRING_GRACE_SECS + 1)..(KEYRING_GRACE_SECS + 5000) {
+            assert!(n
+                .tick(t, OverallStatus::WaitingForKeyring, "x", vec![])
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn a_keyring_unlocked_in_time_never_notifies_and_the_next_wait_starts_afresh() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        for t in 0..KEYRING_GRACE_SECS {
+            assert!(n
+                .tick(t, OverallStatus::WaitingForKeyring, "x", vec![])
+                .is_empty());
+        }
+        assert!(n
+            .tick(KEYRING_GRACE_SECS, OverallStatus::Synced, "ok", vec![])
+            .is_empty());
+        // Out of reach again: the clock restarts from here, not from before.
+        let again = KEYRING_GRACE_SECS + 10;
+        assert!(n
+            .tick(again, OverallStatus::WaitingForKeyring, "x", vec![])
+            .is_empty());
+        assert!(n
+            .tick(
+                again + KEYRING_GRACE_SECS - 1,
+                OverallStatus::WaitingForKeyring,
+                "x",
+                vec![]
+            )
+            .is_empty());
+        assert_eq!(
+            kinds(&n.tick(
+                again + KEYRING_GRACE_SECS,
+                OverallStatus::WaitingForKeyring,
+                "x",
+                vec![]
+            )),
+            [NoticeKind::WaitingForKeyring]
+        );
+    }
+
+    #[test]
+    fn waiting_for_the_keyring_is_not_announced_as_a_sign_out() {
+        // Whatever the keyring is doing, a plain waiting state never produces
+        // the "Signed out of Proton" notice, immediately or later.
+        let mut n = Notifier::new(OverallStatus::Synced);
+        for t in 0..(2 * KEYRING_GRACE_SECS) {
+            let out = n.tick(t, OverallStatus::WaitingForKeyring, "x", vec![]);
+            assert!(!kinds(&out).contains(&NoticeKind::SignedOut), "t={t}");
+        }
+        // But if the keyring answers and the session turns out to be gone, that
+        // is a sign-out and says so.
+        assert_eq!(
+            kinds(&n.tick(
+                2 * KEYRING_GRACE_SECS,
+                OverallStatus::SignedOut,
+                "x",
+                vec![]
+            )),
             [NoticeKind::SignedOut]
         );
     }

@@ -28,6 +28,9 @@ struct AppState {
     activity: VecDeque<ActivityItem>,   // newest at the back, capped at 500
     busy: bool,                          // a sync is running
     watching: bool,                      // watch daemon active
+    signed_out: bool,                    // no Proton session: signing in resumes sync
+    keyring_unreachable: bool,           // the CLI can't reach the keyring holding the session:
+                                         // a wait, not a sign-out (never both flags at once)
 }
 
 struct PairState {
@@ -42,7 +45,7 @@ struct PairState {
     retrying: usize,                     // failed files waiting out a retry backoff (M4-004)
 }
 
-struct AccountState { checked, binary_found, signed_in: bool, version: String }
+struct AccountState { checked, binary_found, signed_in, keyring_unreachable: bool, version: String }
 struct ActivityItem { ts: i64, kind: ActivityKind /*Info|Sync|Error*/, text: String }
 ```
 
@@ -58,10 +61,13 @@ For places with room for a single state (the tray icon), `AppState::overall()` c
 | `OverallStatus` | When | Example line |
 | --- | --- | --- |
 | `SignedOut` | the Proton session expired | `Signed out of Proton — sign in to resume` |
+| `WaitingForKeyring` | the CLI can't reach the keyring its session is kept in (locked, no D-Bus session, headless) | `Waiting for your keyring — unlock it to resume` |
 | `Error` | a pair's last run had errors, or files are waiting to retry | `docs: upload a.txt: <reason>` / `docs: 2 files failed, retrying automatically` |
 | `Syncing` | a scan or transfer is in flight (or the first pass isn't done) | `Syncing docs (3/10)` |
 | `Synced` | live sync is on and everything is up to date | `Up to date · synced 2 minutes ago` |
 | `Paused` | live sync is off | `Auto sync is off` / `No folders to sync` |
+
+`WaitingForKeyring` is not a sign-out and must not be rendered as one: signing in again does nothing for a keyring that is out of reach, the session is usually still in it, and it ends by itself once the keyring answers. Show a waiting page (no sign-in button), and look again now and then: `controller.refresh_account(true)` re-checks the account (`AccountState::keyring_unreachable`) and, when the session is back, wakes the watcher; the window does this every 30 seconds while it waits. In the event stream it is `SyncEvent::KeyringUnreachable`, and a `SyncEvent::Auth` (either value) is what ends it.
 
 `controller.status_summary()` returns both under the state lock without cloning the activity feed, so it is cheap enough to poll several times a second. `PairState::retrying` counts files that failed and are still inside their backoff window: a run that merely *skips* them finishes with zero errors, so without it a pair would read as healthy while files are failing.
 

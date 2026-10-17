@@ -41,7 +41,8 @@ pub enum FileStatus {
     Pending,
     /// Changed on both sides; see the Conflicts page.
     Conflict,
-    /// Can't reach Proton: the session is signed out.
+    /// Can't reach Proton: the session is signed out, or the keyring it lives
+    /// in can't be reached.
     Offline,
     /// The last run had errors.
     Error,
@@ -180,7 +181,7 @@ pub fn desired(inp: &Inputs) -> BTreeMap<PathBuf, FileStatus> {
             _ => FileStatus::Synced,
         };
         let mut root_status = run.max(worst);
-        if inp.state.signed_out {
+        if inp.state.signed_out || inp.state.keyring_unreachable {
             root_status = root_status.max(FileStatus::Offline);
         }
         put(&mut out, root.clone(), root_status);
@@ -476,6 +477,15 @@ mod tests {
         // Signed out lifts a calm root to Offline, but never hides an error.
         let mut st = state_of(&[("docs", Phase::Synced)]);
         st.signed_out = true;
+        assert_eq!(
+            run(&p, &st, &[], &HashMap::new())[&root],
+            FileStatus::Offline
+        );
+        st.pairs[0].phase = Phase::Error;
+        assert_eq!(run(&p, &st, &[], &HashMap::new())[&root], FileStatus::Error);
+        // A keyring the CLI can't reach stops sync just the same.
+        let mut st = state_of(&[("docs", Phase::Synced)]);
+        st.keyring_unreachable = true;
         assert_eq!(
             run(&p, &st, &[], &HashMap::new())[&root],
             FileStatus::Offline

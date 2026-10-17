@@ -1,9 +1,10 @@
 //! Tray status icons: the app logo with a small status badge in the
 //! bottom-right corner, drawn from scratch (no image crate) so the tray can
-//! show sync state at a glance - synced, syncing, paused, error, signed out.
+//! show sync state at a glance - synced, syncing, paused, error, signed out,
+//! waiting for the keyring.
 //!
 //! The badge pairs a color with a distinct white glyph (check, dots, bars,
-//! "!", dash) so the state doesn't hinge on telling hues apart.
+//! "!", dash, clock) so the state doesn't hinge on telling hues apart.
 
 use crate::service::OverallStatus;
 
@@ -27,17 +28,20 @@ pub fn status_color(status: OverallStatus) -> [u8; 3] {
         OverallStatus::Syncing => [0x3B, 0x9C, 0xFF],
         OverallStatus::Paused => [0x8E, 0x8B, 0x9A],
         OverallStatus::Error => [0xE0, 0x50, 0x64],
-        OverallStatus::SignedOut => [0xF0, 0xA0, 0x30],
+        // Amber for both "needs you, and nothing is wrong with the files": the
+        // glyph says which.
+        OverallStatus::SignedOut | OverallStatus::WaitingForKeyring => [0xF0, 0xA0, 0x30],
     }
 }
 
 /// Every status, for building the full set of icons up front.
-pub const ALL_STATUSES: [OverallStatus; 5] = [
+pub const ALL_STATUSES: [OverallStatus; 6] = [
     OverallStatus::Synced,
     OverallStatus::Syncing,
     OverallStatus::Paused,
     OverallStatus::Error,
     OverallStatus::SignedOut,
+    OverallStatus::WaitingForKeyring,
 ];
 
 /// An `ICON_SIZE` x `ICON_SIZE` RGBA icon: `logo` (RGBA, `src_w` x `src_h`,
@@ -106,6 +110,14 @@ pub fn status_icon_rgba(logo: &[u8], src_w: usize, src_h: usize, status: Overall
         OverallStatus::SignedOut => {
             // "blocked" dash
             paint_segment(&mut out, (c - 0.48 * u, c), (c + 0.48 * u, c), 1.6, WHITE);
+        }
+        OverallStatus::WaitingForKeyring => {
+            // a small clock: a ring with two hands
+            let r = 0.56 * u;
+            paint_disc(&mut out, c, c, r + 1.1, WHITE);
+            paint_disc(&mut out, c, c, r - 1.1, status_color(status));
+            paint_segment(&mut out, (c, c), (c, c - 0.34 * u), 1.0, WHITE);
+            paint_segment(&mut out, (c, c), (c + 0.26 * u, c), 1.0, WHITE);
         }
     }
     out
@@ -275,6 +287,19 @@ mod tests {
         let out = render(OverallStatus::SignedOut);
         assert_eq!(badge_px(&out, 0.0, 0.0), white);
         assert_eq!(badge_px(&out, 0.4 * U, 0.0), white);
+
+        // Waiting for the keyring: a clock - a ring, a hand up and a hand right.
+        let waiting = render(OverallStatus::WaitingForKeyring);
+        assert_eq!(badge_px(&waiting, 0.56 * U, 0.0), white, "ring, right");
+        assert_eq!(badge_px(&waiting, -0.56 * U, 0.0), white, "ring, left");
+        assert_eq!(badge_px(&waiting, 0.0, -0.25 * U), white, "hand up");
+        assert_eq!(badge_px(&waiting, 0.18 * U, 0.0), white, "hand right");
+        assert_ne!(
+            badge_px(&waiting, -0.3 * U, 0.0),
+            white,
+            "no hand to the left"
+        );
+        assert_ne!(badge_px(&waiting, 0.0, 0.3 * U), white, "no hand down");
 
         // Syncing: three dots in a row.
         let syncing = render(OverallStatus::Syncing);

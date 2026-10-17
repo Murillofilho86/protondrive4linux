@@ -44,6 +44,10 @@ What a fresh install shows until the CLI has a session.
 
 ![Sign-in page](screenshots/sign-in.png)
 
+When the CLI has a session but can't reach the keyring it is kept in (the keyring is locked, or none is running in this session), the app does not ask you to sign in, because that would not help. It waits, and carries on by itself once the keyring answers:
+
+![Waiting for the keyring](screenshots/keyring.png)
+
 ## Light theme
 
 Settings → Appearance → Theme is **System** (follows the desktop's light/dark setting), **Light**, **Dark**, or any theme file you add (see [THEMES.md](THEMES.md)).

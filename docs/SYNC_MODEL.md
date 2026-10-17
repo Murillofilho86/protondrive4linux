@@ -50,6 +50,12 @@ The full walk **streams**: rather than scan the whole tree and only then apply, 
 
 Concurrency is a pool of workers (`scan_threads`, auto = CPU cores clamped to 2..8), each with its own Engine and cache dir. They share one read-only baseline snapshot and commit disjoint rows (SQLite serialises the writes), and the breadth-first, level-by-level structure means a parent folder is always created before its children are processed. A sequential reference implementation (`Engine::sync_pair_streaming`) is the tested oracle for the walk's semantics; an equivalence test asserts it reaches the same end state as the batch walk.
 
+## The session gate: signed out is not the same as a keyring out of reach
+
+When the `proton-drive` session is unusable every remote call fails, and a full walk would bury the one real cause under an error per folder. So the watcher probes the session (one cheap listing of the remote root) at startup, after any cycle that had errors, every five minutes while it works, and when a window nudges it (`auth_signal`), and keeps a gate: `Open`, `SignedOut` or `KeyringUnreachable`. While the gate is shut it does no sync work, cancels a running walk, says why once (`SyncEvent::Auth { signed_in: false }` or `SyncEvent::KeyringUnreachable`) and probes again - every 20 seconds for a sign-out, every minute for the keyring - until the probe succeeds, then says so (`Auth { signed_in: true }`) and re-walks soon, since anything may have changed meanwhile.
+
+The two shut states differ because the fix does. `SignedOut` means there is no session and it takes a sign-in. `KeyringUnreachable` means the CLI could not reach the secret store its session lives in (locked, no D-Bus session in this login, headless): the session is usually intact, signing in again does nothing, and it ends by itself once the keyring answers - so the app says "waiting for your keyring", offers no sign-in, probes less often (a probe of a locked keyring can be what makes it ask for its password) and notifies only if it lasts five minutes. Telling them apart is `protoncli::session_problem`, from the CLI's message: it is the one place that knows the wording. An inconclusive probe (a network blip) never moves the gate in either direction.
+
 ## Data-safety invariants
 
 These are the rules that must hold. Most exist because breaking one caused a real incident.
