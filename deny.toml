@@ -20,6 +20,19 @@ ignore = [
     # quick-xml = "^0.39", outside the >=0.41.0 fix range.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic-time attribute dedup, via wayland-scanner (build-time only, fixed trusted input). See ci.yml's audit job for the full explanation." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation, via wayland-scanner (build-time only, fixed trusted input). See ci.yml's audit job for the full explanation." },
+    # The zbus maintainers folded zvariant, zvariant_derive and zbus_names into the
+    # `zbus` crate itself (6.0) and marked the standalone crates unmaintained - a
+    # notice about where the code now lives, not a vulnerability. All three are at
+    # 5.x here, the version `zbus 5` (our own direct dependency, gui feature only:
+    # desktop notifications and the system light/dark setting) shares with egui's
+    # accessibility stack (eframe -> egui-winit -> accesskit_winit -> accesskit_unix
+    # -> atspi -> zbus 5). Moving our dependency to zbus 6 would not remove them,
+    # because accesskit_unix would still pull the 5.x crates; the way out is
+    # eframe/accesskit moving to zbus 6. Re-check when they do, and remove all
+    # three then.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5.x is marked unmaintained (folded into zbus 6). No safe upgrade reachable: zbus 5 is shared with egui's accessibility stack (accesskit_unix). gui feature only. Re-check when eframe/accesskit move to zbus 6." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4.x is marked unmaintained (folded into zbus 6). Same root cause and re-check condition as RUSTSEC-2026-0370." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.x is marked unmaintained (its derive macros now ship in zbus 6). Same root cause and re-check condition as RUSTSEC-2026-0370." },
 ]
 
 [licenses]
