@@ -1151,6 +1151,7 @@ mod tests {
             debounce_secs: 2,
             update_channel: UpdateChannel::Stable,
             check_on_launch: false,
+            notifications: true,
             state_dir: std::env::temp_dir(),
             pairs: vec![],
             source_path: None,

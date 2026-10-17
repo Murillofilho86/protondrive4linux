@@ -56,6 +56,25 @@ pub struct ConflictRecord {
     pub dismissed: bool,
 }
 
+/// One `conflicts` row (columns: id, ts, pair, rel, resolution, copy_rel,
+/// dismissed). A row written by a newer build with a resolution this one
+/// doesn't know yields `None` - skipped rather than guessed at.
+fn conflict_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ConflictRecord>> {
+    let resolution: String = r.get(4)?;
+    let Some(resolution) = ConflictResolution::parse(&resolution) else {
+        return Ok(None);
+    };
+    Ok(Some(ConflictRecord {
+        id: r.get(0)?,
+        ts: r.get(1)?,
+        pair: r.get(2)?,
+        rel: r.get(3)?,
+        resolution,
+        copy_rel: r.get(5)?,
+        dismissed: r.get::<_, i64>(6)? != 0,
+    }))
+}
+
 impl Stats {
     /// Open (creating if needed) the stats DB under `state_dir`.
     pub fn open(state_dir: &Path) -> Result<Self> {
@@ -510,36 +529,35 @@ impl Stats {
              WHERE dismissed = 0 OR ?1
              ORDER BY ts DESC, id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![include_dismissed, limit as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, ts, pair, rel, resolution, copy_rel, dismissed) = row?;
-            // A row written by a newer build with a resolution this one doesn't
-            // know is skipped rather than guessed at.
-            let Some(resolution) = ConflictResolution::parse(&resolution) else {
-                continue;
-            };
-            out.push(ConflictRecord {
-                id,
-                ts,
-                pair,
-                rel,
-                resolution,
-                copy_rel,
-                dismissed: dismissed != 0,
-            });
-        }
-        Ok(out)
+        let rows = stmt.query_map(params![include_dismissed, limit as i64], conflict_row)?;
+        Ok(rows
+            .filter_map(|r| r.transpose())
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Conflicts recorded after `after_id`, oldest first - what a notifier has
+    /// not yet seen. Includes ones already dismissed: they're new either way.
+    pub fn conflicts_since(&self, after_id: i64, limit: usize) -> Result<Vec<ConflictRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, pair, rel, resolution, copy_rel, dismissed FROM conflicts
+             WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit as i64], conflict_row)?;
+        Ok(rows
+            .filter_map(|r| r.transpose())
+            .collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The highest conflict id so far (0 if none): where a notifier starts, so
+    /// it only announces conflicts that happen after it began watching.
+    pub fn max_conflict_id(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(
+            conn.query_row("SELECT COALESCE(MAX(id), 0) FROM conflicts", [], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     /// How many conflicts are still unresolved (the inbox badge).
@@ -788,6 +806,37 @@ mod tests {
         s.dismiss_all_conflicts().unwrap();
         assert_eq!(s.conflict_count().unwrap(), 0);
         assert_eq!(s.conflicts(true, 1).unwrap().len(), 1, "limit applies");
+    }
+
+    #[test]
+    fn conflicts_since_returns_only_newer_rows_oldest_first() {
+        let s = Stats::memory().unwrap();
+        assert_eq!(s.max_conflict_id().unwrap(), 0, "empty table");
+        assert!(s.conflicts_since(0, 10).unwrap().is_empty());
+
+        for (i, rel) in ["a", "b", "c"].iter().enumerate() {
+            s.record_conflict("p", rel, ConflictResolution::KeptBoth, None, i as i64)
+                .unwrap();
+        }
+        let all = s.conflicts_since(0, 10).unwrap();
+        assert_eq!(
+            all.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"],
+            "oldest first, unlike the inbox"
+        );
+
+        // A notifier that has seen up to the second row gets only the third...
+        let seen = all[1].id;
+        let newer = s.conflicts_since(seen, 10).unwrap();
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].rel, "c");
+        // ...including ones already acknowledged, which are new to it all the same.
+        s.dismiss_conflict(newer[0].id).unwrap();
+        assert_eq!(s.conflicts_since(seen, 10).unwrap().len(), 1);
+
+        assert_eq!(s.max_conflict_id().unwrap(), all[2].id);
+        assert_eq!(s.conflicts_since(all[2].id, 10).unwrap().len(), 0);
+        assert_eq!(s.conflicts_since(0, 2).unwrap().len(), 2, "limit applies");
     }
 
     #[test]

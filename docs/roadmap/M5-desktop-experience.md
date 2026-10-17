@@ -45,9 +45,9 @@ Pending`.
 - [ ] Sync status.
 
 ## M5-005 — Onboarding, tray, notificações desktop
-**Status: 🔶 Parcial.** A maior parte já existia no código — o status "não iniciado" estava
-desatualizado — e o que faltava de verdade era o ícone de estados e as notificações nativas.
-O ícone de estados está pronto; as notificações são o próximo passo.
+**Status: ✅ Concluído.** A maior parte já existia no código — o status "não iniciado" estava
+desatualizado — e o que faltava de verdade era o ícone de estados e as notificações nativas;
+os dois estão prontos.
 
 - [x] GUI egui com onboarding (porta de login quando o CLI falta/não há sessão), lista de pares
       de pasta, status de sync por pasta e log de atividade em tempo real.
@@ -60,8 +60,25 @@ O ícone de estados está pronto; as notificações são o próximo passo.
       `AppState::overall()` (`src/service.rs`), reutilizável por outros frontends. Verificado
       ao vivo no painel do COSMIC (sincronizado, erro de upload e deslogado).
 - [x] Fluxo de "escolher pastas para sincronizar" (seletor de exclusão).
-- [ ] Notificações desktop nativas para conflitos e erros (nenhum código de notificação
-      existe hoje).
+- [x] Notificações desktop nativas para conflitos e erros (`src/notify.rs`). Uma única chamada
+      `org.freedesktop.Notifications.Notify` pelo barramento de sessão — todo daemon de
+      notificação implementa, então vale pra GNOME/KDE/COSMIC/XFCE/mako/dunst — via `zbus`, que
+      **já estava no build** (a camada de acessibilidade do eframe puxa); a única mudança no
+      `Cargo.lock` é uma linha. O que decide *quando* avisar é uma máquina de estados pura
+      (`Notifier`, relógio injetado, testada): um problema de sync só avisa depois de durar ~90s
+      (um blip de rate-limit que some no primeiro retry fica quieto), uma vez por episódio e no
+      máximo a cada 10 min; conflitos que chegam juntos viram uma notificação só, espaçadas de
+      ≥30s (o excedente espera e entra na próxima, nada se perde); deslogar avisa na transição,
+      não enquanto dura. Só conflitos que acontecem *depois* do daemon subir contam (reiniciar
+      nunca repete os antigos). Vem do daemon da bandeja (precisa de "Run in system tray");
+      switch "Desktop notifications" em Settings / `notifications = false`. Verificado de ponta a
+      ponta: teste automatizado com um `dbus-daemon` privado + servidor de notificações falso
+      (prova o formato exato da chamada, que de outro modo falharia em silêncio), e o daemon
+      real mandando a chamada ao daemon de notificações do COSMIC.
+
+Fica de fora, de propósito: **clicar na notificação** pra abrir o app (precisa ouvir
+`ActionInvoked` numa conexão persistente; `--page conflicts` já existe pra isso) e notificações
+do `watch` headless (o binário CLI não compila `zbus`; só o daemon da GUI notifica).
 
 Achado ao fazer o ícone: depois do M4-004, uma execução que só *pula* arquivos em backoff
 termina com zero erros, então o par aparecia como "Synced"/"watching" mesmo com arquivos

@@ -64,6 +64,7 @@ fn cfg(binary: &str, cli_timeout_secs: u64, root: &Path) -> Config {
         debounce_secs: 2,
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
+        notifications: true,
         state_dir: root.join("state"),
         pairs: vec![],
         source_path: None,

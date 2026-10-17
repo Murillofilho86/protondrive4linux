@@ -42,6 +42,10 @@ gtk = { version = "0.18", optional = true }
 ureq = { version = "2", optional = true }
 semver = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+# Desktop notifications (GUI-only): one `org.freedesktop.Notifications.Notify`
+# call over the session bus. Not a new crate - zbus is already in the tree
+# (eframe's accessibility layer pulls it in); this just adds its blocking API.
+zbus = { version = "5", optional = true, default-features = false, features = ["async-io", "blocking-api"] }
 
 [profile.release]
 opt-level = "z"   # optimise for size ("lite")
@@ -63,6 +67,7 @@ gui = [
     "dep:ureq",
     "dep:semver",
     "dep:sha2",
+    "dep:zbus",
 ]
 
 [[bin]]

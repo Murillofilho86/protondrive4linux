@@ -17,11 +17,15 @@ pub mod icon;
 pub mod ignore;
 pub mod logger;
 pub mod models;
+#[cfg(feature = "gui")]
+pub mod notify;
 pub mod protoncli;
 pub mod ratelimit;
 pub mod service;
 pub mod state;
 pub mod stats;
+#[cfg(all(test, feature = "gui"))]
+mod testbus;
 pub mod trash;
 #[cfg(feature = "gui")]
 pub mod updater;
