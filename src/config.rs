@@ -27,6 +27,15 @@ pub enum ConflictPolicy {
     Skip,
 }
 
+/// Which theme the GUI draws with (M5-001).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemePref {
+    /// Follow the desktop's light/dark setting.
+    System,
+    Light,
+    Dark,
+}
+
 /// Release channel the in-app updater follows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UpdateChannel {
@@ -119,6 +128,8 @@ pub struct Config {
     /// Send desktop notifications for conflicts, sync problems that persist,
     /// and a signed-out session (GUI/tray only).
     pub notifications: bool,
+    /// GUI theme: follow the desktop, or force light or dark.
+    pub theme: ThemePref,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -201,6 +212,7 @@ struct RawOptions {
     update_channel: Option<String>,
     check_on_launch: Option<bool>,
     notifications: Option<bool>,
+    theme: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,6 +400,13 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         other => bail!("options.update_channel must be stable|prerelease, got {other:?}"),
     };
 
+    let theme = match opts.theme.as_deref().unwrap_or("system") {
+        "system" => ThemePref::System,
+        "light" => ThemePref::Light,
+        "dark" => ThemePref::Dark,
+        other => bail!("options.theme must be system|light|dark, got {other:?}"),
+    };
+
     let state_dir = match opts.state_dir {
         Some(s) => expand(&s),
         None => state_home().join("protondrive4linux"),
@@ -451,6 +470,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         update_channel,
         check_on_launch: opts.check_on_launch.unwrap_or(false),
         notifications: opts.notifications.unwrap_or(true),
+        theme,
         state_dir,
         pairs,
         source_path: Some(path),
@@ -595,6 +615,7 @@ struct OutOptions {
     update_channel: String,
     check_on_launch: bool,
     notifications: bool,
+    theme: String,
     state_dir: String,
 }
 
@@ -638,6 +659,14 @@ fn compare_str(v: Compare) -> &'static str {
     }
 }
 
+fn theme_str(v: ThemePref) -> &'static str {
+    match v {
+        ThemePref::System => "system",
+        ThemePref::Light => "light",
+        ThemePref::Dark => "dark",
+    }
+}
+
 fn update_channel_str(v: UpdateChannel) -> &'static str {
     match v {
         UpdateChannel::Stable => "stable",
@@ -678,6 +707,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             update_channel: update_channel_str(cfg.update_channel).to_string(),
             check_on_launch: cfg.check_on_launch,
             notifications: cfg.notifications,
+            theme: theme_str(cfg.theme).to_string(),
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg
@@ -726,7 +756,60 @@ pub fn save(cfg: &Config, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate_transfer_flags, TransferKind};
+    use super::{load, migrate_transfer_flags, to_toml, ThemePref, TransferKind};
+
+    /// Write `toml` to a fresh temp file and load it as a config.
+    fn load_str(tag: &str, toml: &str) -> anyhow::Result<super::Config> {
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-config-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = load(Some(path.to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).ok();
+        cfg
+    }
+
+    #[test]
+    fn theme_defaults_to_system_and_round_trips() {
+        let cfg = load_str("theme-default", "").unwrap();
+        assert_eq!(cfg.theme, ThemePref::System);
+
+        for (name, want) in [
+            ("system", ThemePref::System),
+            ("light", ThemePref::Light),
+            ("dark", ThemePref::Dark),
+        ] {
+            let cfg = load_str("theme-set", &format!("[options]\ntheme = \"{name}\"\n")).unwrap();
+            assert_eq!(cfg.theme, want, "{name}");
+            // Saving and reloading keeps the choice.
+            let again = load_str("theme-again", &to_toml(&cfg).unwrap()).unwrap();
+            assert_eq!(again.theme, want, "{name} after a save/load round trip");
+        }
+    }
+
+    #[test]
+    fn an_unknown_theme_is_rejected_naming_the_choices() {
+        let err = load_str("theme-bad", "[options]\ntheme = \"solarized\"\n")
+            .expect_err("an unknown theme must not load");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("system|light|dark"), "unhelpful error: {msg}");
+    }
+
+    #[test]
+    fn notifications_default_on_and_round_trip() {
+        assert!(load_str("notif-default", "").unwrap().notifications);
+        let off = load_str("notif-off", "[options]\nnotifications = false\n").unwrap();
+        assert!(!off.notifications);
+        let again = load_str("notif-again", &to_toml(&off).unwrap()).unwrap();
+        assert!(!again.notifications);
+    }
 
     #[test]
     fn migrates_legacy_conflict_strategy_upload() {

@@ -7,6 +7,8 @@
 //! The library is deliberately separate from the CLI binary so a future GUI can
 //! depend on the same core (config, engine, adapter, state).
 
+#[cfg(feature = "gui")]
+pub mod appearance;
 pub mod auth_signal;
 pub mod config;
 pub mod datefmt;

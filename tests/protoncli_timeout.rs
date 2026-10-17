@@ -65,6 +65,7 @@ fn cfg(binary: &str, cli_timeout_secs: u64, root: &Path) -> Config {
         update_channel: UpdateChannel::Stable,
         check_on_launch: false,
         notifications: true,
+        theme: neutronsync::config::ThemePref::System,
         state_dir: root.join("state"),
         pairs: vec![],
         source_path: None,

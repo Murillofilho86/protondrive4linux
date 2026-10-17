@@ -1152,6 +1152,7 @@ mod tests {
             update_channel: UpdateChannel::Stable,
             check_on_launch: false,
             notifications: true,
+            theme: crate::config::ThemePref::System,
             state_dir: std::env::temp_dir(),
             pairs: vec![],
             source_path: None,

@@ -4,24 +4,40 @@ Funde as antigas "Fase 3" (GUI) e "Fase 4" (integração com desktop) do roadmap
 
 ## M5-001 — Sistema de temas (System/Light/Dark)
 **Labels**: `type:feature`, `area:gui`
-**Status: ⬜ Não iniciado.**
+**Status: ✅ Concluído.** Settings → Appearance → Theme: **System** (padrão), **Light** ou
+**Dark** (`theme = "system"|"light"|"dark"` no config).
 
-### Arquitetura proposta
-```text
-Theme
- ├── colors
- ├── typography
- ├── spacing
- └── components
-```
+### Como ficou
+- **Tokens, não constantes.** As 13 cores que eram `const` espalhadas por ~190 usos viraram campos
+  semânticos de um `Palette` (`nav_bg`, `panel`, `panel2`, `sel`, `text`, `dim`, `dim2`, `accent*`,
+  `ok`, `danger`, `warn`, mais `line`/`hover`, que são translúcidos pra funcionar sobre qualquer
+  superfície), lidos por `th()`. Duas paletas: a escura (a de sempre, derivada dos pixels do
+  logo) e uma clara que mantém os mesmos matizes sobre uma base lavanda e escurece as cores de
+  status até lerem sobre ela. Achados do auditoria de papéis, que um `s/TEXT/…/` cego teria
+  quebrado no modo claro: "texto sobre o destaque" (botão primário) precisa de um token próprio
+  (`on_accent`, branco nos dois temas), o knob/track do switch sumiam sobre o cartão branco, e a
+  pílula do contador de conflitos usa um âmbar fixo com tinta escura.
+- **"System" de verdade.** O winit não informa o tema do sistema no Wayland (`egui` vê `None`),
+  então confiar nele faria "System" significar "sempre escuro". `src/appearance.rs` lê
+  `org.freedesktop.appearance` / `color-scheme` do portal de configurações (GNOME, KDE, COSMIC…
+  todos têm) numa thread, a cada 3 s — então mudar o tema do desktop com o app aberto vale em
+  segundos. Sem portal (WM mínimo), cai no que o egui enxerga e, por fim, no escuro.
+- **Testes.** Contraste WCAG nas duas paletas (texto ≥ 7:1, texto secundário ≥ 4,5:1, cores de
+  status ≥ 3:1 em toda superfície, texto branco sobre cada tom de destaque ≥ 4,5:1); a leitura do
+  portal contra um portal falso num `dbus-daemon` privado e **hermético** (sem diretórios de
+  serviço — o que também fecha um furo dos testes de notificação: um `dbus-daemon` padrão ativa o
+  serviço real); round trip do config. Verificado visualmente nas duas paletas com a captura
+  interna do egui (só a janela do app, nunca a tela do usuário), e "System" resolveu pra escuro
+  neste desktop, que reporta `color-scheme = 1`.
 
 ### Critérios de aceite
-- [ ] System theme.
-- [ ] Light.
-- [ ] Dark.
-- [ ] Persistência.
-- [ ] Hot reload quando possível.
-- [ ] GUI inteira usa tokens de tema.
+- [x] System theme.
+- [x] Light.
+- [x] Dark.
+- [x] Persistência (`theme` no config).
+- [x] Hot reload: trocar o seletor vale no quadro seguinte; "System" acompanha o desktop.
+- [x] GUI inteira usa tokens de tema (nenhuma `Color32` literal de paleta sobrou fora de
+      `light_palette`/`dark_palette` e do selo âmbar do contador).
 
 ## M5-002 — Temas customizados
 **Status: ⬜ Não iniciado.** Não começar antes de M5-001 ter os tokens de tema estáveis.
