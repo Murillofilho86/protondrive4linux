@@ -40,9 +40,31 @@ Funde as antigas "Fase 3" (GUI) e "Fase 4" (integração com desktop) do roadmap
       `light_palette`/`dark_palette` e do selo âmbar do contador).
 
 ## M5-002 — Temas customizados
-**Status: ⬜ Não iniciado.** Não começar antes de M5-001 ter os tokens de tema estáveis.
-Exemplos-alvo: Dracula, Nord, Tokyo Night. O usuário deve poder adicionar temas sem modificar o
-código dos componentes.
+**Status: ✅ Concluído.** Dracula, Nord e Tokyo Night vêm embutidos, e o usuário adiciona os
+seus como um arquivo TOML em `~/.config/protondrive4linux/themes/` — sem tocar em código de
+componente. Formato e tokens em `docs/THEMES.md`.
+
+### Como ficou
+- **Temas são dados** (`src/themes.rs`, sem dependência de GUI): as duas paletas embutidas, o
+  parser e o catálogo. Cada cor é opcional — um tema declara só `name` e `base` (`light|dark`) e
+  sobrescreve o que quiser; o resto vem da base. A `base` também escolhe o visual padrão dos
+  widgets do egui. Os três presets são arquivos de verdade em `assets/themes/` (compilados com
+  `include_str!`), então servem de exemplo pra copiar.
+- **Erros que ajudam, não que escondem.** `deny_unknown_fields`: `acent = "#fff"` vira
+  `line 4: unknown field 'acent', expected one of …` na página de Settings, não um erro
+  silenciado. Um arquivo ruim nunca esconde os outros; nome reservado (`system|light|dark`),
+  arquivo gigante e cor inválida são recusados com o motivo.
+- **Aviso de legibilidade, não recusa.** Tema ilegível (contraste WCAG: texto < 4,5:1, secundário
+  < 3:1, `on_accent` < 3:1) ganha um aviso em Settings — o tema é do usuário — enquanto os
+  embutidos são cobrados com régua mais alta nos testes (texto 7:1, secundário 4,5:1, status 3:1
+  em toda superfície, `on_accent` 4,5:1 em todo tom de destaque). Isso pegou um erro de verdade:
+  o vermelho do Nord oficial dava 2,66:1 sobre a seleção; o preset usa um mais claro.
+- **O config não quebra por causa de um tema.** `theme = "Nome"` é guardado como foi escrito;
+  se o arquivo sumiu, o app abre com o tema do sistema e avisa — um tema apagado não pode impedir
+  o app de iniciar. Arquivos são relidos enquanto Settings está aberto (sem reiniciar), e há um
+  botão *Folder* que cria e abre a pasta.
+- A régua de contraste e as duas paletas saíram do `gui.rs` pra `themes.rs`: um lugar só, testável
+  sem GUI, e o mesmo teste vale pros temas embutidos e pros presets.
 
 ## M5-003 — File status indicators
 **Status: ⬜ Não iniciado.** Estados: `Synced, Syncing, Conflict, Error, Offline, Excluded,

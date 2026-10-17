@@ -28,30 +28,23 @@ use neutronsync::service::{
     ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
 };
 use neutronsync::stats::Stats;
+use neutronsync::themes::{self, Base, Catalog, ThemeColors};
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette ----------------------------------------------------------------
 // Every color the UI draws with is a semantic token of a `Palette` (M5-001),
-// read through `th()`, so the whole GUI can switch between light and dark.
-// The dark palette is derived from assets/logo.png's actual pixel colors
-// (sampled, not eyeballed) to match the app icon's visual identity: a deep
-// indigo-violet base, a vivid violet-purple accent, and the icon's bright
-// green for success states. The light one keeps the same hues on a pale
-// lavender base, with the status colors darkened until they read on it.
+// read through `th()`. The colors themselves are data in `neutronsync::themes`
+// - the built-in dark and light palettes, plus any custom theme file (M5-002) -
+// and a `Palette` is just that data as egui `Color32`s, plus whether the theme
+// builds on the dark or the light stock widgets.
 #[derive(Clone, Copy)]
 struct Palette {
     dark: bool,
-    /// Sidebar and the deepest surface.
     nav_bg: Color32,
-    /// Page background.
     panel: Color32,
-    /// Cards and raised surfaces.
     panel2: Color32,
-    /// Selected / hovered rows and widgets.
     sel: Color32,
-    /// Primary text.
     text: Color32,
-    /// Secondary and tertiary text.
     dim: Color32,
     dim2: Color32,
     accent: Color32,
@@ -67,48 +60,40 @@ struct Palette {
     hover: Color32,
 }
 
-fn dark_palette() -> Palette {
-    Palette {
-        dark: true,
-        nav_bg: Color32::from_rgb(0x14, 0x10, 0x22),
-        panel: Color32::from_rgb(0x1B, 0x16, 0x2A),
-        panel2: Color32::from_rgb(0x22, 0x1C, 0x34),
-        sel: Color32::from_rgb(0x2A, 0x20, 0x3E),
-        text: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-        dim: Color32::from_rgb(0x8E, 0x8B, 0x9A),
-        dim2: Color32::from_rgb(0x6C, 0x6A, 0x7A),
-        accent: Color32::from_rgb(0x64, 0x28, 0xFA),
-        accent_hi: Color32::from_rgb(0x7B, 0x48, 0xFB),
-        accent_lo: Color32::from_rgb(0x50, 0x20, 0xC8),
-        on_accent: Color32::WHITE,
-        ok: Color32::from_rgb(0x52, 0xE6, 0x5C),
-        danger: Color32::from_rgb(0xE0, 0x50, 0x64),
-        warn: Color32::from_rgb(0xD8, 0xA0, 0x50),
-        line: Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-        hover: Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+fn c32(c: themes::Rgba) -> Color32 {
+    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+}
+
+impl Palette {
+    fn new(dark: bool, c: &ThemeColors) -> Self {
+        Palette {
+            dark,
+            nav_bg: c32(c.nav_bg),
+            panel: c32(c.panel),
+            panel2: c32(c.panel2),
+            sel: c32(c.sel),
+            text: c32(c.text),
+            dim: c32(c.dim),
+            dim2: c32(c.dim2),
+            accent: c32(c.accent),
+            accent_hi: c32(c.accent_hi),
+            accent_lo: c32(c.accent_lo),
+            on_accent: c32(c.on_accent),
+            ok: c32(c.ok),
+            danger: c32(c.danger),
+            warn: c32(c.warn),
+            line: c32(c.line),
+            hover: c32(c.hover),
+        }
     }
 }
 
+fn dark_palette() -> Palette {
+    Palette::new(true, &ThemeColors::dark())
+}
+
 fn light_palette() -> Palette {
-    Palette {
-        dark: false,
-        nav_bg: Color32::from_rgb(0xEC, 0xE8, 0xF7),
-        panel: Color32::from_rgb(0xF6, 0xF4, 0xFC),
-        panel2: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-        sel: Color32::from_rgb(0xE1, 0xDA, 0xF5),
-        text: Color32::from_rgb(0x1B, 0x16, 0x2A),
-        dim: Color32::from_rgb(0x5A, 0x56, 0x6E),
-        dim2: Color32::from_rgb(0x76, 0x72, 0x8A),
-        accent: Color32::from_rgb(0x64, 0x28, 0xFA),
-        accent_hi: Color32::from_rgb(0x7B, 0x48, 0xFB),
-        accent_lo: Color32::from_rgb(0x50, 0x20, 0xC8),
-        on_accent: Color32::WHITE,
-        ok: Color32::from_rgb(0x1A, 0x8A, 0x35),
-        danger: Color32::from_rgb(0xC4, 0x2B, 0x45),
-        warn: Color32::from_rgb(0x9A, 0x62, 0x00),
-        line: Color32::from_rgba_unmultiplied(0, 0, 0, 28),
-        hover: Color32::from_rgba_unmultiplied(0, 0, 0, 16),
-    }
+    Palette::new(false, &ThemeColors::light())
 }
 
 thread_local! {
@@ -122,14 +107,8 @@ fn th() -> Palette {
     ACTIVE.with(|c| c.get())
 }
 
-fn set_active_palette(dark: bool) {
-    ACTIVE.with(|c| {
-        c.set(if dark {
-            dark_palette()
-        } else {
-            light_palette()
-        })
-    });
+fn set_active_palette(p: Palette) {
+    ACTIVE.with(|c| c.set(p));
 }
 
 /// The amber conflict-count pill is the same in both themes (the light
@@ -327,104 +306,6 @@ mod downscale_tests {
         assert_eq!((w, h), (1, 1));
         assert_eq!(&out[0..3], &[255, 255, 255]);
         assert_eq!(out[3], 127); // average alpha of 255 and 0
-    }
-}
-
-#[cfg(test)]
-mod palette_tests {
-    use super::Color32;
-    use super::{dark_palette, light_palette, Palette};
-
-    /// WCAG relative luminance of an sRGB color.
-    fn luminance(c: Color32) -> f64 {
-        let lin = |v: u8| {
-            let v = v as f64 / 255.0;
-            if v <= 0.04045 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
-    }
-
-    /// WCAG contrast ratio between two opaque colors.
-    fn contrast(a: Color32, b: Color32) -> f64 {
-        let (la, lb) = (luminance(a), luminance(b));
-        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-    }
-
-    fn surfaces(p: &Palette) -> [(&'static str, Color32); 4] {
-        [
-            ("nav_bg", p.nav_bg),
-            ("panel", p.panel),
-            ("panel2", p.panel2),
-            ("sel", p.sel),
-        ]
-    }
-
-    /// Every `(foreground, minimum ratio)` must hold on the first `n` surfaces
-    /// (nav_bg, panel, panel2, sel - in that order).
-    fn check(p: &Palette, name: &str, n: usize, fgs: &[(&str, Color32, f64)]) {
-        for (sname, surface) in surfaces(p).into_iter().take(n) {
-            for (fname, fg, min) in fgs {
-                let got = contrast(*fg, surface);
-                assert!(
-                    got >= *min,
-                    "{name}: {fname} on {sname} is {got:.2}:1, needs >= {min}:1"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn both_palettes_keep_text_readable_on_every_surface() {
-        for (name, p) in [("dark", dark_palette()), ("light", light_palette())] {
-            // Everything that can sit on a selected/hovered row too.
-            check(
-                &p,
-                name,
-                4,
-                &[
-                    ("text", p.text, 7.0),
-                    ("dim", p.dim, 4.5),
-                    // status colors are drawn as small text and icons
-                    ("ok", p.ok, 3.0),
-                    ("danger", p.danger, 3.0),
-                    ("warn", p.warn, 3.0),
-                ],
-            );
-            // Tertiary captions live on the sidebar, page and cards, never on a
-            // selected row (the app's own dark palette sits near 3:1 there).
-            check(&p, name, 3, &[("dim2", p.dim2, 3.0)]);
-        }
-    }
-
-    #[test]
-    fn text_on_an_accent_surface_is_readable_in_both_themes() {
-        for (name, p) in [("dark", dark_palette()), ("light", light_palette())] {
-            for (aname, accent) in [
-                ("accent", p.accent),
-                ("accent_hi", p.accent_hi),
-                ("accent_lo", p.accent_lo),
-            ] {
-                let got = contrast(p.on_accent, accent);
-                assert!(
-                    got >= 4.5,
-                    "{name}: on_accent over {aname} is {got:.2}:1, needs >= 4.5:1"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_two_palettes_really_differ_and_are_flagged_correctly() {
-        let (d, l) = (dark_palette(), light_palette());
-        assert!(d.dark && !l.dark);
-        assert!(luminance(d.panel) < 0.05, "dark page background is dark");
-        assert!(luminance(l.panel) > 0.8, "light page background is light");
-        assert!(luminance(d.text) > luminance(d.panel));
-        assert!(luminance(l.text) < luminance(l.panel));
     }
 }
 
@@ -897,7 +778,13 @@ struct App {
     // theme (M5-001): the desktop's light/dark preference, watched on a
     // background thread, and which theme egui was last told to use.
     system_theme: neutronsync::appearance::SystemTheme,
-    applied_dark: Option<bool>,
+    // what egui was last told to draw with (base + colors), so its visuals are
+    // rebuilt only when the theme actually changes
+    applied: Option<(Base, ThemeColors)>,
+    // custom themes (M5-002): the bundled ones plus the user's themes folder,
+    // re-read while Settings is open so a new file shows up without a restart
+    themes: Catalog,
+    themes_scanned: f64,
 }
 
 impl App {
@@ -957,7 +844,9 @@ impl App {
             conflicts_polled: f64::NEG_INFINITY,
             show_resolved: false,
             system_theme: neutronsync::appearance::SystemTheme::spawn(),
-            applied_dark: None,
+            applied: None,
+            themes: Catalog::load(&themes::themes_dir()),
+            themes_scanned: f64::NEG_INFINITY,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
         // the daemon owns the watcher (only one watcher may hold the lock).
@@ -1015,34 +904,68 @@ impl App {
         auto_names_of(&self.cfg)
     }
 
-    /// Whether the dark theme is in effect: the user's choice, or - for
-    /// "System" - the desktop's, falling back to what egui itself can see and
-    /// finally to dark (the app's original look).
-    fn want_dark(&self, ctx: &egui::Context) -> bool {
-        match self.cfg.theme {
-            ThemePref::Dark => true,
-            ThemePref::Light => false,
-            ThemePref::System => self
-                .system_theme
-                .prefers_dark()
-                .or_else(|| ctx.system_theme().map(|t| t == egui::Theme::Dark))
-                .unwrap_or(true),
+    /// The desktop's light/dark preference, falling back to what egui itself can
+    /// see and finally to dark (the app's original look).
+    fn system_is_dark(&self, ctx: &egui::Context) -> bool {
+        self.system_theme
+            .prefers_dark()
+            .or_else(|| ctx.system_theme().map(|t| t == egui::Theme::Dark))
+            .unwrap_or(true)
+    }
+
+    /// The theme in effect: the user's choice - one of the built-ins, or a
+    /// custom theme by name - or, for "System" (and for a custom theme whose
+    /// file has gone missing), the built-in matching the desktop.
+    fn resolve_theme(&self, ctx: &egui::Context) -> (Base, ThemeColors) {
+        let by_system = |dark: bool| {
+            if dark {
+                (Base::Dark, ThemeColors::dark())
+            } else {
+                (Base::Light, ThemeColors::light())
+            }
+        };
+        match &self.cfg.theme {
+            ThemePref::Dark => by_system(true),
+            ThemePref::Light => by_system(false),
+            ThemePref::System => by_system(self.system_is_dark(ctx)),
+            ThemePref::Custom(name) => match self.themes.find(name) {
+                Some(t) => (t.base, t.colors),
+                None => by_system(self.system_is_dark(ctx)),
+            },
         }
     }
 
-    /// Point `th()` at this frame's palette and, when the theme changed, tell
-    /// egui to switch its own visuals to match.
+    /// Point `th()` at this frame's palette and, when the theme changed, give
+    /// egui visuals to match.
     fn apply_theme(&mut self, ctx: &egui::Context) {
-        let dark = self.want_dark(ctx);
-        set_active_palette(dark);
-        if self.applied_dark != Some(dark) {
+        let (base, colors) = self.resolve_theme(ctx);
+        let dark = base == Base::Dark;
+        let palette = Palette::new(dark, &colors);
+        set_active_palette(palette);
+        if self.applied != Some((base, colors)) {
+            // egui keeps one set of visuals per light/dark; a custom theme
+            // simply replaces the one it builds on.
+            ctx.set_visuals_of(
+                if dark {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                },
+                visuals_for(&palette),
+            );
             ctx.set_theme(if dark {
                 egui::ThemePreference::Dark
             } else {
                 egui::ThemePreference::Light
             });
-            self.applied_dark = Some(dark);
+            self.applied = Some((base, colors));
         }
+    }
+
+    /// Re-read the user's themes folder (cheap: a handful of tiny files).
+    fn rescan_themes(&mut self, ctx: &egui::Context) {
+        self.themes_scanned = ctx.input(|i| i.time);
+        self.themes = Catalog::load(&themes::themes_dir());
     }
 
     /// Re-read the conflict badge, and the list when the Conflicts page is up.
@@ -1472,6 +1395,10 @@ impl eframe::App for App {
             self.refresh_conflicts(ctx);
         }
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        // A theme file added while Settings is open appears without a restart.
+        if self.nav == Nav::Settings && ctx.input(|i| i.time) - self.themes_scanned >= 3.0 {
+            self.rescan_themes(ctx);
+        }
         // after a browser login, poll the account until signed in (or deadline),
         // so the app returns to itself without a manual Refresh.
         if let Some(until) = self.login_poll_until {
@@ -2411,13 +2338,32 @@ impl App {
                 ui.set_max_width((ui.available_width() - 15.0).max(200.0));
 
                 settings_group(ui, "APPEARANCE", |ui| {
-                    if setting_row(
-                        ui,
-                        "Theme",
-                        "System follows your desktop's light or dark setting.",
-                        |ui| combo_theme(ui, &mut self.cfg.theme),
-                    ) {
+                    let desc = format!(
+                        "System follows your desktop's light or dark setting. Add your own \
+                         as a .toml file in {} (see docs/THEMES.md).",
+                        themes::themes_dir().display()
+                    );
+                    let (changed, open_folder) = setting_row(ui, "Theme", &desc, |ui| {
+                        let changed = combo_theme(ui, &mut self.cfg.theme, &self.themes);
+                        let open = button(ui, Some(Icon::Folder), "Folder", Btn::Ghost, true, true)
+                            .on_hover_text("Open the themes folder")
+                            .clicked();
+                        (changed, open)
+                    });
+                    if changed {
                         self.dirty = true;
+                    }
+                    if open_folder {
+                        let dir = themes::themes_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        open_path(&dir);
+                        self.rescan_themes(ui.ctx());
+                    }
+                    for note in theme_notes(&self.cfg.theme, &self.themes) {
+                        ui.add(
+                            egui::Label::new(RichText::new(note).size(11.5).color(th().warn))
+                                .wrap(),
+                        );
                     }
                 });
 
@@ -4058,11 +4004,12 @@ fn combo_update_channel(ui: &mut egui::Ui, v: &mut UpdateChannel) -> bool {
         });
     changed
 }
-fn combo_theme(ui: &mut egui::Ui, v: &mut ThemePref) -> bool {
+fn combo_theme(ui: &mut egui::Ui, v: &mut ThemePref, themes: &Catalog) -> bool {
     let text = match v {
-        ThemePref::System => "System",
-        ThemePref::Light => "Light",
-        ThemePref::Dark => "Dark",
+        ThemePref::System => "System".to_string(),
+        ThemePref::Light => "Light".to_string(),
+        ThemePref::Dark => "Dark".to_string(),
+        ThemePref::Custom(name) => name.clone(),
     };
     let mut changed = false;
     egui::ComboBox::from_id_salt("theme")
@@ -4075,8 +4022,39 @@ fn combo_theme(ui: &mut egui::Ui, v: &mut ThemePref) -> bool {
             ] {
                 changed |= ui.selectable_value(v, val, lbl).clicked();
             }
+            if !themes.themes.is_empty() {
+                ui.separator();
+            }
+            for t in &themes.themes {
+                changed |= ui
+                    .selectable_value(v, ThemePref::Custom(t.name.clone()), &t.name)
+                    .clicked();
+            }
         });
     changed
+}
+
+/// Things worth telling the person about their theme choice, as sentences:
+/// a named theme that can't be found, legibility problems in the one they
+/// picked, and theme files that couldn't be read. Empty when all is well.
+fn theme_notes(pref: &ThemePref, themes: &Catalog) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let ThemePref::Custom(name) = pref {
+        match themes.find(name) {
+            None => notes.push(format!(
+                "No theme named \"{name}\" was found, so the system theme is in use."
+            )),
+            Some(t) => {
+                for issue in themes::contrast_issues(&t.colors).into_iter().take(2) {
+                    notes.push(format!("{}: {issue}", t.name));
+                }
+            }
+        }
+    }
+    for p in themes.problems.iter().take(3) {
+        notes.push(format!("Couldn't load theme {p}"));
+    }
+    notes
 }
 fn combo_compare(ui: &mut egui::Ui, v: &mut Compare) -> bool {
     let text = match v {

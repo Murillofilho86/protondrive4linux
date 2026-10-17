@@ -28,6 +28,7 @@ pub mod state;
 pub mod stats;
 #[cfg(all(test, feature = "gui"))]
 mod testbus;
+pub mod themes;
 pub mod trash;
 #[cfg(feature = "gui")]
 pub mod updater;

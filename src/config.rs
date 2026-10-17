@@ -27,13 +27,17 @@ pub enum ConflictPolicy {
     Skip,
 }
 
-/// Which theme the GUI draws with (M5-001).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Which theme the GUI draws with (M5-001, M5-002).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ThemePref {
     /// Follow the desktop's light/dark setting.
     System,
     Light,
     Dark,
+    /// A theme file by name (see [`crate::themes`]). Kept as written: whether
+    /// it exists is the GUI's question, not a reason to refuse to load the
+    /// config - a theme file that was deleted must not stop the app starting.
+    Custom(String),
 }
 
 /// Release channel the in-app updater follows.
@@ -400,11 +404,12 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         other => bail!("options.update_channel must be stable|prerelease, got {other:?}"),
     };
 
-    let theme = match opts.theme.as_deref().unwrap_or("system") {
-        "system" => ThemePref::System,
-        "light" => ThemePref::Light,
-        "dark" => ThemePref::Dark,
-        other => bail!("options.theme must be system|light|dark, got {other:?}"),
+    let theme = match opts.theme.as_deref().unwrap_or("system").trim() {
+        "" => bail!("options.theme must be system, light, dark, or the name of a theme"),
+        s if s.eq_ignore_ascii_case("system") => ThemePref::System,
+        s if s.eq_ignore_ascii_case("light") => ThemePref::Light,
+        s if s.eq_ignore_ascii_case("dark") => ThemePref::Dark,
+        name => ThemePref::Custom(name.to_string()),
     };
 
     let state_dir = match opts.state_dir {
@@ -659,11 +664,12 @@ fn compare_str(v: Compare) -> &'static str {
     }
 }
 
-fn theme_str(v: ThemePref) -> &'static str {
+fn theme_str(v: &ThemePref) -> String {
     match v {
-        ThemePref::System => "system",
-        ThemePref::Light => "light",
-        ThemePref::Dark => "dark",
+        ThemePref::System => "system".into(),
+        ThemePref::Light => "light".into(),
+        ThemePref::Dark => "dark".into(),
+        ThemePref::Custom(name) => name.clone(),
     }
 }
 
@@ -707,7 +713,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             update_channel: update_channel_str(cfg.update_channel).to_string(),
             check_on_launch: cfg.check_on_launch,
             notifications: cfg.notifications,
-            theme: theme_str(cfg.theme).to_string(),
+            theme: theme_str(&cfg.theme),
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg
@@ -795,11 +801,36 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_theme_is_rejected_naming_the_choices() {
-        let err = load_str("theme-bad", "[options]\ntheme = \"solarized\"\n")
-            .expect_err("an unknown theme must not load");
+    fn any_other_theme_name_is_a_custom_theme_kept_verbatim() {
+        // Whether such a theme exists is for the GUI to say; a config naming
+        // one that was since deleted must still load.
+        let cfg = load_str("theme-custom", "[options]\ntheme = \"Tokyo Night\"\n").unwrap();
+        assert_eq!(cfg.theme, ThemePref::Custom("Tokyo Night".into()));
+        let again = load_str("theme-custom-again", &to_toml(&cfg).unwrap()).unwrap();
+        assert_eq!(again.theme, ThemePref::Custom("Tokyo Night".into()));
+    }
+
+    #[test]
+    fn the_builtin_theme_names_are_case_insensitive() {
+        for (s, want) in [
+            ("System", ThemePref::System),
+            ("LIGHT", ThemePref::Light),
+            (" dark ", ThemePref::Dark),
+        ] {
+            let cfg = load_str("theme-case", &format!("[options]\ntheme = \"{s}\"\n")).unwrap();
+            assert_eq!(cfg.theme, want, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_theme_is_rejected_naming_the_choices() {
+        let err = load_str("theme-empty", "[options]\ntheme = \"  \"\n")
+            .expect_err("an empty theme must not load");
         let msg = format!("{err:#}");
-        assert!(msg.contains("system|light|dark"), "unhelpful error: {msg}");
+        assert!(
+            msg.contains("system, light, dark"),
+            "unhelpful error: {msg}"
+        );
     }
 
     #[test]
