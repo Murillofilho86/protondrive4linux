@@ -121,7 +121,9 @@ When the background tray daemon is doing the work, an open window mirrors its li
 
 ## File manager
 
-Opt-in (Settings → File manager, or `file_manager = true`): your synced folders are added to the sidebar of the GTK file managers (Nautilus, Nemo, Thunar, PCManFM - via `~/.config/gtk-3.0/bookmarks`), and two entries - **Proton Drive - Sync now** and **Proton Drive - Conflicts** - appear in Nautilus's right-click → Scripts menu. It's only a shortcut to the real local folder (no virtual filesystem), it never touches your own bookmarks or scripts - even one with the same name - and turning it off removes exactly what it added. COSMIC Files and Dolphin keep their favorites in their own formats and aren't covered.
+Opt-in (Settings → File manager, or `file_manager = true`): your synced folders are added to the sidebar of the GTK file managers (Nautilus, Nemo, Thunar, PCManFM - via `~/.config/gtk-3.0/bookmarks`), and two entries - **Proton Drive - Sync now** and **Proton Drive - Conflicts** - appear in Nautilus's right-click → Scripts menu. It also marks sync status with small emblems in Nautilus and Nemo (kept up by the tray): a check on each synced folder when it's up to date, arrows while it syncs or a file waits to retry, a warning for a conflict (on the file, its folder and the folders above it, so you can find it), a cross for errors, a lock on folders you excluded. A file with no emblem is simply in sync.
+
+It's only a shortcut to the real local folder (no virtual filesystem), it never touches your own bookmarks, scripts or emblems - even a script with the same name - and turning it off removes exactly what it added. COSMIC Files and Dolphin keep their favorites in their own formats and don't read these emblems, so they aren't covered.
 
 ## Selective sync
 

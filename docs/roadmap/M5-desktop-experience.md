@@ -67,11 +67,51 @@ componente. Formato e tokens em `docs/THEMES.md`.
   sem GUI, e o mesmo teste vale pros temas embutidos e pros presets.
 
 ## M5-003 — File status indicators
-**Status: ⬜ Não iniciado.** Estados: `Synced, Syncing, Conflict, Error, Offline, Excluded,
-Pending`.
+**Status: ✅ Concluído** (`src/emblems.rs`), atrás do mesmo switch opt-in do M5-004
+(`file_manager`). Estados: `Synced, Syncing, Conflict, Error, Offline, Excluded, Pending`.
+
+### Como funciona
+- **Emblemas de metadados do GVfs** (`metadata::emblems`) — o jeito padrão de um programa pedir
+  ao Nautilus/Nemo/Caja que sobreponha um ícone num arquivo, sem extensão nem plugin. Sai por
+  `gio set` (GLib, que o app já usa pra lixeira). Gerenciadores que não leem metadados do GVfs
+  (COSMIC Files, Dolphin, Thunar) simplesmente não mostram nada.
+- **Marcar todo arquivo custaria um processo por arquivo**, então só vai emblema onde importa: a
+  **raiz de cada par** (estado geral), os **arquivos com problema** — conflito aberto (o arquivo e
+  a cópia preservada) ou transferência esperando retry — com as **pastas no caminho até eles**
+  (pra dar pra achar o problema de cima), e **pastas excluídas** que existem. Arquivo sem
+  emblema = em dia. No máximo 400 caminhos (raízes primeiro, depois os mais urgentes).
+- Mapeamento: Synced `emblem-default` (check) · Syncing/Pending `emblem-synchronizing` (setas) ·
+  Conflict/Offline `emblem-important` · Error `emblem-unreadable` · Excluded `emblem-readonly`
+  (cadeado). Vocabulário pequeno de propósito: são os nomes que todo tema de ícones tem.
+- **O mais urgente vence.** Severidade `Synced < Excluded < Syncing < Pending < Conflict <
+  Offline < Error`; o estado de uma pasta é o pior dos de baixo (exceto "excluído", que não diz
+  nada sobre a pasta-pai). A raiz também reflete a fase do par e, deslogado, vira `Offline`.
+- **Só toca no que marcou.** O que foi posto fica gravado em `emblems.json` (no state dir): sobra
+  de um crash, ou o switch desligado, são limpos na próxima passada; emblemas de outras origens
+  nunca são lidos nem alterados. Só diferenças viram `gio set` (uma passada grande é fatiada por
+  orçamento por tick, nunca trava), e uma marcação que falha (arquivo sumiu, FS que o GVfs não
+  rastreia) não é repetida a cada tick — só se o desejado mudar. Ao sair pelo menu da bandeja
+  limpa tudo (parado, o emblema mentiria).
+- **Nomes controlados pelo remoto nunca apontam pra fora do par:** caminho relativo só de
+  componentes normais (`..`, absoluto e vazio são recusados) — `join` com um caminho absoluto
+  trocaria a raiz.
+- Roda numa **thread própria** no daemon da bandeja (a cada 2 s): `gio set` é um processo por
+  caminho e nunca pode rodar no loop do GTK.
+
+### Verificação
+Testes puros do que marcar (fase da raiz, conflito marca arquivo+cópia+pastas, retry só dentro do
+backoff, excluídas, pasta ausente, caminhos hostis, limite) e do que aplicar (só diferenças,
+orçamento, falha sem martelar, `clear_all`, persistência/crash, store corrompido), mais um teste
+contra o **`gio` e o GVfs reais** (define, substitui, limpa, caminho com espaço e `$()`; pula onde
+não houver GVfs). E de ponta a ponta com o daemon real: raiz `[emblem-default]` ao subir; depois
+de um conflito de verdade, o arquivo e a raiz viram `[emblem-important]` e um arquivo intocado
+fica sem nada; desligar o switch (hot reload) limpa tudo e os marcadores do usuário voltam
+byte a byte. (Achado do ambiente de teste, não do produto: o GVfs guarda os metadados num diretório
+de dados que o `gvfsd-metadata` mantém aberto — reaproveitar o caminho de um sandbox apagado dá
+leituras vazias; sandbox novo a cada rodada resolveu.)
 
 ## M5-004 — File manager integration
-**Status: 🔶 Parcial.** Prioridade original: Nautilus → Dolphin → Nemo → Thunar. Escopo
+**Status: ✅ Concluído.** Prioridade original: Nautilus → Dolphin → Nemo → Thunar. Escopo
 decidido com o mantenedor: **Nautilus/Nemo/GTK, opt-in** (Settings → *File manager*,
 `file_manager = true`, desligado por padrão — escreve fora das pastas do app). COSMIC Files e
 Dolphin guardam favoritos em formatos próprios e não são cobertos.
@@ -99,17 +139,16 @@ Dolphin guardam favoritos em formatos próprios e não são cobertos.
 - *Abrir a pasta local* já existia (a página *Folders*).
 
 ### Falta
-- [ ] Ícone/status por arquivo/pasta (emblemas — é o M5-003, próximo PR).
-- [ ] Sync status no gerenciador (idem).
+Nada: o ícone/status por arquivo e pasta é o M5-003 (acima), entregue no mesmo switch.
 
 > **Nota de arquitetura**: isto é um atalho/bookmark para a pasta local sincronizada, **não** um
 > mount virtual — não depende de FUSE (ver `docs/architecture/ARCHITECTURE_PRINCIPLES.md`).
 
 ### Critérios de aceite
-- [ ] Ícone/status por arquivo/pasta (M5-003).
+- [x] Ícone/status por arquivo/pasta (M5-003: emblemas).
 - [x] Context menu (scripts do Nautilus).
 - [x] Open local folder (+ marcadores na barra lateral).
-- [ ] Sync status (M5-003).
+- [x] Sync status (emblemas na raiz e nos arquivos com problema).
 
 ## M5-005 — Onboarding, tray, notificações desktop
 **Status: ✅ Concluído.** A maior parte já existia no código — o status "não iniciado" estava

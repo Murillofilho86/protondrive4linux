@@ -2378,8 +2378,10 @@ impl App {
                         ui,
                         "Show in the file manager",
                         "Adds your synced folders to the file manager's sidebar (Nautilus, \
-                         Nemo, Thunar...) and two \"Proton Drive\" entries to Nautilus's \
-                         right-click Scripts menu. Turn it off to remove them again.",
+                         Nemo, Thunar...), marks their sync status with small emblems \
+                         (Nautilus and Nemo, kept up by the tray), and adds two \"Proton \
+                         Drive\" entries to Nautilus's right-click Scripts menu. Turn it \
+                         off to remove them again.",
                         |ui| switch(ui, on),
                     ) {
                         self.cfg.file_manager = !on;
@@ -4184,6 +4186,64 @@ fn auto_names_of(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+/// Keeps the file-manager emblems (M5-003) in step with the sync state, on its
+/// own thread: `gio set` is a process per path and must never run on the GTK
+/// loop. Runs while `on` is set; when it goes off - or the daemon quits, via the
+/// returned sender - it takes down every emblem it put up.
+fn spawn_emblem_worker(
+    ctrl: std::sync::Arc<Controller>,
+    on: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    state_dir: PathBuf,
+) -> Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
+    use neutronsync::emblems::{desired, Emblems, GioSetter, Inputs};
+    use std::sync::atomic::Ordering;
+    let setter = GioSetter::new()?;
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let stats = Stats::open(&state_dir).ok();
+        let mut emblems = Emblems::load(&state_dir);
+        loop {
+            match stop_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // Asked to stop (or the daemon is gone): leave nothing behind.
+                _ => {
+                    emblems.clear_all(&setter, 500);
+                    return;
+                }
+            }
+            if !on.load(Ordering::Relaxed) {
+                if !emblems.is_empty() {
+                    emblems.clear_all(&setter, 100);
+                }
+                continue;
+            }
+            let cfg = ctrl.config();
+            let state = ctrl.snapshot();
+            let conflicts = stats
+                .as_ref()
+                .and_then(|s| s.conflicts(false, 300).ok())
+                .unwrap_or_default();
+            let retry = cfg
+                .pairs
+                .iter()
+                .filter_map(|p| {
+                    let rows = stats.as_ref()?.retry_state(&p.name).ok()?;
+                    Some((p.name.clone(), rows))
+                })
+                .collect();
+            let want = desired(&Inputs {
+                pairs: &cfg.pairs,
+                state: &state,
+                conflicts: &conflicts,
+                retry: &retry,
+                now: now_secs(),
+            });
+            emblems.update(&want, &setter, 60);
+        }
+    });
+    Some((stop_tx, handle))
+}
+
 /// Feeds the desktop-notification state machine for the tray daemon: it polls
 /// the shared stats DB (at most once a second) for conflicts recorded since it
 /// last looked - by this process or any other - and combines them with the
@@ -4267,6 +4327,10 @@ fn run_daemon() {
         }
     }
 
+    let emblems_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(cfg.file_manager));
+    let emblem_worker =
+        spawn_emblem_worker(ctrl.clone(), emblems_on.clone(), cfg.state_dir.clone());
+
     if let Err(e) = gtk::init() {
         eprintln!("protondrive4linux: GTK init failed: {e}");
         return;
@@ -4348,6 +4412,7 @@ fn run_daemon() {
                 let pairs = newcfg.pairs.len();
                 want_watch = newcfg.auto_sync;
                 notify_on = newcfg.notifications;
+                emblems_on.store(newcfg.file_manager, std::sync::atomic::Ordering::Relaxed);
                 neutronsync::fileman::apply(&newcfg);
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
@@ -4405,6 +4470,11 @@ fn run_daemon() {
     // Drop the tick (and the tray icon it owns) while GTK is still alive.
     tick.remove();
     ctrl.stop_watch();
+    // Take down the file-manager emblems: with nothing running they'd lie.
+    if let Some((stop, handle)) = emblem_worker {
+        let _ = stop.send(());
+        let _ = handle.join();
+    }
 }
 
 fn main() -> eframe::Result<()> {
