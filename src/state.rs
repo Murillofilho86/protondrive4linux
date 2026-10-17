@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::models::Entry;
-use crate::stats::Stats;
+use crate::stats::{PairRoots, Stats};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -97,6 +97,55 @@ pub fn load_baseline(state_dir: &Path, name: &str) -> Result<BTreeMap<String, En
         }
     }
     stats.load_baseline(name)
+}
+
+/// The baseline for `pair`, after checking it was taken from the folders the
+/// pair points at now. If the pair has been pointed at another local or remote
+/// folder the old baseline is discarded (see [`Stats::pin_pair_roots`]) and the
+/// returned flag is the old folders and the number of rows dropped: the run is
+/// then a first run, merging both sides and deleting nothing.
+///
+/// Every caller that is about to plan a sync from the baseline goes through this
+/// rather than [`load_baseline`].
+pub fn load_baseline_for(
+    state_dir: &Path,
+    pair: &crate::config::Pair,
+) -> Result<(BTreeMap<String, Entry>, Option<PairMoved>)> {
+    let moved = match Stats::open(state_dir)?.pin_pair_roots(
+        &pair.name,
+        &pair.local.to_string_lossy(),
+        &pair.remote,
+    )? {
+        PairRoots::Moved {
+            local,
+            remote,
+            dropped,
+        } => Some(PairMoved {
+            local,
+            remote,
+            dropped,
+        }),
+        PairRoots::Recorded | PairRoots::Same => None,
+    };
+    Ok((load_baseline(state_dir, &pair.name)?, moved))
+}
+
+/// A pair that was pointed at other folders since its baseline was taken.
+#[derive(Clone, Debug)]
+pub struct PairMoved {
+    pub local: String,
+    pub remote: String,
+    pub dropped: usize,
+}
+
+impl PairMoved {
+    /// What to tell the user: what happened, and that nothing is deleted.
+    pub fn describe(&self, pair: &str) -> String {
+        format!(
+            "pair {pair:?} now points at different folders than its record of {} item(s)              was taken from ({} <-> {}): that record was discarded and both sides are              merged afresh, so nothing is deleted",
+            self.dropped, self.local, self.remote
+        )
+    }
 }
 
 pub fn save_baseline(

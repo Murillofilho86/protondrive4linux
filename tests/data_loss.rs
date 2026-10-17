@@ -6,7 +6,10 @@
 //! - downloads that die, deliver too little, or land on a file the user has
 //!   since edited;
 //! - conflicts (`conflict copy` names, a failing transfer half way);
-//! - a staging folder from a download that was killed.
+//! - a staging folder from a download that was killed;
+//! - deletions that must not happen because the engine's view of one side is
+//!   blind or suspicious (an unreadable folder, an empty root, a symlink, a
+//!   pair pointed at another folder).
 //!
 //! The sync semantics themselves (the decision table, the baseline) are in
 //! `tests/engine.rs`; the processes-and-signals scenarios are in
@@ -15,12 +18,20 @@
 #[path = "common/fake_remote.rs"]
 mod fake_remote;
 
+use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 use std::time::UNIX_EPOCH;
 
 use fake_remote::*;
 use neutronsync::engine::Engine;
 use neutronsync::logger::Logger;
+
+/// A whole-pair sync by the streaming walk (what the watcher's full walk does).
+fn run_streaming(c: &neutronsync::config::Config, f: FakeRemote) {
+    let log = Logger::silent();
+    let mut eng = Engine::new(c, f, &log, false);
+    eng.sync_pair_streaming(&c.pairs[0]).unwrap();
+}
 
 /// The pair root's direct children, hidden ones too, as names.
 fn names_including_hidden(t: &Tmp) -> Vec<String> {
@@ -413,4 +424,328 @@ fn a_conflict_whose_download_fails_loses_nothing_and_converges() {
         std::fs::read_to_string(t.path().join("local/a.txt")).unwrap(),
         "remote edit"
     );
+}
+
+// --- deletions on a blind or suspicious view ----------------------------------------
+
+#[test]
+fn an_unreadable_local_folder_never_deletes_what_it_holds() {
+    // The batch scan (`protondrive4linux sync`, the GUI's Sync now) walked the
+    // tree and dropped the walk's errors, so a folder it could not open looked
+    // empty, and every file in it looked deleted.
+    if is_root() {
+        return; // root reads anything
+    }
+    let t = Tmp::new("blind-unreadable");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/sub/b.txt"), "keep me");
+    write(&t.path().join("local/top.txt"), "top");
+    run(&c, fake, false);
+
+    let sub = t.path().join("local/sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (f, _s) = reuse(&store);
+    let _ = try_run(&c, f, false);
+    // streaming walk as well
+    let (f, _s) = reuse(&store);
+    run_streaming(&c, f);
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        store
+            .borrow()
+            .files
+            .contains_key("/my-files/docs/sub/b.txt"),
+        "the remote copy of a file in an unreadable folder was trashed"
+    );
+    // and once the folder can be read again nothing has changed
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    assert_eq!(store.borrow().files.len(), 2);
+    assert!(sub.join("b.txt").exists());
+}
+
+#[test]
+fn an_empty_local_root_never_deletes_the_remote() {
+    // An unmounted drive leaves its mount point behind, empty.
+    let t = Tmp::new("blind-empty-root");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    for i in 0..5 {
+        write(
+            &t.path().join(format!("local/f{i}.txt")),
+            &format!("data {i}"),
+        );
+    }
+    write(&t.path().join("local/sub/deep.txt"), "deep");
+    run(&c, fake, false);
+    std::fs::remove_dir_all(t.path().join("local")).unwrap();
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+
+    for walk in ["batch", "streaming"] {
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            let _ = try_run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        assert_eq!(
+            store.borrow().files.len(),
+            6,
+            "{walk}: remote files were trashed because the local root came back empty: {:?}",
+            store.borrow().files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // The drive comes back: everything is where it was, nothing to do.
+    for i in 0..5 {
+        write(
+            &t.path().join(format!("local/f{i}.txt")),
+            &format!("data {i}"),
+        );
+    }
+    write(&t.path().join("local/sub/deep.txt"), "deep");
+    let before = store.borrow().files.clone();
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    assert_eq!(store.borrow().files, before);
+}
+
+#[test]
+fn emptying_a_small_pair_is_a_real_deletion() {
+    // The empty-root guard is for a folder full of files going missing at once,
+    // not for deleting the last file or two of a small one.
+    let t = Tmp::new("blind-small-pair");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "a");
+    write(&t.path().join("local/b.txt"), "b");
+    run(&c, fake, false);
+    std::fs::remove_file(t.path().join("local/a.txt")).unwrap();
+    std::fs::remove_file(t.path().join("local/b.txt")).unwrap();
+    for walk in ["batch", "streaming"] {
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+    }
+    assert!(
+        store.borrow().files.is_empty(),
+        "{:?}",
+        store.borrow().files.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_empty_folder_below_the_root_is_still_a_real_deletion() {
+    // The guard is for the root: emptying a sub-folder on purpose propagates.
+    let t = Tmp::new("blind-subfolder-emptied");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/keep.txt"), "keep");
+    write(&t.path().join("local/old/a.txt"), "a");
+    write(&t.path().join("local/old/b.txt"), "b");
+    run(&c, fake, false);
+    std::fs::remove_file(t.path().join("local/old/a.txt")).unwrap();
+    std::fs::remove_file(t.path().join("local/old/b.txt")).unwrap();
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
+    assert_eq!(keys, ["/my-files/docs/keep.txt"], "{keys:?}");
+}
+
+#[test]
+fn a_tracked_file_replaced_by_a_symlink_is_not_a_deletion() {
+    let t = Tmp::new("blind-symlink-file");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/conf.toml"), "important settings");
+    write(&t.path().join("local/other.txt"), "other");
+    run(&c, fake, false);
+    // the user points the file at their dotfiles repo
+    std::fs::remove_file(t.path().join("local/conf.toml")).unwrap();
+    std::os::unix::fs::symlink(
+        "/nonexistent/dotfiles/conf.toml",
+        t.path().join("local/conf.toml"),
+    )
+    .unwrap();
+    for walk in ["batch", "streaming"] {
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        assert_eq!(
+            store
+                .borrow()
+                .files
+                .get("/my-files/docs/conf.toml")
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .as_deref(),
+            Some("important settings"),
+            "{walk}: the remote copy was trashed or replaced because the path became a symlink"
+        );
+    }
+}
+
+#[test]
+fn a_tracked_folder_replaced_by_a_symlink_is_not_a_deletion_and_is_never_followed() {
+    let t = Tmp::new("blind-symlink-dir");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/photos/a.jpg"), "photo a");
+    run(&c, fake, false);
+    // the user moves the folder elsewhere and leaves a link to it
+    let elsewhere = t.path().join("elsewhere");
+    std::fs::rename(t.path().join("local/photos"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, t.path().join("local/photos")).unwrap();
+    // something new lands in the link's target - it must not be uploaded through the link
+    write(&elsewhere.join("new.jpg"), "photo new");
+    for walk in ["batch", "streaming"] {
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["/my-files/docs/photos/a.jpg"],
+            "{walk}: the folder was trashed, or followed through its link: {keys:?}"
+        );
+    }
+}
+
+#[test]
+fn a_download_is_never_written_through_a_symlinked_folder() {
+    let t = Tmp::new("blind-symlink-write");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    std::fs::create_dir_all(t.path().join("local")).unwrap();
+    run(&c, fake, false);
+    // a link inside the root, to a folder outside it
+    let outside = t.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, t.path().join("local/docs")).unwrap();
+    // the remote has a real folder of the same name with a file in it
+    store
+        .borrow_mut()
+        .dirs
+        .insert("/my-files/docs/docs".to_string());
+    store.borrow_mut().files.insert(
+        "/my-files/docs/docs/secret.txt".into(),
+        b"from the cloud".to_vec(),
+    );
+    for walk in ["batch", "streaming"] {
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            let _ = try_run(&c, f, false);
+        } else {
+            let log = Logger::silent();
+            let mut eng = Engine::new(&c, f, &log, false);
+            let _ = eng.sync_pair_streaming(&c.pairs[0]);
+        }
+        let leaked: Vec<String> = std::fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{walk}: a download was written through a symlink to outside the sync root: {leaked:?}"
+        );
+    }
+}
+
+#[test]
+fn pointing_a_pair_at_another_local_folder_starts_a_fresh_baseline_not_a_mass_delete() {
+    let t = Tmp::new("blind-pair-moved");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    for i in 0..4 {
+        write(
+            &t.path().join(format!("local/f{i}.txt")),
+            &format!("data {i}"),
+        );
+    }
+    run(&c, fake, false);
+    // The config now says the same pair lives in another (empty) folder.
+    std::fs::create_dir_all(t.path().join("elsewhere")).unwrap();
+    c.pairs[0].local = t.path().join("elsewhere");
+    let (f, _s) = reuse(&store);
+    let _ = try_run(&c, f, false);
+    assert_eq!(
+        store.borrow().files.len(),
+        4,
+        "the remote was trashed after the pair's local folder was changed"
+    );
+    // ...and the new folder is simply filled from the remote (a fresh union).
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("elsewhere/f2.txt")).unwrap(),
+        "data 2"
+    );
+    assert_eq!(store.borrow().files.len(), 4);
+}
+
+#[test]
+fn pointing_a_pair_at_another_remote_folder_starts_a_fresh_baseline_too() {
+    let t = Tmp::new("blind-pair-remote");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    c.local_delete = neutronsync::config::LocalDelete::Remove;
+    let (fake, store) = FakeRemote::new();
+    for i in 0..4 {
+        write(
+            &t.path().join(format!("local/f{i}.txt")),
+            &format!("data {i}"),
+        );
+    }
+    run(&c, fake, false);
+    // the remote folder is now another (empty) one
+    store
+        .borrow_mut()
+        .dirs
+        .insert("/my-files/other".to_string());
+    c.pairs[0].remote = "/my-files/other".into();
+    let (f, _s) = reuse(&store);
+    let _ = try_run(&c, f, false);
+    assert_eq!(
+        std::fs::read_dir(t.path().join("local")).unwrap().count(),
+        4,
+        "the local files were deleted because the pair's remote folder was changed"
+    );
+}
+
+#[test]
+fn an_unchanged_pair_keeps_its_baseline_across_runs() {
+    // The identity check must not itself discard the baseline: a deletion still
+    // propagates on the run after it was made.
+    let t = Tmp::new("blind-pair-same");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "a");
+    write(&t.path().join("local/b.txt"), "b");
+    run(&c, fake, false);
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    std::fs::remove_file(t.path().join("local/a.txt")).unwrap();
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
+    assert_eq!(keys, ["/my-files/docs/b.txt"], "{keys:?}");
 }

@@ -23,6 +23,24 @@ use crate::models::Entry;
 /// use `ALTER TABLE` migrations instead).
 const SCHEMA_VERSION: i64 = 1;
 
+/// What [`Stats::pin_pair_roots`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairRoots {
+    /// Nothing was on record: the pair's folders are now recorded and its
+    /// baseline, if it has one, is kept.
+    Recorded,
+    /// The pair is where it was.
+    Same,
+    /// The pair now points at other folders than the baseline was taken from
+    /// (`local`/`remote` are the old ones): the baseline's `dropped` rows were
+    /// discarded, and this run starts a fresh one.
+    Moved {
+        local: String,
+        remote: String,
+        dropped: usize,
+    },
+}
+
 pub struct Stats {
     conn: Mutex<Connection>,
 }
@@ -145,6 +163,11 @@ impl Stats {
                  pair        TEXT PRIMARY KEY,
                  last_synced INTEGER
              );
+             CREATE TABLE IF NOT EXISTS pair_roots (
+                 pair   TEXT PRIMARY KEY,
+                 local  TEXT NOT NULL,
+                 remote TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS retry_state (
                  pair     TEXT    NOT NULL,
                  rel      TEXT    NOT NULL,
@@ -199,6 +222,7 @@ impl Stats {
              CREATE TABLE retry_state (pair TEXT NOT NULL, rel TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, PRIMARY KEY (pair, rel));
              CREATE TABLE conflicts (id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT NOT NULL, rel TEXT NOT NULL, ts INTEGER NOT NULL, resolution TEXT NOT NULL, copy_rel TEXT, dismissed INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE pair_state (pair TEXT PRIMARY KEY, last_synced INTEGER);
+             CREATE TABLE pair_roots (pair TEXT PRIMARY KEY, local TEXT NOT NULL, remote TEXT NOT NULL);
              CREATE TABLE baseline (pair TEXT NOT NULL, rel TEXT NOT NULL, is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER, sha1 TEXT, remote_id TEXT, state TEXT NOT NULL DEFAULT 'synced', PRIMARY KEY (pair, rel));",
         )?;
         Ok(Stats {
@@ -437,6 +461,54 @@ impl Stats {
         Ok(())
     }
 
+    /// Record where `pair` lives - its local folder and its remote folder - and
+    /// say what that means for the baseline. A baseline is only meaningful for
+    /// the two folders it was taken from: point the pair at another one and every
+    /// path it knew would read as deleted on whichever side is now different,
+    /// and the next run would carry that out on the other. So when the folders
+    /// changed the old baseline (and its retry backoff) is discarded in the same
+    /// transaction, and this run is a first run: both sides are merged, nothing
+    /// is deleted. A pair with no record yet (first run, or a database from before
+    /// this was kept) just has its folders recorded and keeps its baseline.
+    pub fn pin_pair_roots(&self, pair: &str, local: &str, remote: &str) -> Result<PairRoots> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let old: Option<(String, String)> = tx
+            .query_row(
+                "SELECT local, remote FROM pair_roots WHERE pair = ?1",
+                params![pair],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let outcome = match old {
+            None => PairRoots::Recorded,
+            Some((l, r)) if l == local && r == remote => PairRoots::Same,
+            Some((l, r)) => {
+                let dropped: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM baseline WHERE pair = ?1",
+                    params![pair],
+                    |r| r.get(0),
+                )?;
+                tx.execute("DELETE FROM baseline WHERE pair = ?1", params![pair])?;
+                tx.execute("DELETE FROM retry_state WHERE pair = ?1", params![pair])?;
+                PairRoots::Moved {
+                    local: l,
+                    remote: r,
+                    dropped: dropped as usize,
+                }
+            }
+        };
+        if outcome != PairRoots::Same {
+            tx.execute(
+                "INSERT INTO pair_roots(pair, local, remote) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(pair) DO UPDATE SET local = ?2, remote = ?3",
+                params![pair, local, remote],
+            )?;
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
+
     /// Per-file retry backoff state for `pair` (rel -> (consecutive failures,
     /// epoch seconds it's next eligible to be retried)). A path with no row
     /// has never failed, or already recovered (M4-004).
@@ -651,6 +723,7 @@ impl Stats {
             "ops",
             "retry_state",
             "conflicts",
+            "pair_roots",
         ] {
             conn.execute(&format!("DELETE FROM {tbl} WHERE pair = ?1"), params![pair])?;
         }
@@ -662,7 +735,7 @@ impl Stats {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "DELETE FROM baseline; DELETE FROM pair_state; DELETE FROM events; DELETE FROM ops; \
-             DELETE FROM retry_state; DELETE FROM conflicts;",
+             DELETE FROM retry_state; DELETE FROM conflicts; DELETE FROM pair_roots;",
         )?;
         Ok(())
     }
@@ -1014,6 +1087,85 @@ mod tests {
         s.wipe().unwrap();
         assert_eq!(s.conflict_count().unwrap(), 0);
         assert!(s.retry_state("stays").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pair_pointed_at_other_folders_loses_its_baseline_and_nothing_else() {
+        let s = Stats::memory().unwrap();
+        let entry = |p: &str| Entry {
+            path: p.into(),
+            size: 3,
+            ..Default::default()
+        };
+        let base: BTreeMap<String, Entry> = [("a.txt".to_string(), entry("a.txt"))]
+            .into_iter()
+            .collect();
+
+        // First sight: recorded, and a baseline already there (a database from
+        // before folders were recorded) is kept.
+        s.save_baseline("docs", &base).unwrap();
+        s.save_baseline("other", &base).unwrap();
+        assert_eq!(
+            s.pin_pair_roots("docs", "/home/u/Docs", "/my-files/docs")
+                .unwrap(),
+            PairRoots::Recorded
+        );
+        assert_eq!(s.load_baseline("docs").unwrap().len(), 1);
+        // Same folders: nothing happens.
+        assert_eq!(
+            s.pin_pair_roots("docs", "/home/u/Docs", "/my-files/docs")
+                .unwrap(),
+            PairRoots::Same
+        );
+        assert_eq!(s.load_baseline("docs").unwrap().len(), 1);
+
+        // Another local folder, then another remote one: each discards the
+        // baseline and the retry backoff of THIS pair, says what it was, and
+        // records the new folders.
+        s.apply_retry_updates("docs", &[("a.txt".into(), 2, 10)], &[])
+            .unwrap();
+        let moved = s
+            .pin_pair_roots("docs", "/home/u/Elsewhere", "/my-files/docs")
+            .unwrap();
+        assert_eq!(
+            moved,
+            PairRoots::Moved {
+                local: "/home/u/Docs".into(),
+                remote: "/my-files/docs".into(),
+                dropped: 1
+            }
+        );
+        assert!(s.load_baseline("docs").unwrap().is_empty());
+        assert!(s.retry_state("docs").unwrap().is_empty());
+        assert_eq!(
+            s.load_baseline("other").unwrap().len(),
+            1,
+            "other pairs untouched"
+        );
+        assert_eq!(
+            s.pin_pair_roots("docs", "/home/u/Elsewhere", "/my-files/docs")
+                .unwrap(),
+            PairRoots::Same,
+            "and it is recorded"
+        );
+        s.save_baseline("docs", &base).unwrap();
+        assert!(matches!(
+            s.pin_pair_roots("docs", "/home/u/Elsewhere", "/my-files/new")
+                .unwrap(),
+            PairRoots::Moved { dropped: 1, .. }
+        ));
+
+        // Forgetting the pair forgets where it was.
+        s.forget_pair("docs").unwrap();
+        assert_eq!(
+            s.pin_pair_roots("docs", "/anywhere", "/else").unwrap(),
+            PairRoots::Recorded
+        );
+        s.wipe().unwrap();
+        assert_eq!(
+            s.pin_pair_roots("docs", "/x", "/y").unwrap(),
+            PairRoots::Recorded
+        );
     }
 
     #[test]
