@@ -9,6 +9,8 @@
 //! - **Nautilus Scripts** (`~/.local/share/nautilus/scripts/`): two entries in
 //!   the right-click -> Scripts menu, to sync now and to open the conflicts.
 //!
+//! (Per-file status emblems are a separate piece: see [`crate::emblems`].)
+//!
 //! Everything it writes is marked as ours, and *only* ours is ever changed or
 //! removed: a user's own bookmarks and scripts are carried through untouched,
 //! even one that happens to have the same name. Applying is idempotent, so it
