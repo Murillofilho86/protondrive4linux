@@ -1090,6 +1090,36 @@ mod tests {
     }
 
     #[test]
+    fn the_baseline_is_committed_durably() {
+        // The baseline says what has synced, and is written after the file's own
+        // bytes are on disk (see `staged`). If a commit could be lost in a power
+        // cut while the file survived, or the reverse with a cheaper sync mode,
+        // the guarantee would be gone: pin the setting that gives it. WAL with
+        // `synchronous = FULL` syncs the log on every commit.
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-durable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let s = Stats::open(&dir).unwrap();
+        let conn = s.conn.lock().unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        assert_eq!(synchronous, 2, "0 = OFF, 1 = NORMAL, 2 = FULL");
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_pair_pointed_at_other_folders_loses_its_baseline_and_nothing_else() {
         let s = Stats::memory().unwrap();
         let entry = |p: &str| Entry {

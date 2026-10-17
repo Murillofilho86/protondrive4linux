@@ -42,6 +42,13 @@ stand-in mínimo do CLI oficial (list/upload/download/create-folder/trash/versio
   peculiaridades do binário real, que um stub não reproduz com fidelidade. Continua exigindo
   acesso a uma conta Proton real para reproduzir.
 
+> **Atualização (M9-003):** a revisão de perda de dados voltou a este milestone e encontrou
+> defeitos reais que os testes daqui não pegavam (downloads não atômicos, guardas de deleção
+> ausentes, a heurística "mesmo tamanho = mesmo conteúdo"). Estão corrigidos e cobertos em
+> `tests/data_loss.rs` e `tests/disaster/`; **disco cheio** passou a ser *simulado* (download que
+> falha no meio) e o **timeout de rede** passou a existir e ser testado (`cli_timeout_secs`). A
+> corrida watch/rescan continua não coberta. Ver [`docs/DATA_LOSS_REVIEW.md`](../DATA_LOSS_REVIEW.md).
+
 ### Critério de aceite
 Nenhum cenário coberto resultou em exclusão silenciosa ou perda de dados. Os três cenários acima
 ficam documentados como não cobertos, não como "concluídos por omissão".

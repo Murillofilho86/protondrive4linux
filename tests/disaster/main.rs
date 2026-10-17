@@ -485,3 +485,66 @@ fn sigkill_mid_download_over_existing_files_keeps_each_old_or_new_never_half() {
 fn sigterm_mid_download_never_leaves_a_partial_file_under_its_real_name() {
     killed_mid_download("TERM", false);
 }
+
+#[test]
+fn a_cli_that_hits_its_timeout_mid_download_leaves_no_partial_file_and_no_junk() {
+    // "Network loss" / "large file": the CLI is killed at `cli_timeout_secs` with
+    // half a file written. Whatever it wrote must not appear under a real name,
+    // must not be uploaded, and the next run (the network back) must fetch it whole.
+    let env = setup("timeout");
+    let remote = remote_docs_dir(&env);
+    std::fs::create_dir_all(&remote).unwrap();
+    let body = "payload ".repeat(500);
+    std::fs::write(remote.join("big.bin"), &body).unwrap();
+    // a one second timeout, against a CLI that pauses three seconds mid-write
+    let cfg_text = std::fs::read_to_string(&env.config_path).unwrap();
+    std::fs::write(
+        &env.config_path,
+        cfg_text.replace(
+            "fresh_cache = false",
+            // ...and a retry that is due almost at once
+            "fresh_cache = false\ncli_timeout_secs = 1\nretry_base_delay_secs = 1\nretry_max_delay_secs = 1",
+        ),
+    )
+    .unwrap();
+
+    let mut extra = BTreeMap::new();
+    extra.insert("FAKE_CLI_HALF_WRITE_MS", "3000".to_string());
+    let mut child = spawn_sync(&env, &extra);
+    let status = child
+        .wait_timeout(Duration::from_secs(30))
+        .expect("the run must end on its own once the CLI is killed");
+    let _ = status;
+
+    let visible = visible_local(&env);
+    assert!(
+        visible.is_empty(),
+        "a partial download is visible under a real name: {visible:?}"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&env.local)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the staging folder of a failed download was not cleaned up: {leftovers:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.join("big.bin")).unwrap(),
+        body,
+        "the remote copy was touched"
+    );
+    assert_eq!(count_remote_files(&env), 1, "junk reached the remote");
+
+    // The network is back (no more pause, no more timeout) and the retry is due:
+    // it arrives whole.
+    std::thread::sleep(Duration::from_millis(1600));
+    run_clean_sync(&env);
+    assert_eq!(
+        std::fs::read_to_string(env.local.join("big.bin")).unwrap(),
+        body
+    );
+    assert_eq!(visible_local(&env), ["big.bin"]);
+    assert_eq!(count_remote_files(&env), 1);
+}

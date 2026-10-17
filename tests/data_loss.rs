@@ -1124,3 +1124,146 @@ fn a_real_rename_is_still_a_move_even_with_digests() {
     assert!(!rf.contains_key("/my-files/docs/a.txt"));
     assert_eq!(store.borrow().moves, 1, "should have been a move");
 }
+
+// --- permission denied -----------------------------------------------------------
+
+#[test]
+fn a_download_into_a_folder_that_cannot_be_written_fails_cleanly() {
+    // A read-only destination: nothing is half written, nothing is lost, the error
+    // says so, and the file arrives once the folder is writable again.
+    if is_root() {
+        return; // root writes anywhere
+    }
+    let t = Tmp::new("perm-write");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/ro/keep.txt"), "mine");
+    run(&c, fake, false);
+    store.borrow_mut().files.insert(
+        "/my-files/docs/ro/new.txt".into(),
+        b"from the cloud".to_vec(),
+    );
+    let ro = t.path().join("local/ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    let r = eng.sync_pair(&c.pairs[0], false).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!r.errors.is_empty(), "the failure must be reported");
+    assert_eq!(
+        std::fs::read_to_string(ro.join("keep.txt")).unwrap(),
+        "mine",
+        "an existing file was touched"
+    );
+    let names: Vec<String> = std::fs::read_dir(&ro)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["keep.txt"], "something was left behind: {names:?}");
+
+    clear_retry_backoff(&c, "docs");
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    assert_eq!(
+        std::fs::read_to_string(ro.join("new.txt")).unwrap(),
+        "from the cloud"
+    );
+}
+
+#[test]
+fn a_file_that_cannot_be_read_is_an_error_and_never_touches_the_remote_copy() {
+    if is_root() {
+        return;
+    }
+    let t = Tmp::new("perm-read");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "v1");
+    write(&t.path().join("local/b.txt"), "other");
+    run(&c, fake, false);
+    // edited, then made unreadable: the upload cannot read it
+    write(&t.path().join("local/a.txt"), "v2, longer");
+    let a = t.path().join("local/a.txt");
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (f, _s) = reuse(&store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(&c, f, &log, false);
+    let r = eng.sync_pair(&c.pairs[0], false).unwrap();
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(!r.errors.is_empty(), "the failure must be reported");
+    let rf = remote_files(&store);
+    assert_eq!(
+        rf.get("/my-files/docs/a.txt").map(String::as_str),
+        Some("v1"),
+        "the remote copy was damaged or removed: {rf:?}"
+    );
+    assert_eq!(
+        rf.get("/my-files/docs/b.txt").map(String::as_str),
+        Some("other")
+    );
+    // readable again: the edit goes up
+    clear_retry_backoff(&c, "docs");
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    assert_eq!(
+        remote_files(&store)
+            .get("/my-files/docs/a.txt")
+            .map(String::as_str),
+        Some("v2, longer")
+    );
+}
+
+// --- large trees -------------------------------------------------------------------
+
+#[test]
+fn a_large_tree_converges_in_both_directions_with_both_walks_and_then_does_nothing() {
+    let t = Tmp::new("large-tree");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    let n = 3000usize;
+    for i in 0..n {
+        write(
+            &t.path()
+                .join(format!("local/d{}/s{}/f{i}.txt", i % 30, i % 7)),
+            &format!("content {i}"),
+        );
+    }
+    let started = std::time::Instant::now();
+    run(&c, fake, false);
+    assert_eq!(store.borrow().files.len(), n);
+
+    // A second machine: an empty folder with the same remote. Everything comes down.
+    let other = Tmp::new("large-tree-other");
+    let c2 = cfg(other.path());
+    std::fs::create_dir_all(other.path().join("local")).unwrap();
+    let (f, _s) = reuse(&store);
+    run_streaming(&c2, f);
+    let down = walkdir::WalkDir::new(other.path().join("local"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .count();
+    assert_eq!(down, n, "not everything came down");
+    assert_eq!(
+        std::fs::read_to_string(other.path().join("local/d7/s0/f7.txt")).unwrap(),
+        "content 7"
+    );
+
+    // Converged: another pass with either walk changes nothing anywhere.
+    let before = store.borrow().files.clone();
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    let (f, _s) = reuse(&store);
+    run_streaming(&c2, f);
+    assert_eq!(store.borrow().files, before);
+    assert!(
+        started.elapsed().as_secs() < 60,
+        "a 3000-file tree took {:?}",
+        started.elapsed()
+    );
+}

@@ -238,8 +238,11 @@ protondrive4linux has no access to your Proton account. Logging in runs Proton's
 
 ## Known limitations
 
+How the data-loss review of the sync engine went - what it found, what it fixed, and what still is a risk - is in [docs/DATA_LOSS_REVIEW.md](docs/DATA_LOSS_REVIEW.md).
+
 - Remote-side changes (edits on another device) are only noticed on a hot or full pass, not instantly, because the CLI has no event feed and must re-walk. Actively-changed local folders sync immediately; see [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
-- Default `compare = "size+mtime"` can miss an in-place edit that keeps the same size and mtime; use `compare = "sha1"` to compare content exactly.
+- Default `compare = "size+mtime"` can miss an in-place edit that keeps the same size and mtime, and a file whose Proton entry has no modification time is compared by size alone; use `compare = "sha1"` to compare content exactly.
+- A transfer that doesn't finish within `cli.cli_timeout_secs` (30 minutes by default) is stopped and retried, so a file too big for your connection to move in that time never arrives until you raise it.
 - Renames look like a delete + create.
 
 ## Development
