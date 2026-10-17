@@ -38,7 +38,7 @@ struct PairState {
     current_op: Option<String>,          // e.g. "upload sub/a.txt" — good for a status line
     last_error: Option<String>,
     last_synced: Option<i64>,            // epoch seconds
-    tracked: usize,                      // files under management
+    tracked: usize,                      // files synced, counted from the baseline (files only, not folders)
     retrying: usize,                     // failed files waiting out a retry backoff (M4-004)
 }
 

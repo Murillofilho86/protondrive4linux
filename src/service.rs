@@ -63,6 +63,10 @@ pub struct PairState {
     pub current_op: Option<String>,
     pub last_error: Option<String>,
     pub last_synced: Option<i64>, // epoch seconds
+    /// Files of this pair that are synced, counted from the baseline (see
+    /// [`Stats::synced_files`]); 0 until the first sync completes. Only when
+    /// there is no stats DB does it fall back to what the run reported, which
+    /// is not always a file count.
     pub tracked: usize,
     /// Files whose last transfer failed and that are still inside their retry
     /// backoff window (M4-004) - failing, but not retried yet. Without this a
@@ -324,12 +328,15 @@ pub struct StateSink {
 
 impl EventSink for StateSink {
     fn emit(&self, ev: &SyncEvent) {
-        // A DB read, so done before taking the state lock (like `record_op`
+        // DB reads, so done before taking the state lock (like `record_op`
         // below). By PairFinished the run has already persisted its retry
-        // outcomes, so this reflects files that failed during it too.
-        let retrying = match (ev, &self.stats) {
-            (SyncEvent::PairFinished { pair, .. }, Some(st)) => count_retrying(st, pair),
-            _ => 0,
+        // outcomes and committed its baseline, so these reflect files that
+        // failed during it, and the files it synced, too.
+        let (retrying, synced_files) = match (ev, &self.stats) {
+            (SyncEvent::PairFinished { pair, .. }, Some(st)) => {
+                (count_retrying(st, pair), st.synced_files(pair).ok())
+            }
+            _ => (0, None),
         };
         let mut s = self.state.lock().unwrap();
         match ev {
@@ -445,7 +452,7 @@ impl EventSink for StateSink {
                     };
                     p.progress.done = p.progress.total;
                     p.current_op = None;
-                    p.tracked = tracked;
+                    p.tracked = synced_files.unwrap_or(tracked);
                     p.retrying = retrying;
                     if errors == 0 {
                         p.last_synced = Some(now_epoch());
@@ -461,7 +468,10 @@ impl EventSink for StateSink {
                         ActivityKind::Sync
                     };
                     let msg = if errors > 0 {
-                        format!("{pair}: {applied} applied, {errors} error(s)")
+                        format!(
+                            "{pair}: {applied} applied, {}",
+                            crate::datefmt::counted(errors, "error", "errors")
+                        )
                     } else {
                         format!("{pair}: {applied} applied")
                     };
@@ -526,6 +536,7 @@ impl Controller {
                         ps.last_synced = ls;
                     }
                     ps.retrying = count_retrying(st, &p.name);
+                    ps.tracked = st.synced_files(&p.name).unwrap_or(0);
                 }
                 ps
             })
@@ -1065,6 +1076,59 @@ mod tests {
             tracked: 2,
         });
         assert_eq!(st.lock().unwrap().pairs[0].retrying, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_finished_pair_reports_the_files_in_its_baseline_not_what_the_run_counted() {
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-filecount-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stats = Arc::new(Stats::open(&dir).unwrap());
+        let mut entries = std::collections::BTreeMap::new();
+        for f in ["a.txt", "d/b.txt", "d/c.txt"] {
+            entries.insert(
+                f.to_string(),
+                crate::models::Entry {
+                    path: f.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        entries.insert(
+            "d".to_string(),
+            crate::models::Entry {
+                path: "d".into(),
+                is_dir: true,
+                ..Default::default()
+            },
+        );
+        stats
+            .commit_baseline("docs", &entries, &Default::default())
+            .unwrap();
+
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: Some(stats),
+        };
+        // A full walk reports the folders it visited (here 7), not files.
+        sink.emit(&SyncEvent::PairFinished {
+            pair: "docs".into(),
+            applied: 0,
+            errors: 0,
+            tracked: 7,
+        });
+        assert_eq!(
+            st.lock().unwrap().pairs[0].tracked,
+            3,
+            "three files, one folder"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

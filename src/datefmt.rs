@@ -1,6 +1,8 @@
 //! Tiny date helpers (no chrono dependency) for the ISO-8601 timestamps the
 //! proton-drive CLI emits (`claimedModificationTime` etc.) and for trashinfo.
-//! Everything is treated as UTC; Proton returns "...Z" times.
+//! Everything is treated as UTC; Proton returns "...Z" times. Also the small
+//! helpers for phrasing a time or a count for a person ([`rel_time`],
+//! [`counted`]).
 
 /// Days since the Unix epoch for a civil (proleptic Gregorian) date.
 /// Howard Hinnant's algorithm.
@@ -95,13 +97,34 @@ pub fn rel_time(now: i64, ts: i64) -> String {
     let d = (now - ts).max(0);
     match d {
         0..=44 => "just now".into(),
-        45..=89 => "1 minute ago".into(),
-        90..=3599 => format!("{} minutes ago", d / 60),
+        // Up to two minutes is still "1 minute": 90 to 119 seconds used to read
+        // "1 minutes ago".
+        45..=119 => "1 minute ago".into(),
+        120..=3599 => format!("{} minutes ago", d / 60),
         3600..=7199 => "1 hour ago".into(),
         7200..=86399 => format!("{} hours ago", d / 3600),
         86400..=172799 => "yesterday".into(),
         _ => format!("{} days ago", d / 86400),
     }
+}
+
+/// `n` with thousands separators: 4733 -> "4,733".
+pub fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// "1 folder", "2 folders", "4,733 files": a count with its noun in the right
+/// number, instead of "folder(s)".
+pub fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{} {}", group_digits(n), if n == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -114,11 +137,37 @@ mod tests {
         assert_eq!(rel_time(now, now), "just now");
         assert_eq!(rel_time(now, now - 44), "just now");
         assert_eq!(rel_time(now, now - 60), "1 minute ago");
+        // The whole second minute reads singular, not "1 minutes ago".
+        assert_eq!(rel_time(now, now - 90), "1 minute ago");
+        assert_eq!(rel_time(now, now - 119), "1 minute ago");
+        assert_eq!(rel_time(now, now - 120), "2 minutes ago");
         assert_eq!(rel_time(now, now - 600), "10 minutes ago");
         assert_eq!(rel_time(now, now - 3600), "1 hour ago");
         assert_eq!(rel_time(now, now - 3 * 3600), "3 hours ago");
         assert_eq!(rel_time(now, now - 86400), "yesterday");
         assert_eq!(rel_time(now, now - 5 * 86400), "5 days ago");
+    }
+
+    #[test]
+    fn no_rel_time_is_ever_a_wrong_plural() {
+        // Every second across the first hour: "1 minutes" must never appear.
+        for d in 0..3700 {
+            let t = rel_time(10_000, 10_000 - d);
+            assert!(!t.starts_with("1 minutes"), "{d}s -> {t}");
+            assert!(!t.contains("(s)"), "{d}s -> {t}");
+        }
+    }
+
+    #[test]
+    fn counts_agree_with_their_noun_and_group_thousands() {
+        assert_eq!(counted(0, "folder", "folders"), "0 folders");
+        assert_eq!(counted(1, "folder", "folders"), "1 folder");
+        assert_eq!(counted(2, "error", "errors"), "2 errors");
+        assert_eq!(counted(4733, "file", "files"), "4,733 files");
+        assert_eq!(counted(1_000_000, "file", "files"), "1,000,000 files");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(12_345), "12,345");
     }
 
     #[test]

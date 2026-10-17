@@ -600,6 +600,21 @@ impl Stats {
         Ok(())
     }
 
+    /// How many files (not folders) of `pair` are in the baseline as fully
+    /// synced - what a folder card calls "N files". Counted from the baseline
+    /// rather than taken from what a run reports, which differs by kind of run
+    /// (a full walk counts folders visited, a one-shot sync counts entries).
+    pub fn synced_files(&self, pair: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM baseline
+             WHERE pair = ?1 AND is_dir = 0 AND state = 'synced'",
+            params![pair],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
     /// Whether `pair` has any baseline rows (i.e. it has synced before).
     pub fn has_baseline(&self, pair: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
@@ -870,6 +885,47 @@ mod tests {
             path: rel.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn synced_files_counts_files_only_and_per_pair() {
+        let s = Stats::memory().unwrap();
+        assert_eq!(s.synced_files("p").unwrap(), 0, "nothing synced yet");
+
+        let mut entries = BTreeMap::new();
+        for f in ["a.txt", "dir/b.txt", "dir/c.txt"] {
+            entries.insert(f.to_string(), entry(f));
+        }
+        entries.insert(
+            "dir".to_string(),
+            Entry {
+                path: "dir".into(),
+                is_dir: true,
+                ..Default::default()
+            },
+        );
+        s.commit_baseline("p", &entries, &HashSet::new()).unwrap();
+        // Another pair's files don't leak in.
+        let mut other = BTreeMap::new();
+        other.insert("z.txt".to_string(), entry("z.txt"));
+        s.commit_baseline("q", &other, &HashSet::new()).unwrap();
+
+        assert_eq!(s.synced_files("p").unwrap(), 3, "the folder isn't a file");
+        assert_eq!(s.synced_files("q").unwrap(), 1);
+
+        // A file that isn't fully synced yet isn't counted, and a removal is.
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE baseline SET state = 'pending_down' WHERE pair = 'p' AND rel = 'a.txt'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.synced_files("p").unwrap(), 2);
+        let removed: HashSet<String> = ["dir/b.txt".to_string()].into();
+        s.commit_baseline("p", &BTreeMap::new(), &removed).unwrap();
+        assert_eq!(s.synced_files("p").unwrap(), 1);
     }
 
     #[test]

@@ -843,8 +843,8 @@ impl<'a, R: Remote> Engine<'a, R> {
             self.emit(SyncEvent::Error {
                 pair: Some(pair.name.clone()),
                 text: format!(
-                    "{} folder(s) couldn't be listed — synced without deletions, will retry",
-                    remote_failed.len()
+                    "{} couldn't be listed — synced without deletions, will retry",
+                    crate::datefmt::counted(remote_failed.len(), "folder", "folders")
                 ),
             });
         }

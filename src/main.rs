@@ -387,10 +387,10 @@ fn cmd_sync(
             Ok(res) => {
                 total_errors += res.errors.len();
                 log.info(&format!(
-                    "pair {:?}: {} change(s) applied, {} error(s){}\n",
+                    "pair {:?}: {} applied, {}{}\n",
                     res.pair,
-                    res.applied,
-                    res.errors.len(),
+                    neutronsync::datefmt::counted(res.applied, "change", "changes"),
+                    neutronsync::datefmt::counted(res.errors.len(), "error", "errors"),
                     if dry_run { " (dry run)" } else { "" }
                 ));
                 summaries.push((res.pair, res.applied, res.errors.len(), res.plan_summary));
