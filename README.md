@@ -109,7 +109,7 @@ For each folder pair, protondrive4linux keeps a baseline snapshot of the last st
 - On startup it syncs folders with fresh local changes first, then recently active ("hot") folders, then everything else.
 - A full walk of both trees is the safety net that catches remote-side changes (edits made on your other devices, which the CLI only reveals by re-walking). It **streams**: it reconciles and transfers folder-by-folder as it walks, so a large tree starts syncing right away instead of after a full scan. It is paced to how long a walk actually takes, roughly six times its own duration, so a large tree is not re-walked constantly. Remote-only changes therefore appear on the next hot or full pass, not instantly.
 
-When the background tray daemon is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
+When the background tray daemon is doing the work, an open window mirrors its live state, so scanning and per-file transfers show up in Activity in real time. The tray icon carries a status badge so you can tell at a glance without opening anything: green check = up to date, blue dots = syncing, grey bars = auto sync off, red "!" = a folder has errors or files are waiting to retry, amber dash = signed out of Proton. The menu's top line spells it out ("Syncing docs (3/10)", "Up to date · synced 2 minutes ago", ...). The sync model and its reasoning are written up in [docs/SYNC_MODEL.md](docs/SYNC_MODEL.md).
 
 **Safety model.**
 

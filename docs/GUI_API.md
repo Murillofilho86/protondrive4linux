@@ -39,6 +39,7 @@ struct PairState {
     last_error: Option<String>,
     last_synced: Option<i64>,            // epoch seconds
     tracked: usize,                      // files under management
+    retrying: usize,                     // failed files waiting out a retry backoff (M4-004)
 }
 
 struct AccountState { checked, binary_found, signed_in: bool, version: String }
@@ -49,6 +50,20 @@ Rendering hints:
 - Per-pair row: name, `phase`, a progress bar from `progress.fraction()`, and `current_op` as a subtitle. Colour by `phase` (Synced=green, Error=red, Scanning/Syncing=accent).
 - Activity tab: iterate `activity` (it's already capped), colour by `kind`.
 - Account tab: dot from `signed_in`, show `version`.
+
+## One-glance status
+
+For places with room for a single state (the tray icon), `AppState::overall()` collapses everything into one `OverallStatus` — the most urgent thing across every pair — and `AppState::status_line(now)` words it as a short sentence:
+
+| `OverallStatus` | When | Example line |
+| --- | --- | --- |
+| `SignedOut` | the Proton session expired | `Signed out of Proton — sign in to resume` |
+| `Error` | a pair's last run had errors, or files are waiting to retry | `docs: upload a.txt: <reason>` / `docs: 2 files failed, retrying automatically` |
+| `Syncing` | a scan or transfer is in flight (or the first pass isn't done) | `Syncing docs (3/10)` |
+| `Synced` | live sync is on and everything is up to date | `Up to date · synced 2 minutes ago` |
+| `Paused` | live sync is off | `Auto sync is off` / `No folders to sync` |
+
+`controller.status_summary()` returns both under the state lock without cloning the activity feed, so it is cheap enough to poll several times a second. `PairState::retrying` counts files that failed and are still inside their backoff window: a run that merely *skips* them finishes with zero errors, so without it a pair would read as healthy while files are failing.
 
 ## Commands (all non-blocking)
 

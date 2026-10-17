@@ -88,9 +88,43 @@ pub fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
+/// How long before `now` the instant `ts` was, as a short human phrase:
+/// "just now", "5 minutes ago", "yesterday", "3 days ago". A `ts` in the
+/// future (clock skew) reads as "just now" rather than a negative duration.
+pub fn rel_time(now: i64, ts: i64) -> String {
+    let d = (now - ts).max(0);
+    match d {
+        0..=44 => "just now".into(),
+        45..=89 => "1 minute ago".into(),
+        90..=3599 => format!("{} minutes ago", d / 60),
+        3600..=7199 => "1 hour ago".into(),
+        7200..=86399 => format!("{} hours ago", d / 3600),
+        86400..=172799 => "yesterday".into(),
+        _ => format!("{} days ago", d / 86400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rel_time_buckets() {
+        let now = 1_000_000;
+        assert_eq!(rel_time(now, now), "just now");
+        assert_eq!(rel_time(now, now - 44), "just now");
+        assert_eq!(rel_time(now, now - 60), "1 minute ago");
+        assert_eq!(rel_time(now, now - 600), "10 minutes ago");
+        assert_eq!(rel_time(now, now - 3600), "1 hour ago");
+        assert_eq!(rel_time(now, now - 3 * 3600), "3 hours ago");
+        assert_eq!(rel_time(now, now - 86400), "yesterday");
+        assert_eq!(rel_time(now, now - 5 * 86400), "5 days ago");
+    }
+
+    #[test]
+    fn rel_time_future_timestamp_is_just_now() {
+        assert_eq!(rel_time(1000, 5000), "just now");
+    }
 
     #[test]
     fn roundtrip() {
