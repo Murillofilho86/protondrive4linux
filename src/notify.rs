@@ -282,35 +282,7 @@ mod tests {
         }
     }
 
-    /// A private session bus, killed on drop.
-    struct PrivateBus {
-        child: std::process::Child,
-        address: String,
-    }
-    impl Drop for PrivateBus {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-    impl PrivateBus {
-        /// `None` when there's no `dbus-daemon` to start (the test then skips).
-        fn start() -> Option<Self> {
-            use std::io::BufRead;
-            let mut child = std::process::Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok()?;
-            let mut line = String::new();
-            std::io::BufReader::new(child.stdout.take()?)
-                .read_line(&mut line)
-                .ok()?;
-            let address = line.trim().to_string();
-            (!address.is_empty()).then_some(PrivateBus { child, address })
-        }
-    }
+    use crate::testbus::PrivateBus;
 
     #[test]
     fn notify_call_reaches_a_real_notification_daemon_intact() {
