@@ -32,7 +32,8 @@ below is consulted (`decide`, top of function).
 | Modified | Unchanged | Upload | | `modify_local_uploads` |
 | Unchanged | Modified | Download | | (covered implicitly by streaming tests; no dedicated unit test) |
 | Modified | Modified, same content | Noop, baseline refreshed | `same_content()` under the configured `compare` mode | — |
-| Modified | Modified, same size, no sha1 clash | Noop, baseline refreshed | Same-size + drifted mtime is treated as metadata drift, not a dual edit — prevents keep-both from multiplying conflict copies forever (0.4.0 fix) | — |
+| Modified | Modified, same size, **digests equal** (the remote listed a SHA-1 and the local file hashes to it) | Noop, baseline refreshed | A touch on both sides, same bytes: only a digest can prove that. The local file is hashed just for this case (`digest_equal_sizes`) | `the_same_content_with_drifted_times_is_not_a_conflict_when_the_digest_proves_it` |
+| Modified | Modified, same size, digests differ **or the remote listed none** | Conflict (per `ConflictPolicy`) | Same size is not same content: two edits of equal length (a counter, a flag) look exactly like a touch. This used to be refreshed as "metadata drift" (a 0.4.0 fix for conflict copies multiplying, which was really the `claimedSize` misparse); the next run then downloaded the remote over the local file and the local edit was gone from both sides | `two_different_edits_of_the_same_size_are_a_conflict_not_metadata_drift` |
 | Modified | Modified, real content differs | Conflict (per `ConflictPolicy`) | See § Conflict policy | `conflict_keep_both`, `streaming_keeps_both_on_conflict` |
 | Deleted | Unchanged | DeleteRemote (if `propagate_deletes`) else Noop, baseline kept | | `delete_local_propagate_trashes_remote`, `delete_local_no_propagate` |
 | Unchanged | Deleted | DeleteLocal (if `propagate_deletes`) else Noop, baseline kept | | `delete_remote_propagate_removes_local` |
@@ -46,8 +47,8 @@ below is consulted (`decide`, top of function).
 | --- | --- | --- | --- | --- |
 | Created | Absent | Upload ("new local") | | `initial_upload` |
 | Absent | Created | Download ("new remote") | | `download_new_remote` |
-| Created | Created, same content | Noop, baseline set | Both sides created the identical file independently | — |
-| Created | Created, differs | Conflict (per `ConflictPolicy`) | Same conflict path as the baseline-present case | — |
+| Created | Created, same content | Noop, baseline set | Both sides created the identical file independently (judged as the rows above) | — |
+| Created | Created, differs | Conflict (per `ConflictPolicy`) | Same conflict path as the baseline-present case, including equal sizes without a proving digest: the first sync of a folder that already exists on both sides no longer replaces one of two different `notes.txt` | `files_made_independently_on_both_sides_with_equal_sizes_are_both_kept` |
 
 ## Directories (`decide_dir`)
 
@@ -57,8 +58,8 @@ No content comparison, no conflict — a directory is a container, not a value:
 | --- | --- | --- | --- |
 | Created | (none on remote) | MkdirRemote | |
 | (none on local) | Created | MkdirLocal | |
-| Deleted | Unchanged | DeleteRemote (if `propagate_deletes`) else Noop | |
-| Unchanged | Deleted | DeleteLocal (if `propagate_deletes`) else Noop | |
+| Deleted | Unchanged | DeleteRemote (if `propagate_deletes`) else Noop | At execution, the remote folder is listed and must hold only files the baseline knows and that are unchanged (`folder_delete_hazard`); otherwise it is kept and its files reconcile on their own | `a_folder_removed_locally_keeps_remote_files_this_machine_never_saw` |
+| Unchanged | Deleted | DeleteLocal (if `propagate_deletes`) else Noop | Same, locally: nothing inside may be new or edited here, and no exclude may sit inside it | `a_folder_removed_remotely_keeps_local_files_that_never_synced` |
 | anything else | | Noop, baseline kept from whichever side has an entry | Includes both-created (no mkdir race handling needed — mkdir is idempotent on both backends) |
 
 ## Conflict policy (`ConflictPolicy`, applies to the Conflict rows above)
@@ -97,9 +98,10 @@ documentation:
   `conflict_newer_local_wins`, `conflict_newer_remote_wins`,
   `conflict_newer_without_remote_mtime_falls_back_to_keep_both`, and
   `conflict_skip_leaves_both_sides_untouched` in `tests/engine.rs` (M1-005).
-- **Same-size/drifted-mtime baseline refresh** (the 0.4.0 thrash fix) has no dedicated regression
-  test under this name — it's exercised indirectly by whatever real-world scenario prompted the
-  0.4.0 fix, but a named test would prevent silent regression.
+- ~~Same-size/drifted-mtime baseline refresh has no dedicated regression test~~ — it turned out to
+  be a data-loss bug, not a thrash fix (see the rows above), and is now covered by
+  `two_different_edits_of_the_same_size_are_a_conflict_not_metadata_drift` and friends in
+  `tests/data_loss.rs`.
 - **Both-sides-created-identical-directory** and **both-sides-created-identical-file** have no
   dedicated test confirming the baseline is set correctly and no duplicate mkdir/upload is
   attempted.

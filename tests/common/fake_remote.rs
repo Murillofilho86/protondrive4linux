@@ -46,6 +46,10 @@ pub struct Store {
     pub truncate_download: Option<(String, usize)>,
     // absolute remote path whose download writes the first N bytes then FAILS (disk full, killed CLI)
     pub partial_then_fail: Option<(String, usize)>,
+    // List every file with the SHA-1 of its content, as the real CLI does when the
+    // revision carries `claimedDigests` (off by default: a remote entry can
+    // legitimately lack one).
+    pub report_sha1: bool,
 }
 
 pub struct FakeRemote {
@@ -105,6 +109,9 @@ impl Remote for FakeRemote {
                         is_dir: false,
                         size: data.len() as u64,
                         mtime: s.mtimes.get(f).copied(),
+                        sha1: s
+                            .report_sha1
+                            .then(|| sha1_smol::Sha1::from(data).digest().to_string()),
                         ..Default::default()
                     });
                 }

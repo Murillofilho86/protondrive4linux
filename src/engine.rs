@@ -636,6 +636,40 @@ impl<'a, R: Remote> Engine<'a, R> {
         self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
+    /// For every path both sides changed to the same size at different times, hash
+    /// the local file when the remote listed a digest, so `decide` can tell a
+    /// touch (same bytes) from two different edits (see there). Rare, and the one
+    /// case where reading a local file for a comparison is worth it.
+    fn digest_equal_sizes(
+        &self,
+        root: &Path,
+        local: &mut BTreeMap<String, Entry>,
+        remote: &BTreeMap<String, Entry>,
+        ls: &HashMap<String, Change>,
+        rs: &HashMap<String, Change>,
+    ) {
+        let both_changed = |p: &String| {
+            matches!(ls.get(p), Some(Change::Created | Change::Modified))
+                && matches!(rs.get(p), Some(Change::Created | Change::Modified))
+        };
+        for (path, le) in local.iter_mut() {
+            let Some(re) = remote.get(path) else { continue };
+            if le.is_dir
+                || re.is_dir
+                || le.sha1.is_some()
+                || re.sha1.is_none()
+                || le.size != re.size
+                || le.size == 0
+                || !both_changed(path)
+            {
+                continue;
+            }
+            if let Ok(rel_path) = safe_join(root, path) {
+                le.sha1 = sha1_file(&rel_path);
+            }
+        }
+    }
+
     /// How long a staging folder must have sat idle to be taken for the
     /// leftovers of a download whose process died: longer than the CLI is allowed
     /// to run (it is killed at `cli_timeout_secs`), so a live download never is.
@@ -988,8 +1022,10 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
 
         let cmp = self.cfg.compare;
+        let mut local = local;
         let ls = classify(&local, &base, cmp);
         let rs = classify(&remote, &base, cmp);
+        self.digest_equal_sizes(&pair.local, &mut local, &remote, &ls, &rs);
 
         let mut plan = Plan::default();
         let mut new_base: BTreeMap<String, Entry> = BTreeMap::new();
@@ -1038,7 +1074,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         // Skip on an incomplete scan: a "missing" source may just be in an
         // unlisted folder, so a rename could wrongly move a remote file.
         if !incomplete {
-            detect_renames(&mut plan, &base, &local, &remote);
+            detect_renames(&mut plan, &base, &local, &remote, &pair.local);
         }
         Ok((plan, new_base, incomplete, prune_excluded))
     }
@@ -1120,18 +1156,26 @@ impl<'a, R: Remote> Engine<'a, R> {
                 }
                 return;
             }
-            // Same byte size but different mtimes: usually metadata drift (a
-            // download/touch, or Proton's claimedModificationTime vs a local
-            // clock), not a real dual edit. Emitting keep-both here multiplies
-            // conflict copies forever. Prefer size equality; if both sides carry
-            // sha1 and they differ, fall through to a real conflict.
+            // Same byte size but different mtimes. A touch on both sides (or Proton's
+            // claimedModificationTime against a local clock) changes the time and
+            // not the bytes - but so does editing a number, a flag or a digit on
+            // both sides, and the two cannot be told apart by size. Taking it for
+            // drift (as this once did, to stop conflict copies multiplying) left
+            // the two files different with a baseline saying they agreed: the next
+            // run saw the remote's time differ from the baseline's, downloaded it
+            // over the local file, and the local edit was gone from both sides.
+            // Only a digest settles it: when both sides have one and they match,
+            // it is drift and the baseline is refreshed; in every other case
+            // (different digests, or none to compare) both versions are kept.
+            // The local digest of such a file is filled in before this runs
+            // (`digest_equal_sizes`), so it is there whenever the remote listed one.
             if let (Some(a), Some(b)) = (le, re) {
                 if a.size == b.size && a.size > 0 {
-                    let sha_clash = matches!(
+                    let proven_same = matches!(
                         (&a.sha1, &b.sha1),
-                        (Some(x), Some(y)) if x != y
+                        (Some(x), Some(y)) if x == y
                     );
-                    if !sha_clash {
+                    if proven_same {
                         if let Some(e) = le {
                             new_base.insert(path.to_string(), e.clone());
                         }
@@ -1479,6 +1523,29 @@ impl<'a, R: Remote> Engine<'a, R> {
                     op.path
                 ));
                 continue;
+            }
+            // A folder goes with everything in it. The files inside were judged
+            // one by one when the plan was made - or, in a shallow reconcile, not
+            // at all, since only the folder's own listing is looked at. So before
+            // removing one, check that nothing in it is a file the sync has not
+            // seen: a new file, an edit, something from another device. If there
+            // is, the folder stays; its files reconcile on their own and the
+            // folder is removed on a later run if it is then empty of news.
+            if op.is_dir && matches!(op.action, Action::DeleteLocal | Action::DeleteRemote) {
+                if let Some(why) = self.folder_delete_hazard(pair, op) {
+                    let (where_, gone_on) = if op.action == Action::DeleteLocal {
+                        ("here", "Proton Drive")
+                    } else {
+                        ("on Proton Drive", "this computer")
+                    };
+                    let msg = format!(
+                        "kept the folder {} {where_}: it was removed on {gone_on}, but {why}",
+                        op.path
+                    );
+                    self.log.warn(&msg);
+                    self.emit(SyncEvent::Info { text: msg });
+                    continue;
+                }
             }
             self.emit(SyncEvent::OpStarted {
                 pair: pair.name.clone(),
@@ -1852,6 +1919,115 @@ impl<'a, R: Remote> Engine<'a, R> {
             Action::Noop => {}
         }
         Ok(())
+    }
+
+    /// Why removing the folder `op.path` - which the other side no longer has -
+    /// would take something the sync has not seen, or `None` if everything in it
+    /// is a file the baseline knows and that is unchanged since. Checked against
+    /// the stored baseline, which only ever holds what completed, so it errs on
+    /// the side of keeping the folder. Anything it cannot establish counts as
+    /// unsafe.
+    fn folder_delete_hazard(&self, pair: &Pair, op: &Op) -> Option<String> {
+        let base = match crate::state::load_baseline(&self.cfg.state_dir, &pair.name) {
+            Ok(b) => b,
+            Err(_) => return Some("this pair's record can't be read".to_string()),
+        };
+        let prefix = format!("{}/", op.path);
+        let cmp = self.cfg.compare;
+        // An exclude inside the folder is invisible to the sync and must never be
+        // deleted; removing the folder would take it.
+        if let Some(ex) = pair.exclude.iter().find(|e| e.starts_with(&prefix)) {
+            return Some(format!("{ex} inside it is excluded from sync"));
+        }
+        // What `rel`, found with this size and time, says about being safe to remove.
+        let judge = |rel: &str, found: &Entry, side: &str| -> Option<String> {
+            match base.get(rel) {
+                Some(b) if !b.is_dir && same_content(found, b, cmp) => None,
+                Some(_) => Some(format!("{rel} was changed {side} since the last sync")),
+                None => Some(format!("{rel} is new {side} and has not synced")),
+            }
+        };
+        match op.action {
+            Action::DeleteLocal => {
+                let root = match safe_join(&pair.local, &op.path) {
+                    Ok(p) => p,
+                    Err(e) => return Some(e.to_string()),
+                };
+                for entry in walkdir::WalkDir::new(&root)
+                    .min_depth(1)
+                    .follow_links(false)
+                {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => return Some(format!("part of it can't be read ({e})")),
+                    };
+                    let Some(under) = entry
+                        .path()
+                        .strip_prefix(&root)
+                        .ok()
+                        .and_then(|p| p.to_str())
+                    else {
+                        return Some(
+                            "it holds a file with a name that isn't valid text".to_string(),
+                        );
+                    };
+                    let rel = format!("{prefix}{}", under.replace('\\', "/"));
+                    if pair.is_excluded(&rel) {
+                        continue;
+                    }
+                    let ft = entry.file_type();
+                    if ft.is_dir() {
+                        continue;
+                    }
+                    if !ft.is_file() {
+                        return Some(format!("{rel} is a symlink or special file"));
+                    }
+                    let Ok(meta) = entry.metadata() else {
+                        return Some(format!("{rel} can't be read"));
+                    };
+                    let found = Entry {
+                        path: rel.clone(),
+                        is_dir: false,
+                        size: meta.len(),
+                        mtime: meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64),
+                        sha1: None,
+                        remote_id: None,
+                    };
+                    if let Some(why) = judge(&rel, &found, "here") {
+                        return Some(why);
+                    }
+                }
+                None
+            }
+            Action::DeleteRemote => {
+                let scan = match self.remote.list_tree(
+                    &remote_join(&pair.remote, &op.path),
+                    &|_| false,
+                    &|_| {},
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return Some(format!("it can't be listed ({e})")),
+                };
+                if !scan.failed.is_empty() {
+                    return Some("part of it can't be listed".to_string());
+                }
+                for (under, found) in &scan.entries {
+                    let rel = format!("{prefix}{under}");
+                    if found.is_dir || pair.is_excluded(&rel) {
+                        continue;
+                    }
+                    if let Some(why) = judge(&rel, found, "on Proton Drive") {
+                        return Some(why);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Report how a conflict was settled: a text-log line (the resolution
@@ -2406,6 +2582,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         let cmp = self.cfg.compare;
         let ls = classify(&local_direct, &base_direct, cmp);
         let rs = classify(&remote_direct, &base_direct, cmp);
+        self.digest_equal_sizes(&pair.local, &mut local_direct, &remote_direct, &ls, &rs);
         let mut plan = Plan::default();
         let mut new_base: BTreeMap<String, Entry> = BTreeMap::new();
         let mut keys: Vec<&String> = local_direct
@@ -2499,7 +2676,13 @@ impl<'a, R: Remote> Engine<'a, R> {
 
         // Immediate sub-folders to descend into on a streaming walk: dirs present
         // on either side after the reconcile, minus any deleted this run.
-        let deleted: HashSet<&String> = deleted_dirs.iter().collect();
+        // Only a folder whose removal completed is gone: one that was kept (it held
+        // something that had not synced) must still be descended into, or what is
+        // in it would never be reconciled.
+        let deleted: HashSet<&String> = deleted_dirs
+            .iter()
+            .filter(|d| self.dry_run || deleted_ok.contains(*d))
+            .collect();
         let mut children: Vec<String> = local_direct
             .iter()
             .chain(remote_direct.iter())
@@ -2681,6 +2864,13 @@ fn is_rename_match(a: &Entry, b: &Entry) -> bool {
 /// Rewrite delete+create pairs with identical content into a single rename op.
 /// `from_entry` gives the baseline content of a deleted path; `to_entry` gives
 /// the new content of a created path.
+///
+/// `confirm(from, to)` has the last word on a pair that matched by size and time:
+/// size and (whole-second) time are a heuristic, and a build output or a batch
+/// of files extracted together can share both with a file that has other bytes in
+/// it. It returns `false` only when it can show they differ, in which case the
+/// two stay a delete and a create - never a move that would put the old content
+/// under the new name and leave the new content unsent.
 fn rewrite_renames<'a>(
     plan: &mut Plan,
     del: Action,
@@ -2688,6 +2878,7 @@ fn rewrite_renames<'a>(
     rename: Action,
     from_entry: impl Fn(&str) -> Option<&'a Entry>,
     to_entry: impl Fn(&str) -> Option<&'a Entry>,
+    confirm: impl Fn(&str, &str) -> bool,
 ) {
     let creates: Vec<usize> = plan
         .ops
@@ -2717,7 +2908,7 @@ fn rewrite_renames<'a>(
             let Some(fe) = from_entry(&from) else {
                 continue;
             };
-            if is_rename_match(fe, te) {
+            if is_rename_match(fe, te) && confirm(&from, &to) {
                 used_del.insert(d);
                 renamed.push((c, from));
                 break;
@@ -2741,12 +2932,29 @@ fn rewrite_renames<'a>(
 
 /// Detect local renames (delete-remote + upload) and remote renames
 /// (delete-local + download) by matching content, collapsing each into a move.
+///
+/// A match by size and time is checked against the remote's digest when it listed
+/// one: the file about to be moved is hashed and compared. With no digest there
+/// is nothing to check against and the match stands.
 fn detect_renames(
     plan: &mut Plan,
     base: &BTreeMap<String, Entry>,
     local: &BTreeMap<String, Entry>,
     remote: &BTreeMap<String, Entry>,
+    local_root: &Path,
 ) {
+    // Does `local_rel`'s content match the digest `remote_rel` was listed with?
+    let matches_remote_digest = |remote_rel: &str, local_rel: &str| -> bool {
+        match remote.get(remote_rel).and_then(|e| e.sha1.as_deref()) {
+            Some(want) => safe_join(local_root, local_rel)
+                .ok()
+                .and_then(|p| sha1_file(&p))
+                .is_some_and(|got| got == want),
+            None => true,
+        }
+    };
+    // A local rename: the remote file at `from` is to be moved to `to`, which
+    // has to be the same bytes as `from`'s remote digest.
     rewrite_renames(
         plan,
         Action::DeleteRemote,
@@ -2754,7 +2962,10 @@ fn detect_renames(
         Action::RenameRemote,
         |p| base.get(p),
         |p| local.get(p),
+        |from, to| matches_remote_digest(from, to),
     );
+    // A remote rename: the local file at `from` is to be moved to `to`, whose
+    // remote digest has to be `from`'s bytes.
     rewrite_renames(
         plan,
         Action::DeleteLocal,
@@ -2762,6 +2973,7 @@ fn detect_renames(
         Action::RenameLocal,
         |p| base.get(p),
         |p| remote.get(p),
+        |from, to| matches_remote_digest(to, from),
     );
 }
 
