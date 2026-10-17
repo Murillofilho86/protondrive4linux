@@ -80,7 +80,10 @@ debounce = 2
 
 # GUI theme: "system" follows your desktop's light/dark setting (read from the
 # settings portal, so it works on GNOME, KDE, COSMIC...), or force "light" or
-# "dark". Also in Settings -> Appearance.
+# "dark", or the name of a custom theme: Dracula, Nord and Tokyo Night are
+# bundled, and your own are small TOML files in
+# ~/.config/protondrive4linux/themes/ (see docs/THEMES.md). Also in Settings ->
+# Appearance.
 # theme = "system"
 
 # GUI preferences (also toggled from Settings; saved back here automatically).

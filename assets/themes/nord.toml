@@ -1,0 +1,19 @@
+# Nord - https://www.nordtheme.com
+name = "Nord"
+base = "dark"
+
+[colors]
+nav_bg = "#272C36"
+panel = "#2E3440"
+panel2 = "#3B4252"
+sel = "#434C5E"
+text = "#ECEFF4"
+dim = "#BAC4D6"
+dim2 = "#94A1BA"
+accent = "#88C0D0"
+accent_hi = "#9DCFDD"
+accent_lo = "#78B0C0"
+on_accent = "#232831"
+ok = "#A3BE8C"
+danger = "#E58A93"
+warn = "#EBCB8B"

@@ -84,7 +84,7 @@ sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
 
 ### GUI
 
-Launch **protondrive4linux** from your app menu (or `protondrive4linux-gui`). Sign in to Proton (this opens Proton's own login in your browser and signs in the CLI), add folder pairs on the Folders page, and use "Choose folders to sync" to exclude any sub-folders you don't want. Settings covers the theme (follow the system, or force light/dark), the tray, auto-sync, conflict handling, and your update channel.
+Launch **protondrive4linux** from your app menu (or `protondrive4linux-gui`). Sign in to Proton (this opens Proton's own login in your browser and signs in the CLI), add folder pairs on the Folders page, and use "Choose folders to sync" to exclude any sub-folders you don't want. Settings covers the theme (follow the system, force light/dark, or pick Dracula, Nord, Tokyo Night or one of your own - a small TOML file, see [docs/THEMES.md](docs/THEMES.md)), the tray, auto-sync, conflict handling, and your update channel.
 
 ### CLI
 
@@ -145,7 +145,7 @@ poll_interval = 900           # watch: seconds between full rescans
 update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
 # notifications = true        # tray: desktop notifications for conflicts, lasting problems, sign-out
-# theme = "system"            # GUI: system | light | dark
+# theme = "system"            # GUI: system | light | dark | the name of a custom theme
 
 [[pair]]
 name = "documents"

@@ -1,0 +1,19 @@
+# Dracula - https://draculatheme.com
+name = "Dracula"
+base = "dark"
+
+[colors]
+nav_bg = "#21222C"
+panel = "#282A36"
+panel2 = "#313442"
+sel = "#44475A"
+text = "#F8F8F2"
+dim = "#B5BAD6"
+dim2 = "#8F95B8"
+accent = "#BD93F9"
+accent_hi = "#CFAEFB"
+accent_lo = "#A47CEE"
+on_accent = "#1E1F29"
+ok = "#50FA7B"
+danger = "#FF6E6E"
+warn = "#FFB86C"
