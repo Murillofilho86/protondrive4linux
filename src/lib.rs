@@ -34,6 +34,7 @@ pub mod stats;
 mod testbus;
 pub mod themes;
 pub mod trash;
+pub mod tray_policy;
 #[cfg(feature = "gui")]
 pub mod updater;
 pub mod watcher;

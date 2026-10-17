@@ -63,9 +63,13 @@ These are the rules that must hold. Most exist because breaking one caused a rea
 - **Excludes are invisible.** Excluded sub-paths are pruned from the scan itself (local and remote), never listed, downloaded, or deleted. Re-including a folder re-downloads it, so excluding can never delete remote data.
 - **Conflicts keep both.** Both sides changed and differ, keep both (`name (conflict <timestamp>).ext`), never silently overwrite.
 
-## The GUI is two processes
+## The GUI is up to three processes
 
-In tray mode the background tray daemon owns the watcher and does the syncing in one process; the window is a separate process. The window cannot see the daemon's in-memory state directly, so the daemon publishes a compact live snapshot to `status.json` a few times a second and the window reads it. That is how an open window shows the daemon scanning, syncing, and per-file transfers in real time. A CLI `protondrive4linux sync` also records its operations into the same activity store the window reads, so command-line runs show up there too.
+In tray mode the background tray owns the watcher and does the syncing in one process; the window is a separate process; and `--tray` is a thin supervisor that holds the tray lock and runs the real tray (`--tray-child`) as its child, starting it again after a crash (waits of 2, 5, 15, 30 and 30 seconds; it gives up after five restarts in five minutes, and stops at once when the display session is gone or the tray quits). The release build aborts on a panic, a broken display connection kills a GTK app, and the kernel's OOM killer picks its own victims, so without the supervisor any of them silently ended background sync. The supervisor does no GTK, syncing or config watching, so it survives what takes the tray down, and the kernel stops the tray if the supervisor itself dies, so there is never a tray without the lock.
+
+The window does not trust the snapshot blindly: every couple of seconds it checks that a live process holds the tray lock and that `status.json` is less than ten seconds old. A dead supervisor is started again by the window; a tray that is alive but has stopped updating gets a "not responding" banner; three starts that never come up become "could not start", with a Try again button. The decisions are plain functions in `src/tray_policy.rs`.
+
+The window cannot see the tray's in-memory state directly, so the tray publishes a compact live snapshot to `status.json` a few times a second and the window reads it. That is how an open window shows the daemon scanning, syncing, and per-file transfers in real time. A CLI `protondrive4linux sync` also records its operations into the same activity store the window reads, so command-line runs show up there too.
 
 ## Config knobs
 

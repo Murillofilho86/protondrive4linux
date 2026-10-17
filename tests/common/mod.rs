@@ -71,7 +71,12 @@ impl Sandbox {
     }
 
     pub fn command(&self) -> Command {
-        let mut cmd = Command::new(BIN);
+        self.command_for(BIN)
+    }
+
+    /// The same scrubbed environment for another of this crate's binaries.
+    pub fn command_for(&self, bin: &str) -> Command {
+        let mut cmd = Command::new(bin);
         cmd.env_clear()
             .current_dir(&self.root)
             .env("PATH", self.path("empty-bin"))
