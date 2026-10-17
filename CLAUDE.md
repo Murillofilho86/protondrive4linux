@@ -36,6 +36,7 @@ Not something to do casually — see `docs/contributing/CONTRIBUTING.md` for ful
 - `engine` — the three-way-merge sync engine: classifies each path per side against the baseline (Created/Modified/Deleted/Unchanged/Absent) and decides an action (`decide` / `decide_dir`). Also owns the streaming full-walk implementation (`run_sync_streaming`) and its tested sequential oracle (`Engine::sync_pair_streaming`).
 - `state` — baseline persistence (SQLite, `stats.db`, table `baseline`, keyed by `(pair, rel)`). Baseline commits are additive/scoped — never a full-pair rewrite.
 - `watcher` — inotify-based live sync (`notify-debouncer-full`): shallow, folder-scoped reconciliation on local events, hot-folder passes, and the adaptively-paced full walk.
+- `staged` — staged downloads. The CLI never writes to a final name: it is pointed at a hidden `.protondrive4linux-….part` folder next to the destination, and the file is moved into place with one rename only once it has arrived at the promised size, been `fsync`ed, had its mtime set, and the local file is still what the plan saw. Every download goes through it (`engine::run_downloads`, `fetch_into_place`); don't add a path that lets the CLI write straight into the tree.
 - `trash` — recoverable local deletes (`gio`/freedesktop trash, with a manual XDG-trash fallback).
 - `ignore` — exclude-path handling; excludes are pruned from scans entirely, never listed/downloaded/deleted.
 - `events` — structured sync events emitted by the engine.

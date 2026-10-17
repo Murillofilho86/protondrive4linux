@@ -353,6 +353,7 @@ pub fn watch_with(
     // 2) Debounced FS watcher -> record hotness + queue a scoped sync per folder.
     let handler_roots = roots.clone();
     let handler_names: Vec<String> = pairs.iter().map(|p| p.name.clone()).collect();
+    let handler_pairs: Vec<Pair> = pairs.clone();
     let handler_stats = stats.clone();
     let handler_tx = tx.clone();
     let mut debouncer = new_debouncer(
@@ -377,7 +378,11 @@ pub fn watch_with(
                     if let Some(i) = handler_roots.iter().position(|r| path.starts_with(r)) {
                         if let Ok(rel) = path.strip_prefix(&handler_roots[i]) {
                             let rel = rel.to_string_lossy().replace('\\', "/");
-                            if rel.is_empty() {
+                            // An excluded path is invisible to the engine, so a
+                            // change inside one is not news: no hot-folder tick,
+                            // no sync. This is also what keeps a download's own
+                            // staging folder from setting off a sync of itself.
+                            if rel.is_empty() || handler_pairs[i].is_excluded(&rel) {
                                 continue;
                             }
                             if let Some(st) = &handler_stats {

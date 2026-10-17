@@ -24,8 +24,11 @@ use crate::events::{ConflictResolution, EventSink, SyncEvent};
 use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete, Pair};
 use crate::datefmt::{epoch_to_stamp, now_epoch};
 use crate::logger::Logger;
-use crate::models::{same_content, Action, Change, Compare, DownloadJob, Entry, Op, Plan};
+use crate::models::{
+    same_content, Action, Change, Compare, DownloadJob, Entry, LocalSeen, Op, Plan,
+};
 use crate::protoncli::{ListOutcome, ProtonCli, Remote};
+use crate::staged::{self, Expect};
 use crate::trash::trash_local;
 
 /// `plan()`'s return: (the plan, the prospective new baseline, whether the
@@ -618,6 +621,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
     }
 
+    /// How long a staging folder must have sat idle to be taken for the
+    /// leftovers of a download whose process died: longer than the CLI is allowed
+    /// to run (it is killed at `cli_timeout_secs`), so a live download never is.
+    fn stale_after(&self) -> Duration {
+        Duration::from_secs(self.cfg.cli_timeout_secs).saturating_add(staged::STALE_MARGIN)
+    }
+
     // --- scanning -----------------------------------------------------------
     /// Walk the local tree. In sha1 mode, files whose size+mtime match the
     /// baseline reuse the stored hash instead of being re-read (a
@@ -646,17 +656,26 @@ impl<'a, R: Remote> Engine<'a, R> {
         let want_sha1 = self.cfg.compare == Compare::Sha1;
         // Prune excluded subtrees from the walk itself (`filter_entry` stops
         // descent), so an excluded folder is never even stat-walked locally —
-        // matching the remote scan and keeping excludes truly invisible.
+        // matching the remote scan and keeping excludes truly invisible. A
+        // staging folder (a download in progress) is one of them; one left by a
+        // dead process is cleaned up on the way past.
+        let stale = self.stale_after();
         for entry in walkdir::WalkDir::new(&start)
             .min_depth(1)
             .follow_links(false)
             .into_iter()
-            .filter_entry(
-                |e| match e.path().strip_prefix(root).ok().and_then(|p| p.to_str()) {
+            .filter_entry(|e| {
+                if e.file_type().is_dir()
+                    && e.file_name().to_str().is_some_and(staged::is_staging_name)
+                {
+                    staged::sweep_if_stale(e.path(), stale);
+                    return false;
+                }
+                match e.path().strip_prefix(root).ok().and_then(|p| p.to_str()) {
                     Some(r) => !pair.is_excluded(&r.replace('\\', "/")),
                     None => true,
-                },
-            )
+                }
+            })
             .filter_map(|e| e.ok())
         {
             let rel = match entry
@@ -993,7 +1012,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             return;
         }
         if matches!(rc, Created | Modified) && lc == Unchanged {
-            self.emit_download(path, re, plan, new_base, rc.label());
+            self.emit_download(path, re, le, plan, new_base, rc.label());
             return;
         }
         // one side created, other absent
@@ -1002,7 +1021,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             return;
         }
         if rc == Created && lc == Absent {
-            self.emit_download(path, re, plan, new_base, "new remote");
+            self.emit_download(path, re, le, plan, new_base, "new remote");
             return;
         }
         // both created / both modified
@@ -1052,6 +1071,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             self.emit_download(
                 path,
                 re,
+                le,
                 plan,
                 new_base,
                 "deleted locally but modified remotely; keeping remote",
@@ -1137,15 +1157,19 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
     }
 
+    /// Plan a download of `e` (the remote entry). `seen` is the local entry the
+    /// scan found at the path, so the file is only replaced if the user has not
+    /// touched it by the time the download lands.
     fn emit_download(
         &self,
         path: &str,
         e: Option<&Entry>,
+        seen: Option<&Entry>,
         plan: &mut Plan,
         nb: &mut BTreeMap<String, Entry>,
         reason: &str,
     ) {
-        plan.add(Op::new(Action::Download, path, false, reason));
+        plan.add(Op::new(Action::Download, path, false, reason).seeing(LocalSeen::of(seen)));
         if let Some(e) = e {
             nb.insert(path.to_string(), e.clone());
         }
@@ -1172,7 +1196,7 @@ impl<'a, R: Remote> Engine<'a, R> {
                     settle_last(plan, ConflictResolution::KeptLocal);
                 }
                 (Some(_), Some(_)) => {
-                    self.emit_download(path, re, plan, nb, "conflict: remote newer");
+                    self.emit_download(path, re, le, plan, nb, "conflict: remote newer");
                     settle_last(plan, ConflictResolution::KeptRemote);
                 }
                 _ => self.emit_conflict_keep_both(path, re, plan, nb),
@@ -1559,12 +1583,27 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| pair.local.clone());
+            let Some(name) = local_full
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+            else {
+                let msg = format!("download {}: no file name", op.path);
+                self.log.error(&msg);
+                result.errors.push(msg);
+                continue;
+            };
+            // The CLI writes into a private staging folder next to the final
+            // location, never into it (see `staged`); the folder is created when
+            // the job starts, so only the running ones exist at any moment.
             jobs.push(DownloadJob {
                 rel: op.path.clone(),
                 remote_path: remote_join(&pair.remote, &op.path),
-                dest_dir: dest_dir.to_string_lossy().into_owned(),
+                dest_dir: staged::plan_dir(&dest_dir).to_string_lossy().into_owned(),
+                final_dir: dest_dir.to_string_lossy().into_owned(),
+                name,
                 mtime: new_base.get(&op.path).and_then(|e| e.mtime),
                 size: new_base.get(&op.path).map(|e| e.size).unwrap_or(0),
+                local_seen: op.local_seen.unwrap_or(LocalSeen::Absent),
             });
         }
 
@@ -1572,7 +1611,6 @@ impl<'a, R: Remote> Engine<'a, R> {
         let log = self.log;
         let cfg = self.cfg;
         let pair_name = pair.name.as_str();
-        let local_root = &pair.local;
         let applied = AtomicUsize::new(0);
         let errs: Mutex<Vec<String>> = Mutex::new(Vec::new());
         let done_rels: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1585,6 +1623,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             cfg.download_limiter
                 .acquire(j.size, cfg.download_limit_kbps);
             log.info(&format!("download    file {} (new remote)", j.rel));
+            if let Err(e) = std::fs::create_dir_all(&j.final_dir)
+                .and_then(|()| std::fs::create_dir(&j.dest_dir))
+            {
+                // The download will fail on its own and say so; this says why.
+                log.error(&format!(
+                    "download {}: cannot create a staging folder next to it: {e}",
+                    j.rel
+                ));
+            }
             if let Some(s) = events {
                 s.emit(&SyncEvent::OpStarted {
                     pair: pair_name.to_string(),
@@ -1594,12 +1641,28 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
         };
         let on_done = |j: &DownloadJob, r: std::result::Result<(), String>| {
+            // Whatever the CLI wrote is in the staging folder. Only a download
+            // that arrived whole, and found the local file as the plan left it,
+            // is moved into place; the folder goes either way.
+            let staging = staged::Staging::adopt(Path::new(&j.dest_dir));
+            let r = r.and_then(|()| {
+                staging
+                    .install(
+                        &j.name,
+                        &Expect {
+                            size: j.size,
+                            mtime: j.mtime,
+                            local: j.local_seen,
+                        },
+                    )
+                    .map_err(|e| e.to_string())
+            });
+            drop(staging);
             let ok = r.is_ok();
             let err_text = r.as_ref().err().cloned();
             match r {
                 Ok(()) => {
                     applied.fetch_add(1, Ordering::Relaxed);
-                    match_mtime(&local_root.join(&j.rel), j.mtime);
                     done_rels.lock().unwrap().push(j.rel.clone());
                 }
                 Err(e) => {
@@ -1668,16 +1731,16 @@ impl<'a, R: Remote> Engine<'a, R> {
                 )?;
             }
             Action::Download => {
-                let dest_dir = local_full
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(pair.local.clone());
-                std::fs::create_dir_all(&dest_dir)?;
-                self.remote
-                    .download(&remote_full, &dest_dir.to_string_lossy())?;
-                if let Some(e) = new_base.get(&op.path) {
-                    match_mtime(&local_full, e.mtime);
-                }
+                let want = new_base.get(&op.path);
+                self.fetch_into_place(
+                    pair,
+                    &op.path,
+                    &Expect {
+                        size: want.map(|e| e.size).unwrap_or(0),
+                        mtime: want.and_then(|e| e.mtime),
+                        local: op.local_seen.unwrap_or(LocalSeen::Absent),
+                    },
+                )?;
             }
             Action::DeleteRemote => self.remote.trash(&remote_full)?,
             Action::DeleteLocal => self.delete_local(&local_full, op.is_dir)?,
@@ -1725,29 +1788,58 @@ impl<'a, R: Remote> Engine<'a, R> {
         });
     }
 
+    /// Download `rel` from the remote into place: into a private staging folder
+    /// first, then moved over the destination only once it has arrived whole and
+    /// the destination is still what `expect.local` says (see [`staged`]).
+    fn fetch_into_place(&self, pair: &Pair, rel: &str, expect: &Expect) -> Result<()> {
+        let local_full = safe_join(&pair.local, rel)?;
+        let dest_dir = local_full
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(pair.local.clone());
+        let name = local_full
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("{rel:?} has no file name"))?;
+        std::fs::create_dir_all(&dest_dir)?;
+        let staging = staged::Staging::create(&dest_dir)?;
+        self.remote.download(
+            &remote_join(&pair.remote, rel),
+            &staging.dir().to_string_lossy(),
+        )?;
+        staging.install(&name, expect)?;
+        Ok(())
+    }
+
     fn resolve_conflict(
         &mut self,
         pair: &Pair,
         rel: &str,
         new_base: &mut BTreeMap<String, Entry>,
     ) -> Result<()> {
-        let local_full = pair.local.join(rel);
+        let local_full = safe_join(&pair.local, rel)?;
         let stamp = epoch_to_stamp(now_epoch());
-        let conflict_rel = conflict_name(rel, &stamp);
+        // A name nothing is called yet: setting the local version aside must
+        // never overwrite another file (an earlier conflict copy, say).
+        let conflict_rel = unique_conflict_name(&pair.local, rel, &stamp)?;
         let conflict_full = pair.local.join(&conflict_rel);
         self.log
             .info(&format!("  conflict: keeping local copy as {conflict_rel}"));
         if local_full.exists() {
-            std::fs::rename(&local_full, &conflict_full)?;
+            move_aside(&local_full, &conflict_full)?;
         }
         // bring the remote version down to the original name
-        let dest_dir = local_full
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or(pair.local.clone());
-        std::fs::create_dir_all(&dest_dir)?;
-        self.remote
-            .download(&remote_join(&pair.remote, rel), &dest_dir.to_string_lossy())?;
+        let want = new_base.get(rel);
+        self.fetch_into_place(
+            pair,
+            rel,
+            &Expect {
+                size: want.map(|e| e.size).unwrap_or(0),
+                mtime: want.and_then(|e| e.mtime),
+                // The local file was just set aside: anything there now is new.
+                local: LocalSeen::Absent,
+            },
+        )?;
         // push the renamed local copy up so both versions exist on both sides
         let parent = parent_rel(&conflict_rel);
         self.ensure_remote_dir(&pair.remote, parent)?;
@@ -1984,6 +2076,21 @@ impl<'a, R: Remote> Engine<'a, R> {
                 pair.local.display()
             );
         }
+        // An excluded folder (a user exclude, a junk name, a download's staging
+        // folder) is invisible to the engine: nothing to list on either side. A
+        // watcher event inside one must not cost a CLI call to find that out.
+        if !folder.is_empty() && pair.is_excluded(folder) {
+            return Ok((
+                SyncResult {
+                    pair: pair.name.clone(),
+                    applied: 0,
+                    errors: Vec::new(),
+                    plan_summary: String::new(),
+                    was_in_sync: true,
+                },
+                Vec::new(),
+            ));
+        }
 
         let prefix = if folder.is_empty() {
             String::new()
@@ -2024,6 +2131,12 @@ impl<'a, R: Remote> Engine<'a, R> {
             Ok(rd) => {
                 for e in rd.flatten() {
                     let name = e.file_name().to_string_lossy().replace('\\', "/");
+                    if staged::is_staging_name(&name) {
+                        // A download in progress, or its leftovers if the process
+                        // died: never part of the listing either way.
+                        staged::sweep_if_stale(&e.path(), self.stale_after());
+                        continue;
+                    }
                     let rel = format!("{prefix}{name}");
                     if pair.is_excluded(&rel) {
                         continue;
@@ -2457,6 +2570,42 @@ fn conflict_name(rel: &str, stamp: &str) -> String {
         name
     } else {
         format!("{dir}/{name}")
+    }
+}
+
+/// A conflict-copy name for `rel` that no existing file has. The timestamp has
+/// whole-second resolution, so two conflicts on one file within a second - or a
+/// file the user already named that way - would otherwise collide, and the later
+/// rename would silently overwrite the earlier copy.
+fn unique_conflict_name(root: &Path, rel: &str, stamp: &str) -> Result<String> {
+    let taken = |r: &str| std::fs::symlink_metadata(root.join(r)).is_ok();
+    let first = conflict_name(rel, stamp);
+    if !taken(&first) {
+        return Ok(first);
+    }
+    for n in 2..1000 {
+        let candidate = conflict_name(rel, &format!("{stamp} {n}"));
+        if !taken(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no free name for a conflict copy of {rel:?}")
+}
+
+/// Move `from` to `to` without ever replacing an existing `to`: `rename(2)`
+/// would. A hard link fails if `to` exists, and unlinking `from` afterwards
+/// completes the move; a filesystem without hard links falls back to a rename
+/// guarded by an existence check.
+fn move_aside(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => std::fs::remove_file(from),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            std::fs::rename(from, to)
+        }
     }
 }
 
