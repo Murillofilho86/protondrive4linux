@@ -22,7 +22,7 @@ use crate::datefmt::now_epoch;
 use crate::engine::{run_sync_shallow_many, run_sync_streaming};
 use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
-use crate::protoncli::{is_not_logged_in, ProtonCli, Remote};
+use crate::protoncli::{session_problem, ProtonCli, Remote, SessionProblem};
 use crate::stats::Stats;
 
 /// A sub-folder counts as "hot" if it saw >= this many changes in the window.
@@ -38,6 +38,10 @@ const FULL_WALK_MAX_SECS: u64 = 6 * 3600;
 /// While signed out, re-probe the proton-drive session no more often than this,
 /// so a logged-out daemon idles cheaply instead of spawning a probe every tick.
 const AUTH_REPROBE_SECS: i64 = 20;
+/// While the CLI can't reach its keyring, look less often: the probe may be what
+/// makes the keyring ask for its password, and one prompt a minute is already
+/// plenty. Unlocking from the window checks (and resumes) at once.
+const KEYRING_REPROBE_SECS: i64 = 60;
 /// While signed in, still probe occasionally so an expired session is caught
 /// before a full walk starts spamming per-folder errors.
 const AUTH_KEEPALIVE_SECS: i64 = 300;
@@ -45,10 +49,23 @@ const AUTH_KEEPALIVE_SECS: i64 = 300;
 /// Outcome of a cheap auth probe. `Unknown` (a non-auth error, e.g. a network
 /// blip) is deliberately distinct from `SignedOut` so a transient failure never
 /// flips the "signed out" banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuthProbe {
     SignedIn,
     SignedOut,
+    /// The CLI could not reach the keyring its session lives in. Not a
+    /// sign-out: the session may be intact, so nobody is asked to sign in.
+    KeyringUnreachable,
     Unknown,
+}
+
+/// What a failed CLI call says about the session.
+fn probe_from_error(msg: &str) -> AuthProbe {
+    match session_problem(msg) {
+        Some(SessionProblem::SignedOut) => AuthProbe::SignedOut,
+        Some(SessionProblem::SecretStoreUnreachable) => AuthProbe::KeyringUnreachable,
+        None => AuthProbe::Unknown,
+    }
 }
 
 /// Probe whether the proton-drive session is authenticated by listing the remote
@@ -56,22 +73,93 @@ enum AuthProbe {
 fn probe_auth(cfg: &Config) -> AuthProbe {
     match ProtonCli::new(cfg).list_dir(&cfg.remote_root) {
         Ok(_) => AuthProbe::SignedIn,
-        Err(e) if is_not_logged_in(&e.to_string()) => AuthProbe::SignedOut,
-        Err(_) => AuthProbe::Unknown,
+        Err(e) => probe_from_error(&format!("{e:#}")),
     }
 }
 
-/// Announce a sign-in state change: emit a structured event (so the GUI banner
-/// flips) and log it once.
-fn note_auth(events: Option<&dyn EventSink>, log: &Logger, signed_in: bool) {
+/// Whether the proton-drive session is usable, as far as the watcher knows.
+/// Anything but `Open` pauses all sync work until a probe says it is back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    Open,
+    /// No session: it takes a sign-in to resume.
+    SignedOut,
+    /// The CLI can't reach its keyring (locked, no D-Bus session, headless).
+    /// Resumes by itself once the keyring answers.
+    KeyringUnreachable,
+}
+
+impl Gate {
+    /// Where the gate stands after `probe`. An inconclusive probe (a network
+    /// blip) leaves it where it was: a flaky connection must neither pause
+    /// sync nor resume it.
+    fn after(self, probe: AuthProbe) -> Gate {
+        match probe {
+            AuthProbe::SignedIn => Gate::Open,
+            AuthProbe::SignedOut => Gate::SignedOut,
+            AuthProbe::KeyringUnreachable => Gate::KeyringUnreachable,
+            AuthProbe::Unknown => self,
+        }
+    }
+
+    /// How long to leave the session alone before probing it again.
+    fn probe_every_secs(self) -> i64 {
+        match self {
+            Gate::Open => AUTH_KEEPALIVE_SECS,
+            Gate::SignedOut => AUTH_REPROBE_SECS,
+            Gate::KeyringUnreachable => KEYRING_REPROBE_SECS,
+        }
+    }
+}
+
+/// Announce a change of the gate: emit a structured event (so the GUI banner
+/// flips) and log it once. Nothing happens if it did not change.
+fn note_gate(events: Option<&dyn EventSink>, log: &Logger, from: Gate, to: Gate) {
+    if from == to {
+        return;
+    }
     if let Some(sink) = events {
-        sink.emit(&SyncEvent::Auth { signed_in });
+        sink.emit(&match to {
+            Gate::Open => SyncEvent::Auth { signed_in: true },
+            Gate::SignedOut => SyncEvent::Auth { signed_in: false },
+            Gate::KeyringUnreachable => SyncEvent::KeyringUnreachable,
+        });
     }
-    if signed_in {
-        log.info("watch: signed back in to Proton — resuming");
-    } else {
-        log.warn("watch: proton-drive session signed out — pausing sync until you sign in");
+    match (from, to) {
+        (Gate::KeyringUnreachable, Gate::Open) => {
+            log.info("watch: the keyring answers again — resuming")
+        }
+        (_, Gate::Open) => log.info("watch: signed back in to Proton — resuming"),
+        (_, Gate::SignedOut) => {
+            log.warn("watch: proton-drive session signed out — pausing sync until you sign in")
+        }
+        (_, Gate::KeyringUnreachable) => log.warn(
+            "watch: the proton-drive CLI can't reach its keyring (locked, or none running in \
+             this session) — pausing sync; it resumes by itself once the keyring answers",
+        ),
     }
+}
+
+/// Move `gate` to where `probe` says the session is. A change is announced, and
+/// when it shuts the gate any running walk is told to stop (it would only fail
+/// folder by folder). Returns whether the gate changed.
+fn apply_probe(
+    gate: &mut Gate,
+    probe: AuthProbe,
+    events: Option<&dyn EventSink>,
+    log: &Logger,
+    walk_cancel: &AtomicBool,
+) -> bool {
+    let next = gate.after(probe);
+    if next == *gate {
+        return false;
+    }
+    note_gate(events, log, *gate, next);
+    if next != Gate::Open {
+        walk_cancel.store(true, Ordering::Relaxed);
+    }
+    *gate = next;
+    true
 }
 
 enum Msg {
@@ -345,16 +433,15 @@ pub fn watch_with(
         }
     });
 
-    // Auth state. When the proton-drive session is signed out every remote call
-    // fails; rather than hammer every folder and bury it as per-folder errors, we
-    // detect it, surface ONE clear signed-out event (a GUI banner), and pause
-    // real work — re-probing on a throttle until the session is back.
-    let mut signed_out = matches!(probe_auth(&reload_cfg(cfg, log)), AuthProbe::SignedOut);
+    // Auth state. When the proton-drive session is signed out, or the keyring it
+    // lives in can't be reached, every remote call fails; rather than hammer
+    // every folder and bury it as per-folder errors, we detect it, surface ONE
+    // clear event (a GUI banner that says which), and pause real work —
+    // re-probing on a throttle until the session is back.
+    let mut gate = Gate::Open.after(probe_auth(&reload_cfg(cfg, log)));
     let mut last_auth_probe = now_epoch();
     let state_dir = cfg.state_dir.clone();
-    if signed_out {
-        note_auth(events, log, false);
-    }
+    note_gate(events, log, Gate::Open, gate);
 
     // Prioritised startup (the watcher is already attached, so live changes
     // queue meanwhile): 1) sync folders with fresh LOCAL changes first; 2) sync
@@ -362,8 +449,8 @@ pub fn watch_with(
     // Steps 1 and 2 reconcile their folders CONCURRENTLY (a worker pool) so a
     // large set isn't a slow one-folder-at-a-time slog. Root ("") folders are
     // left to the full walk. Each folder is a safe shallow reconcile. Skipped
-    // while signed out; the main loop resumes them once the session is back.
-    if !signed_out {
+    // while the session is unusable; the main loop resumes them once it is back.
+    if gate == Gate::Open {
         let live = reload_cfg(cfg, log);
         let mut primed: BTreeSet<(String, String)> = BTreeSet::new();
         // 1) folders with fresh local changes
@@ -449,39 +536,27 @@ pub fn watch_with(
                 ));
             }
 
-            // Auth gate: while signed out, do no sync work; re-probe on a
-            // throttle (or immediately when the GUI signals a fresh login) and
-            // resume the moment the session is back.
-            if signed_out {
+            // Auth gate: while the session is unusable (signed out, or its keyring
+            // out of reach) do no sync work; re-probe on a throttle (or at once
+            // when the GUI signals a fresh login or unlock) and resume the moment
+            // it is back. While it is usable, still probe now and then so an
+            // expiry is caught before a walk starts failing folder by folder.
+            if gate != Gate::Open {
                 walk_cancel.store(true, Ordering::Relaxed);
-                let auth_due = crate::auth_signal::take(&state_dir)
-                    || now_epoch() - last_auth_probe >= AUTH_REPROBE_SECS;
-                if auth_due {
-                    last_auth_probe = now_epoch();
-                    if let AuthProbe::SignedIn = probe_auth(&reload_cfg(cfg, log)) {
-                        signed_out = false;
-                        note_auth(events, log, true);
-                        // Re-walk soon so anything missed while out is reconciled.
-                        next_full_at = now_epoch();
-                    }
+            }
+            let auth_due = crate::auth_signal::take(&state_dir)
+                || now_epoch() - last_auth_probe >= gate.probe_every_secs();
+            if auth_due {
+                last_auth_probe = now_epoch();
+                let probe = probe_auth(&reload_cfg(cfg, log));
+                if apply_probe(&mut gate, probe, events, log, &walk_cancel) && gate == Gate::Open {
+                    // Re-walk soon so anything missed while out is reconciled.
+                    next_full_at = now_epoch();
                 }
-                if signed_out {
-                    thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-            } else {
-                let auth_due = crate::auth_signal::take(&state_dir)
-                    || now_epoch() - last_auth_probe >= AUTH_KEEPALIVE_SECS;
-                if auth_due {
-                    last_auth_probe = now_epoch();
-                    if let AuthProbe::SignedOut = probe_auth(&reload_cfg(cfg, log)) {
-                        signed_out = true;
-                        walk_cancel.store(true, Ordering::Relaxed);
-                        note_auth(events, log, false);
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                }
+            }
+            if gate != Gate::Open {
+                thread::sleep(Duration::from_millis(500));
+                continue;
             }
 
             // Start a background full walk when due and none is running.
@@ -583,16 +658,14 @@ pub fn watch_with(
                 ));
             }
 
-            // A cycle that errored may mean the session expired. Probe once
-            // (cheap); only a genuine "not logged in" flips the gate — a
-            // transient/other error is left to retry normally.
-            if cycle_errors > 0 && !signed_out {
+            // A cycle that errored may mean the session expired, or its keyring
+            // went out of reach. Probe once (cheap); only a genuine session
+            // problem shuts the gate — a transient/other error is left to retry
+            // normally.
+            if cycle_errors > 0 && gate == Gate::Open {
                 last_auth_probe = now_epoch();
-                if let AuthProbe::SignedOut = probe_auth(&reload_cfg(cfg, log)) {
-                    signed_out = true;
-                    walk_cancel.store(true, Ordering::Relaxed);
-                    note_auth(events, log, false);
-                }
+                let probe = probe_auth(&reload_cfg(cfg, log));
+                apply_probe(&mut gate, probe, events, log, &walk_cancel);
             }
         }
     });
@@ -636,5 +709,143 @@ mod tests {
             RenameMode::Any
         ))));
         assert!(is_content_change(&EventKind::Modify(ModifyKind::Any)));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Remembers the events it is given, as their `Debug` text.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+
+    impl EventSink for Recorder {
+        fn emit(&self, ev: &SyncEvent) {
+            self.0.lock().unwrap().push(format!("{ev:?}"));
+        }
+    }
+
+    impl Recorder {
+        fn all(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const KEYRING: &str = "the CLI can't reach its keyring: Failed to load session from \
+                           secrets (ensure you have secrets available): Could not connect: \
+                           No such file or directory (code: 1)";
+
+    #[test]
+    fn a_failed_call_is_read_for_what_it_says_about_the_session() {
+        assert_eq!(probe_from_error(KEYRING), AuthProbe::KeyringUnreachable);
+        assert_eq!(
+            probe_from_error("not signed in: you need to login first"),
+            AuthProbe::SignedOut
+        );
+        // A network blip or a rate limit says nothing about the session.
+        for other in ["connection reset", "rate limited, try again", ""] {
+            assert_eq!(probe_from_error(other), AuthProbe::Unknown, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_probe_moves_the_gate_and_an_inconclusive_one_leaves_it_alone() {
+        use AuthProbe::*;
+        for from in [Gate::Open, Gate::SignedOut, Gate::KeyringUnreachable] {
+            assert_eq!(from.after(SignedIn), Gate::Open);
+            assert_eq!(from.after(SignedOut), Gate::SignedOut);
+            assert_eq!(from.after(KeyringUnreachable), Gate::KeyringUnreachable);
+            // A flaky connection neither pauses sync nor resumes it.
+            assert_eq!(from.after(Unknown), from);
+        }
+    }
+
+    #[test]
+    fn a_keyring_is_probed_less_often_than_a_sign_out() {
+        // A probe of a locked keyring can be what makes it ask for a password.
+        assert!(Gate::KeyringUnreachable.probe_every_secs() > Gate::SignedOut.probe_every_secs());
+        assert!(Gate::Open.probe_every_secs() > Gate::KeyringUnreachable.probe_every_secs());
+    }
+
+    #[test]
+    fn each_change_of_the_gate_is_announced_once_and_in_its_own_words() {
+        let log = Logger::silent();
+        let events = Recorder::default();
+        let note = |from, to| note_gate(Some(&events), &log, from, to);
+
+        note(Gate::Open, Gate::Open);
+        note(Gate::KeyringUnreachable, Gate::KeyringUnreachable);
+        assert!(events.all().is_empty(), "no change, nothing said");
+
+        note(Gate::Open, Gate::KeyringUnreachable);
+        note(Gate::KeyringUnreachable, Gate::Open);
+        note(Gate::Open, Gate::SignedOut);
+        note(Gate::SignedOut, Gate::KeyringUnreachable);
+        note(Gate::KeyringUnreachable, Gate::SignedOut);
+        note(Gate::SignedOut, Gate::Open);
+        assert_eq!(
+            events.all(),
+            [
+                "KeyringUnreachable",
+                "Auth { signed_in: true }",
+                "Auth { signed_in: false }",
+                "KeyringUnreachable",
+                "Auth { signed_in: false }",
+                "Auth { signed_in: true }",
+            ]
+        );
+    }
+
+    #[test]
+    fn shutting_the_gate_stops_a_running_walk_and_opening_it_does_not() {
+        let log = Logger::silent();
+        let walk = AtomicBool::new(false);
+        let mut gate = Gate::Open;
+
+        // Inconclusive: nothing changes, nothing is cancelled.
+        assert!(!apply_probe(
+            &mut gate,
+            AuthProbe::Unknown,
+            None,
+            &log,
+            &walk
+        ));
+        assert_eq!((gate, walk.load(Ordering::Relaxed)), (Gate::Open, false));
+
+        // The keyring goes out of reach: the walk (which would only fail folder
+        // by folder) is told to stop.
+        assert!(apply_probe(
+            &mut gate,
+            AuthProbe::KeyringUnreachable,
+            None,
+            &log,
+            &walk
+        ));
+        assert_eq!(
+            (gate, walk.load(Ordering::Relaxed)),
+            (Gate::KeyringUnreachable, true)
+        );
+
+        // Still out of reach: no change to report.
+        assert!(!apply_probe(
+            &mut gate,
+            AuthProbe::KeyringUnreachable,
+            None,
+            &log,
+            &walk
+        ));
+
+        // It answers: the gate opens. Starting the next walk is the loop's job
+        // (it clears the flag itself), so the flag is left as it was.
+        assert!(apply_probe(
+            &mut gate,
+            AuthProbe::SignedIn,
+            None,
+            &log,
+            &walk
+        ));
+        assert_eq!(gate, Gate::Open);
     }
 }

@@ -110,6 +110,7 @@ fn account() -> AccountState {
         checked: true,
         binary_found: true,
         signed_in: true,
+        keyring_unreachable: false,
         version: "cli-drive@0.8.0 (/usr/bin/proton-drive)".into(),
         checking: false,
     }
@@ -224,6 +225,7 @@ fn idle(now: i64) -> AppState {
         busy: false,
         watching: true,
         signed_out: false,
+        keyring_unreachable: false,
     }
 }
 
@@ -269,6 +271,13 @@ fn scenes(now: i64) -> Vec<Scene> {
     signed_out.signed_out = true;
     signed_out.watching = false;
 
+    // Signed in, but the CLI can't reach the keyring the session is kept in.
+    let mut keyring = idle(now);
+    keyring.account.signed_in = false;
+    keyring.account.keyring_unreachable = true;
+    keyring.keyring_unreachable = true;
+    keyring.watching = false;
+
     let mut idle_folders = idle(now);
     idle_folders.pairs[2].retrying = 3;
 
@@ -286,6 +295,7 @@ fn scenes(now: i64) -> Vec<Scene> {
         scene("settings", Nav::Settings, false, idle(now), vec![]),
         scene("account", Nav::Account, false, idle(now), vec![]),
         scene("sign-in", Nav::Activity, false, signed_out, vec![]),
+        scene("keyring", Nav::Activity, false, keyring, vec![]),
         scene("activity-light", Nav::Activity, true, idle(now), vec![]),
         scene("folders-light", Nav::Folders, true, idle_folders, vec![]),
         scene(
@@ -625,6 +635,7 @@ mod tests {
             "settings",
             "account",
             "sign-in",
+            "keyring",
         ] {
             assert!(names.contains(&want), "no scene named {want}");
         }
@@ -679,11 +690,24 @@ mod tests {
     }
 
     #[test]
-    fn the_signed_out_scene_shows_the_sign_in_gate_and_the_rest_do_not() {
+    fn only_the_sign_in_and_keyring_scenes_show_the_gate_and_each_says_why() {
         for s in scenes(NOW) {
             let gate = s.state.account.checked
                 && !(s.state.account.binary_found && s.state.account.signed_in);
-            assert_eq!(gate, s.name == "sign-in", "{}", s.name);
+            assert_eq!(gate, matches!(s.name, "sign-in" | "keyring"), "{}", s.name);
+            // The two reasons never overlap, and a scene says it the way the
+            // app would: the account check and the state agree.
+            assert!(
+                !(s.state.signed_out && s.state.keyring_unreachable),
+                "{}",
+                s.name
+            );
+            assert_eq!(
+                s.state.account.keyring_unreachable, s.state.keyring_unreachable,
+                "{}",
+                s.name
+            );
+            assert_eq!(s.state.signed_out, s.name == "sign-in", "{}", s.name);
         }
     }
 

@@ -19,7 +19,7 @@ use crate::datefmt::now_epoch;
 use crate::engine::run_sync_with;
 use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
-use crate::protoncli::{ProtonCli, Remote};
+use crate::protoncli::{session_problem, ProtonCli, Remote, SessionProblem};
 pub use crate::stats::ConflictRecord;
 use crate::stats::Stats;
 use crate::watcher;
@@ -108,6 +108,10 @@ fn count_retrying(stats: &Stats, pair: &str) -> usize {
 pub enum OverallStatus {
     /// Signed out of Proton: nothing can sync until the user logs in again.
     SignedOut,
+    /// The CLI can't reach the keyring its session is stored in: nothing can
+    /// sync until it can, but the session may be intact, so the user is not
+    /// asked to sign in. Resolves on its own once the keyring answers.
+    WaitingForKeyring,
     /// A pair's last run had errors, or files are waiting out a retry backoff.
     Error,
     /// A scan or transfer is in flight (or live sync hasn't completed its
@@ -124,6 +128,11 @@ pub struct AccountState {
     pub checked: bool,
     pub binary_found: bool,
     pub signed_in: bool,
+    /// The check failed because the CLI could not reach its keyring (locked, no
+    /// D-Bus session, headless), not because there is no session. `signed_in`
+    /// is false then too, but signing in again won't help.
+    #[serde(default)]
+    pub keyring_unreachable: bool,
     pub version: String,
     /// A login/version check is in flight (drives the Refresh spinner).
     pub checking: bool,
@@ -171,6 +180,10 @@ pub struct AppState {
     /// Surfaced as a distinct "sign in to resume" banner instead of error spam.
     #[serde(default)]
     pub signed_out: bool,
+    /// The CLI can't reach the keyring its session is stored in. Never set at
+    /// the same time as `signed_out`: this is a wait, not a sign-out.
+    #[serde(default)]
+    pub keyring_unreachable: bool,
 }
 
 impl AppState {
@@ -211,10 +224,14 @@ impl AppState {
     }
 
     /// The single most urgent state across the whole app, in priority order:
-    /// signed out > error/retrying > working > (synced | paused).
+    /// signed out > waiting for the keyring > error/retrying > working >
+    /// (synced | paused).
     pub fn overall(&self) -> OverallStatus {
         if self.signed_out {
             return OverallStatus::SignedOut;
+        }
+        if self.keyring_unreachable {
+            return OverallStatus::WaitingForKeyring;
         }
         if self
             .pairs
@@ -252,6 +269,9 @@ impl AppState {
     pub fn status_line(&self, now: i64) -> String {
         match self.overall() {
             OverallStatus::SignedOut => "Signed out of Proton — sign in to resume".into(),
+            OverallStatus::WaitingForKeyring => {
+                "Waiting for your keyring — unlock it to resume".into()
+            }
             OverallStatus::Error => {
                 let failing: Vec<&PairState> = self
                     .pairs
@@ -480,8 +500,15 @@ impl EventSink for StateSink {
             }
             SyncEvent::Auth { signed_in } => {
                 s.signed_out = !*signed_in;
+                // The CLI answered, so whatever the keyring was doing, it isn't
+                // the problem now.
+                s.keyring_unreachable = false;
                 // Banner-only: auth state is not a file operation and clutters
                 // the activity feed if logged here.
+            }
+            SyncEvent::KeyringUnreachable => {
+                s.keyring_unreachable = true;
+                s.signed_out = false;
             }
             SyncEvent::Conflict {
                 pair,
@@ -830,12 +857,21 @@ impl Controller {
         state.lock().unwrap().account.checking = true;
         thread::spawn(move || {
             let proton = ProtonCli::new(&cfg);
-            let signed_in = proton.list_dir(&cfg.remote_root).is_ok();
+            let probe = proton.list_dir(&cfg.remote_root);
+            let signed_in = probe.is_ok();
+            // A keyring the CLI can't reach is not a sign-out: say so, so the
+            // app waits for it instead of sending the user to sign in again.
+            let keyring_unreachable = matches!(
+                &probe,
+                Err(e) if session_problem(&format!("{e:#}"))
+                    == Some(SessionProblem::SecretStoreUnreachable)
+            );
             let account = match proton.resolve_binary() {
                 Some(p) => AccountState {
                     checked: true,
                     binary_found: true,
                     signed_in,
+                    keyring_unreachable,
                     version: format!("{} ({})", proton.version(), p.display()),
                     checking: false,
                 },
@@ -843,6 +879,7 @@ impl Controller {
                     checked: true,
                     binary_found: false,
                     signed_in: false,
+                    keyring_unreachable: false,
                     version: "proton-drive NOT FOUND on PATH".into(),
                     checking: false,
                 },
@@ -852,8 +889,10 @@ impl Controller {
                 s.account = account;
                 if signed_in {
                     s.signed_out = false;
+                    s.keyring_unreachable = false;
                 } else if s.account.binary_found {
-                    s.signed_out = true;
+                    s.signed_out = !keyring_unreachable;
+                    s.keyring_unreachable = keyring_unreachable;
                 }
             }
             if signal_watch && signed_in {
@@ -967,6 +1006,86 @@ mod tests {
             s.status_line(now),
             "Signed out of Proton — sign in to resume"
         );
+    }
+
+    #[test]
+    fn a_keyring_out_of_reach_is_a_wait_not_a_sign_out() {
+        let now = 10_000;
+        let mut s = AppState {
+            watching: true,
+            ..Default::default()
+        };
+        s.pairs.push(pair("docs", Phase::Error));
+        s.keyring_unreachable = true;
+
+        // It outranks an error (nothing can sync until the keyring answers)...
+        assert_eq!(s.overall(), OverallStatus::WaitingForKeyring);
+        let line = s.status_line(now);
+        assert_eq!(line, "Waiting for your keyring — unlock it to resume");
+        assert!(!line.to_lowercase().contains("sign"), "{line}");
+
+        // ...but a real sign-out outranks it, whatever both flags say.
+        s.signed_out = true;
+        assert_eq!(s.overall(), OverallStatus::SignedOut);
+    }
+
+    #[test]
+    fn the_session_events_keep_signed_out_and_keyring_unreachable_apart() {
+        let sink = StateSink {
+            state: state_with(&["docs"]),
+            stats: None,
+        };
+        let flags = || {
+            let s = sink.state.lock().unwrap();
+            (s.signed_out, s.keyring_unreachable)
+        };
+        assert_eq!(flags(), (false, false));
+
+        sink.emit(&SyncEvent::KeyringUnreachable);
+        assert_eq!(flags(), (false, true));
+
+        // The keyring answers and there is no session after all: a sign-out,
+        // and the wait is over.
+        sink.emit(&SyncEvent::Auth { signed_in: false });
+        assert_eq!(flags(), (true, false));
+
+        // Out of reach again (a sign-out cannot be told while the keyring is):
+        // the sign-out banner gives way to the wait.
+        sink.emit(&SyncEvent::KeyringUnreachable);
+        assert_eq!(flags(), (false, true));
+
+        // And signing in, however it happened, ends it.
+        sink.emit(&SyncEvent::Auth { signed_in: true });
+        assert_eq!(flags(), (false, false));
+
+        // Neither is an activity-feed line: they are banners.
+        assert!(sink.state.lock().unwrap().activity.is_empty());
+    }
+
+    #[test]
+    fn a_status_file_from_before_the_keyring_state_still_reads() {
+        // The window reads what an older tray daemon wrote (and the reverse
+        // after an upgrade): the new fields must default, not fail the parse.
+        let mut value = serde_json::to_value(AppState::default()).unwrap();
+        value.as_object_mut().unwrap().remove("keyring_unreachable");
+        value["account"]
+            .as_object_mut()
+            .unwrap()
+            .remove("keyring_unreachable");
+        let old: AppState = serde_json::from_value(value).unwrap();
+        assert!(!old.keyring_unreachable);
+        assert!(!old.account.keyring_unreachable);
+
+        let now = AppState {
+            keyring_unreachable: true,
+            account: AccountState {
+                keyring_unreachable: true,
+                ..AccountState::default()
+            },
+            ..AppState::default()
+        };
+        let back: AppState = serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
+        assert!(back.keyring_unreachable && back.account.keyring_unreachable);
     }
 
     #[test]

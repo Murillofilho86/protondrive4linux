@@ -116,8 +116,14 @@ pub enum SyncEvent {
     /// The proton-drive session's sign-in state changed. Emitted by the watch
     /// daemon when it detects the session has expired (signed out) or come back,
     /// so a logged-out state surfaces as one clear banner instead of a pile of
-    /// per-folder transfer errors.
+    /// per-folder transfer errors. Either value also means the keyring answered,
+    /// so it ends a [`SyncEvent::KeyringUnreachable`] wait.
     Auth { signed_in: bool },
+    /// The CLI cannot reach the keyring its session is stored in (locked, no
+    /// D-Bus session, a headless box). Not a sign-out: the session may be
+    /// intact, signing in again won't help, and sync resumes by itself once the
+    /// keyring answers - which is announced with an [`SyncEvent::Auth`].
+    KeyringUnreachable,
 }
 
 /// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:

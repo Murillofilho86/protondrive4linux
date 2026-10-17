@@ -19,6 +19,12 @@
 //!   the real CLI does when there is no session ("you need to login first").
 //! - `FAKE_CLI_VERSION`: the line `version` prints (default `fake-cli-drive
 //!   0.0.0-test`), to test how a CLI version is judged.
+//!
+//! And one for `tests/watch_session.rs`:
+//! - `FAKE_CLI_KEYRING_FLAG`: a path. While a file exists there, every command
+//!   but `version` fails the way the real CLI does when it can't reach its
+//!   keyring ("Failed to load session from secrets ..."); a test "unlocks the
+//!   keyring" by deleting the file, with the CLI still running under the app.
 
 use std::env;
 use std::fs;
@@ -243,6 +249,15 @@ fn main() -> ExitCode {
 
     if env::var("FAKE_CLI_SIGNED_OUT").is_ok() {
         eprintln!("Error: you need to login first");
+        return ExitCode::FAILURE;
+    }
+
+    if env::var("FAKE_CLI_KEYRING_FLAG").is_ok_and(|flag| Path::new(&flag).exists()) {
+        eprintln!(
+            "Error: Failed to load session from secrets (ensure you have secrets \
+             available, read the README for more information): Could not connect: \
+             No such file or directory (code: 1)"
+        );
         return ExitCode::FAILURE;
     }
 
