@@ -13,9 +13,13 @@
 The official `proton-drive` CLI can upload, download, list, and manage sharing, but it has no sync engine. protondrive4linux adds one: a three-way-merge engine that keeps one or more local folders and their Proton Drive counterparts in sync in both directions, driven entirely by the CLI's one-shot commands. It ships as a dependency-light CLI plus an optional native GUI, both on one core library.
 
 <p align="center">
-  <img src="docs/screenshots/activity.png" width="32%" alt="Activity view, showing a completed sync">
-  <img src="docs/screenshots/folders.png" width="32%" alt="Folders view, showing a local/Proton Drive pair">
-  <img src="docs/screenshots/settings.png" width="32%" alt="Settings view">
+  <img src="docs/screenshots/activity.png" width="32%" alt="Activity: live sync is on and the latest files are listed">
+  <img src="docs/screenshots/folders.png" width="32%" alt="Folders: one watched, one syncing, one with files waiting to retry">
+  <img src="docs/screenshots/conflicts.png" width="32%" alt="Conflicts: what changed on both sides and what was done about each">
+</p>
+
+<p align="center">
+  More pages, the light theme and the sign-in screen: <a href="docs/screenshots.md">docs/screenshots.md</a>
 </p>
 
 ## Features

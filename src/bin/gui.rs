@@ -34,6 +34,10 @@ use neutronsync::themes::{self, Base, Catalog, ThemeColors};
 use neutronsync::tray_policy::{self, DaemonBanner, LivenessInput};
 use neutronsync::updater::{self, UpdateInfo};
 
+// In a folder of its own: next to this file it would be a binary of its own.
+#[path = "gui/shots.rs"]
+mod shots;
+
 // --- palette ----------------------------------------------------------------
 // Every color the UI draws with is a semantic token of a `Palette` (M5-001),
 // read through `th()`. The colors themselves are data in `neutronsync::themes`
@@ -748,6 +752,10 @@ struct App {
     // re-read while Settings is open so a new file shows up without a restart
     themes: Catalog,
     themes_scanned: f64,
+
+    // `--screenshots`: the script that drives the window through the example
+    // scenes (None in normal use).
+    shot: Option<shots::Script>,
 }
 
 impl App {
@@ -759,7 +767,6 @@ impl App {
             Ok(c) => (c, true),
             Err(_) => (starter_config(&config_path), false),
         };
-        let ctrl = Controller::new(cfg.clone());
         // With the tray on, a headless daemon owns the tray + watcher; this window
         // just ensures one exists, takes a window lock, and exits on close.
         let mode_daemon = cfg.run_in_tray;
@@ -774,7 +781,49 @@ impl App {
             None
         };
 
-        let app = App {
+        let app = App::assemble(
+            cfg,
+            config_path,
+            config_loaded,
+            mode_daemon,
+            win_lock,
+            daemon_spawned_at,
+            Catalog::load(&themes::themes_dir()),
+        );
+        // Resume Auto sync if it was on last time — but not in daemon mode, where
+        // the daemon owns the watcher (only one watcher may hold the lock).
+        if app.cfg.auto_sync && !app.mode_daemon {
+            let names = app.auto_names();
+            if !names.is_empty() {
+                app.ctrl.start_watch(names);
+            }
+        }
+        // Optional quiet update check on launch (notify only).
+        if app.cfg.check_on_launch {
+            spawn_update_check(
+                app.update.clone(),
+                app.cfg.update_channel,
+                cc.egui_ctx.clone(),
+            );
+        }
+        app
+    }
+
+    /// The app's state around `cfg`, with no side effects beyond opening its
+    /// [`Controller`] (the stats database in `cfg.state_dir`): nothing is started,
+    /// installed or written outside it. What `App::new` builds on, and what the
+    /// screenshot mode builds on with example data instead of the user's.
+    fn assemble(
+        cfg: Config,
+        config_path: PathBuf,
+        config_loaded: bool,
+        mode_daemon: bool,
+        win_lock: Option<ProcessLock>,
+        daemon_spawned_at: Option<std::time::Instant>,
+        themes: Catalog,
+    ) -> App {
+        let ctrl = Controller::new(cfg.clone());
+        App {
             ctrl,
             cfg,
             config_path,
@@ -815,26 +864,10 @@ impl App {
             show_resolved: false,
             system_theme: neutronsync::appearance::SystemTheme::spawn(),
             applied: None,
-            themes: Catalog::load(&themes::themes_dir()),
+            themes,
             themes_scanned: f64::NEG_INFINITY,
-        };
-        // Resume Auto sync if it was on last time — but not in daemon mode, where
-        // the daemon owns the watcher (only one watcher may hold the lock).
-        if app.cfg.auto_sync && !app.mode_daemon {
-            let names = app.auto_names();
-            if !names.is_empty() {
-                app.ctrl.start_watch(names);
-            }
+            shot: None,
         }
-        // Optional quiet update check on launch (notify only).
-        if app.cfg.check_on_launch {
-            spawn_update_check(
-                app.update.clone(),
-                app.cfg.update_channel,
-                cc.egui_ctx.clone(),
-            );
-        }
-        app
     }
 
     fn toast(&mut self, ctx: &egui::Context, msg: impl Into<String>, err: bool) {
@@ -1412,6 +1445,8 @@ impl eframe::App for App {
                 mine
             }
         };
+        // `--screenshots`: the scene's example state stands in for the real one.
+        let snap = self.drive_shots(ctx).unwrap_or(snap);
         // Keep polling the daemon's published state while a window is open.
         if self.mode_daemon {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -4967,6 +5002,25 @@ fn run_daemon() -> i32 {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // `--screenshots <dir> [--scale N]`: draw the example scenes and write them
+    // as PNGs (see `shots`). Made-up data only; nothing of the user's is read.
+    if let Some(i) = args.iter().position(|a| a == "--screenshots") {
+        let Some(dir) = args.get(i + 1).filter(|d| !d.starts_with("--")) else {
+            eprintln!("protondrive4linux: --screenshots needs a folder to write into");
+            std::process::exit(2);
+        };
+        let scale = match args.iter().position(|a| a == "--scale") {
+            None => 1.0,
+            Some(j) => match args.get(j + 1).and_then(|v| v.parse::<f32>().ok()) {
+                Some(s) if (1.0..=4.0).contains(&s) => s,
+                _ => {
+                    eprintln!("protondrive4linux: --scale takes a number from 1 to 4");
+                    std::process::exit(2);
+                }
+            },
+        };
+        return shots::run(PathBuf::from(dir), scale);
+    }
     // The tray itself, started (and restarted) by the supervisor.
     if args.iter().any(|a| a == "--tray-child") {
         std::process::exit(run_daemon());
