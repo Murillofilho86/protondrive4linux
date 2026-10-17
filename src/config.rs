@@ -134,6 +134,9 @@ pub struct Config {
     pub notifications: bool,
     /// GUI theme: follow the desktop, or force light or dark.
     pub theme: ThemePref,
+    /// Show the synced folders in the file manager (sidebar bookmarks,
+    /// Nautilus scripts). Opt-in: it writes outside the app's own folders.
+    pub file_manager: bool,
     pub state_dir: PathBuf,
     pub pairs: Vec<Pair>,
     pub source_path: Option<PathBuf>,
@@ -217,6 +220,7 @@ struct RawOptions {
     check_on_launch: Option<bool>,
     notifications: Option<bool>,
     theme: Option<String>,
+    file_manager: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +252,11 @@ fn xdg(var: &str, default_rel: &[&str]) -> PathBuf {
 
 pub fn config_home() -> PathBuf {
     xdg("XDG_CONFIG_HOME", &[".config"])
+}
+
+/// `$XDG_DATA_HOME`, or `~/.local/share`.
+pub fn data_home() -> PathBuf {
+    xdg("XDG_DATA_HOME", &[".local", "share"])
 }
 
 fn state_home() -> PathBuf {
@@ -476,6 +485,7 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         check_on_launch: opts.check_on_launch.unwrap_or(false),
         notifications: opts.notifications.unwrap_or(true),
         theme,
+        file_manager: opts.file_manager.unwrap_or(false),
         state_dir,
         pairs,
         source_path: Some(path),
@@ -621,6 +631,7 @@ struct OutOptions {
     check_on_launch: bool,
     notifications: bool,
     theme: String,
+    file_manager: bool,
     state_dir: String,
 }
 
@@ -714,6 +725,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
             check_on_launch: cfg.check_on_launch,
             notifications: cfg.notifications,
             theme: theme_str(&cfg.theme),
+            file_manager: cfg.file_manager,
             state_dir: cfg.state_dir.to_string_lossy().into_owned(),
         },
         pair: cfg
@@ -831,6 +843,16 @@ mod tests {
             msg.contains("system, light, dark"),
             "unhelpful error: {msg}"
         );
+    }
+
+    #[test]
+    fn file_manager_integration_is_off_by_default_and_round_trips() {
+        // It writes outside the app's own folders, so it has to be asked for.
+        assert!(!load_str("fm-default", "").unwrap().file_manager);
+        let on = load_str("fm-on", "[options]\nfile_manager = true\n").unwrap();
+        assert!(on.file_manager);
+        let again = load_str("fm-again", &to_toml(&on).unwrap()).unwrap();
+        assert!(again.file_manager);
     }
 
     #[test]

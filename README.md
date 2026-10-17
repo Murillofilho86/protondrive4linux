@@ -119,6 +119,10 @@ When the background tray daemon is doing the work, an open window mirrors its li
 - A failed or interrupted run never poisons the wider sync: the baseline records a file only after its transfer actually completes, so a timeout, an error, or a run cancelled part-way leaves every other file's state untouched and retries the rest next run in the correct direction. This is what stops a half-finished run from later mistaking a not-yet-downloaded file for a deletion.
 - Conflicts keep both copies by default (`name (conflict <timestamp>).ext`). The GUI's **Conflicts** page lists every file that changed on both sides and what was done about it - including `conflict = "skip"` ones, which are left untouched until you settle them - and `protondrive4linux status` reports how many are unresolved.
 
+## File manager
+
+Opt-in (Settings → File manager, or `file_manager = true`): your synced folders are added to the sidebar of the GTK file managers (Nautilus, Nemo, Thunar, PCManFM - via `~/.config/gtk-3.0/bookmarks`), and two entries - **Proton Drive - Sync now** and **Proton Drive - Conflicts** - appear in Nautilus's right-click → Scripts menu. It's only a shortcut to the real local folder (no virtual filesystem), it never touches your own bookmarks or scripts - even one with the same name - and turning it off removes exactly what it added. COSMIC Files and Dolphin keep their favorites in their own formats and aren't covered.
+
 ## Selective sync
 
 Each pair can list sub-paths to exclude (in the GUI's "Choose folders to sync", or `exclude = [...]` in the config). Excluded paths are ignored entirely and never touched on Proton. Excluding an already-synced folder freezes both copies in place; when you exclude one, protondrive4linux offers to remove the local copy (to the desktop trash) to free space while the cloud copy stays. Re-including a folder later re-downloads it from the cloud, so excluding can never delete remote data.
@@ -146,6 +150,7 @@ update_channel = "stable"     # stable | prerelease
 # check_on_launch = false     # GUI: check for updates on start (notify only)
 # notifications = true        # tray: desktop notifications for conflicts, lasting problems, sign-out
 # theme = "system"            # GUI: system | light | dark | the name of a custom theme
+# file_manager = false        # add synced folders to the file manager sidebar + Nautilus Scripts menu
 
 [[pair]]
 name = "documents"

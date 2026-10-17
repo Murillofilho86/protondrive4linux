@@ -14,6 +14,7 @@ pub mod config;
 pub mod datefmt;
 pub mod engine;
 pub mod events;
+pub mod fileman;
 #[cfg(feature = "gui")]
 pub mod icon;
 pub mod ignore;
