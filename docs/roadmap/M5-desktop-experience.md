@@ -45,13 +45,28 @@ Pending`.
 - [ ] Sync status.
 
 ## M5-005 — Onboarding, tray, notificações desktop
-**Status: ⬜ Não iniciado.**
+**Status: 🔶 Parcial.** A maior parte já existia no código — o status "não iniciado" estava
+desatualizado — e o que faltava de verdade era o ícone de estados e as notificações nativas.
+O ícone de estados está pronto; as notificações são o próximo passo.
 
-- [ ] Revisar/expandir a GUI egui existente: onboarding (login), lista de pares de pasta, status
-      de sync por pasta, log de atividade em tempo real.
-- [ ] Ícone de bandeja com estados visuais claros (sincronizado/sincronizando/pausado/erro).
-- [ ] Fluxo de "escolher pastas para sincronizar" (seletor de exclusão).
-- [ ] Notificações desktop nativas (`notify-rust`) para conflitos e erros.
+- [x] GUI egui com onboarding (porta de login quando o CLI falta/não há sessão), lista de pares
+      de pasta, status de sync por pasta e log de atividade em tempo real.
+- [x] Ícone de bandeja com estados visuais claros: um selo no canto do logo — check verde
+      (sincronizado), reticências azuis (sincronizando), barras cinza (auto sync desligado),
+      "!" vermelho (erro, ou arquivos esperando retry), traço âmbar (deslogado) — cada um com
+      glifo próprio, pra não depender só de distinguir cores. O menu ganha uma linha de status
+      no topo (`Syncing docs (3/10)`, `Up to date · synced 2 minutes ago`, ...). Desenhado do
+      zero em `src/icon.rs`, sem dependência nova; o estado agregado vem de
+      `AppState::overall()` (`src/service.rs`), reutilizável por outros frontends. Verificado
+      ao vivo no painel do COSMIC (sincronizado, erro de upload e deslogado).
+- [x] Fluxo de "escolher pastas para sincronizar" (seletor de exclusão).
+- [ ] Notificações desktop nativas para conflitos e erros (nenhum código de notificação
+      existe hoje).
+
+Achado ao fazer o ícone: depois do M4-004, uma execução que só *pula* arquivos em backoff
+termina com zero erros, então o par aparecia como "Synced"/"watching" mesmo com arquivos
+falhando. `PairState::retrying` passou a contar esses arquivos e a banner de Activity, a linha
+de cada pasta e o ícone da bandeja agora mostram "N arquivos esperando retry".
 
 ## M5 — Definition of Done
 Um usuário novo instala via AUR, loga, escolhe uma pasta, e vê sync funcionando sem tocar em

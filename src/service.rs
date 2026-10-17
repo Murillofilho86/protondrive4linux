@@ -63,6 +63,11 @@ pub struct PairState {
     pub last_error: Option<String>,
     pub last_synced: Option<i64>, // epoch seconds
     pub tracked: usize,
+    /// Files whose last transfer failed and that are still inside their retry
+    /// backoff window (M4-004) - failing, but not retried yet. Without this a
+    /// pair looks "Synced" on every run that merely skips them.
+    #[serde(default)]
+    pub retrying: usize,
 }
 
 impl PairState {
@@ -78,8 +83,35 @@ impl PairState {
             last_error: None,
             last_synced: None,
             tracked: 0,
+            retrying: 0,
         }
     }
+}
+
+/// How many of `pair`'s files are currently waiting out a retry backoff.
+fn count_retrying(stats: &Stats, pair: &str) -> usize {
+    let now = now_epoch();
+    stats
+        .retry_state(pair)
+        .map(|m| m.values().filter(|&&(_, next_at)| next_at > now).count())
+        .unwrap_or(0)
+}
+
+/// One-glance summary of the whole app, for places with room for a single
+/// state (the tray icon): the most urgent thing happening across every pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverallStatus {
+    /// Signed out of Proton: nothing can sync until the user logs in again.
+    SignedOut,
+    /// A pair's last run had errors, or files are waiting out a retry backoff.
+    Error,
+    /// A scan or transfer is in flight (or live sync hasn't completed its
+    /// first pass yet).
+    Syncing,
+    /// Live sync is on and everything is up to date.
+    Synced,
+    /// Live sync is off (paused, or never enabled): sync runs only on demand.
+    Paused,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -172,6 +204,105 @@ impl AppState {
             self.activity.pop_front();
         }
     }
+
+    /// The single most urgent state across the whole app, in priority order:
+    /// signed out > error/retrying > working > (synced | paused).
+    pub fn overall(&self) -> OverallStatus {
+        if self.signed_out {
+            return OverallStatus::SignedOut;
+        }
+        if self
+            .pairs
+            .iter()
+            .any(|p| p.phase == Phase::Error || p.retrying > 0)
+        {
+            return OverallStatus::Error;
+        }
+        let working = self.busy
+            || self
+                .pairs
+                .iter()
+                .any(|p| matches!(p.phase, Phase::Scanning | Phase::Syncing));
+        if working {
+            return OverallStatus::Syncing;
+        }
+        if !self.watching {
+            return OverallStatus::Paused;
+        }
+        // Live sync is on and idle: only "synced" once every pair has actually
+        // completed a pass at least once, otherwise the first scan is still due.
+        if self
+            .pairs
+            .iter()
+            .all(|p| p.phase == Phase::Synced || p.last_synced.is_some())
+        {
+            OverallStatus::Synced
+        } else {
+            OverallStatus::Syncing
+        }
+    }
+
+    /// A short human sentence for [`AppState::overall`], for a tray menu line
+    /// or tooltip. `now` is passed in (rather than read) so it's testable.
+    pub fn status_line(&self, now: i64) -> String {
+        match self.overall() {
+            OverallStatus::SignedOut => "Signed out of Proton — sign in to resume".into(),
+            OverallStatus::Error => {
+                let failing: Vec<&PairState> = self
+                    .pairs
+                    .iter()
+                    .filter(|p| p.phase == Phase::Error || p.retrying > 0)
+                    .collect();
+                match failing.as_slice() {
+                    [one] => match (&one.last_error, one.retrying) {
+                        (Some(e), _) => truncate(&format!("{}: {e}", one.name), 120),
+                        (None, n) => format!(
+                            "{}: {n} file{} failed, retrying automatically",
+                            one.name,
+                            if n == 1 { "" } else { "s" }
+                        ),
+                    },
+                    many => format!("{} folders have sync problems", many.len()),
+                }
+            }
+            OverallStatus::Syncing => {
+                if let Some(p) = self.pairs.iter().find(|p| p.phase == Phase::Syncing) {
+                    if p.progress.total > 0 {
+                        format!(
+                            "Syncing {} ({}/{})",
+                            p.name, p.progress.done, p.progress.total
+                        )
+                    } else {
+                        format!("Syncing {}", p.name)
+                    }
+                } else if let Some(p) = self.pairs.iter().find(|p| p.phase == Phase::Scanning) {
+                    format!("Scanning {}…", p.name)
+                } else {
+                    "Syncing…".into()
+                }
+            }
+            OverallStatus::Synced => match self.pairs.iter().filter_map(|p| p.last_synced).max() {
+                Some(ts) => format!("Up to date · synced {}", crate::datefmt::rel_time(now, ts)),
+                None => "Up to date".into(),
+            },
+            OverallStatus::Paused => {
+                if self.pairs.is_empty() {
+                    "No folders to sync".into()
+                } else {
+                    "Auto sync is off".into()
+                }
+            }
+        }
+    }
+}
+
+/// `s` cut to at most `max` characters, with an ellipsis if anything was dropped.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 /// One activity line for an operation: "upload path" when it worked, and
@@ -192,6 +323,13 @@ pub struct StateSink {
 
 impl EventSink for StateSink {
     fn emit(&self, ev: &SyncEvent) {
+        // A DB read, so done before taking the state lock (like `record_op`
+        // below). By PairFinished the run has already persisted its retry
+        // outcomes, so this reflects files that failed during it too.
+        let retrying = match (ev, &self.stats) {
+            (SyncEvent::PairFinished { pair, .. }, Some(st)) => count_retrying(st, pair),
+            _ => 0,
+        };
         let mut s = self.state.lock().unwrap();
         match ev {
             SyncEvent::PairStarted { pair } => {
@@ -307,6 +445,7 @@ impl EventSink for StateSink {
                     p.progress.done = p.progress.total;
                     p.current_op = None;
                     p.tracked = tracked;
+                    p.retrying = retrying;
                     if errors == 0 {
                         p.last_synced = Some(now_epoch());
                         p.last_error = None;
@@ -373,6 +512,7 @@ impl Controller {
                     if let Ok(ls) = st.last_synced(&p.name) {
                         ps.last_synced = ls;
                     }
+                    ps.retrying = count_retrying(st, &p.name);
                 }
                 ps
             })
@@ -424,6 +564,14 @@ impl Controller {
     /// A cheap clone of the current state - call this each frame.
     pub fn snapshot(&self) -> AppState {
         self.state.lock().unwrap().clone()
+    }
+
+    /// The one-glance [`OverallStatus`] and its status sentence, computed under
+    /// the state lock without cloning the whole activity feed - cheap enough to
+    /// poll several times a second (the tray does).
+    pub fn status_summary(&self) -> (OverallStatus, String) {
+        let s = self.state.lock().unwrap();
+        (s.overall(), s.status_line(now_epoch()))
     }
 
     /// Publish a compact live snapshot to `<state_dir>/status.json` so a
@@ -687,12 +835,156 @@ mod tests {
                 last_error: None,
                 last_synced: None,
                 tracked: 0,
+                retrying: 0,
             })
             .collect();
         Arc::new(Mutex::new(AppState {
             pairs,
             ..Default::default()
         }))
+    }
+
+    fn pair(name: &str, phase: Phase) -> PairState {
+        PairState {
+            name: name.into(),
+            local: String::new(),
+            remote: String::new(),
+            phase,
+            progress: Progress::default(),
+            scanned_folders: 0,
+            current_op: None,
+            last_error: None,
+            last_synced: None,
+            tracked: 0,
+            retrying: 0,
+        }
+    }
+
+    #[test]
+    fn overall_status_priority_and_lines() {
+        let now = 10_000;
+        let mut s = AppState::default();
+
+        // No folders at all: nothing to do.
+        assert_eq!(s.overall(), OverallStatus::Paused);
+        assert_eq!(s.status_line(now), "No folders to sync");
+
+        // Folders but live sync off: paused, sync on demand only.
+        s.pairs.push(pair("docs", Phase::Idle));
+        assert_eq!(s.overall(), OverallStatus::Paused);
+        assert_eq!(s.status_line(now), "Auto sync is off");
+
+        // Live sync on but the first pass hasn't completed: still initializing.
+        s.watching = true;
+        assert_eq!(s.overall(), OverallStatus::Syncing);
+
+        // Once synced, with a timestamp, it reads as up to date.
+        s.pairs[0].phase = Phase::Synced;
+        s.pairs[0].last_synced = Some(now - 120);
+        assert_eq!(s.overall(), OverallStatus::Synced);
+        assert_eq!(s.status_line(now), "Up to date · synced 2 minutes ago");
+
+        // A scan/transfer in flight outranks "synced" and names the pair.
+        s.pairs[0].phase = Phase::Syncing;
+        s.pairs[0].progress = Progress { done: 3, total: 10 };
+        assert_eq!(s.overall(), OverallStatus::Syncing);
+        assert_eq!(s.status_line(now), "Syncing docs (3/10)");
+        s.pairs[0].phase = Phase::Scanning;
+        assert_eq!(s.status_line(now), "Scanning docs…");
+
+        // An error outranks working, and carries the reason.
+        s.pairs[0].phase = Phase::Error;
+        s.pairs[0].last_error = Some("upload a.txt: boom".into());
+        assert_eq!(s.overall(), OverallStatus::Error);
+        assert_eq!(s.status_line(now), "docs: upload a.txt: boom");
+
+        // Two failing folders collapse to a count.
+        s.pairs.push(pair("photos", Phase::Error));
+        assert_eq!(s.status_line(now), "2 folders have sync problems");
+
+        // Signed out outranks everything.
+        s.signed_out = true;
+        assert_eq!(s.overall(), OverallStatus::SignedOut);
+        assert_eq!(
+            s.status_line(now),
+            "Signed out of Proton — sign in to resume"
+        );
+    }
+
+    #[test]
+    fn files_waiting_to_retry_keep_the_pair_in_error() {
+        // A pair whose last run merely SKIPPED backed-off files finishes with
+        // zero errors (phase Synced), but those files are still failing - it
+        // must not read as healthy.
+        let mut s = AppState {
+            watching: true,
+            ..Default::default()
+        };
+        let mut p = pair("docs", Phase::Synced);
+        p.last_synced = Some(1);
+        p.retrying = 1;
+        s.pairs.push(p);
+        assert_eq!(s.overall(), OverallStatus::Error);
+        assert_eq!(
+            s.status_line(100),
+            "docs: 1 file failed, retrying automatically"
+        );
+        s.pairs[0].retrying = 3;
+        assert_eq!(
+            s.status_line(100),
+            "docs: 3 files failed, retrying automatically"
+        );
+    }
+
+    #[test]
+    fn long_error_text_is_truncated_in_the_status_line() {
+        let mut s = AppState::default();
+        let mut p = pair("docs", Phase::Error);
+        p.last_error = Some("x".repeat(500));
+        s.pairs.push(p);
+        let line = s.status_line(0);
+        assert_eq!(line.chars().count(), 120);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn pair_finished_records_files_waiting_to_retry() {
+        // End to end through the real sink + a real stats DB: a file with a
+        // retry row still inside its backoff window is counted when the pair
+        // finishes, and one whose window already elapsed is not.
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-retrying-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stats = Arc::new(Stats::open(&dir).unwrap());
+        let now = now_epoch();
+        stats
+            .apply_retry_updates(
+                "docs",
+                &[
+                    ("waiting.txt".into(), 2, now + 600),
+                    ("due.txt".into(), 2, now - 5),
+                ],
+                &[],
+            )
+            .unwrap();
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: Some(stats),
+        };
+        sink.emit(&SyncEvent::PairFinished {
+            pair: "docs".into(),
+            applied: 0,
+            errors: 0,
+            tracked: 2,
+        });
+        assert_eq!(st.lock().unwrap().pairs[0].retrying, 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

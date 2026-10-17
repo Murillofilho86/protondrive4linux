@@ -21,7 +21,9 @@ use eframe::egui::{
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::{ProtonCli, Remote};
-use neutronsync::service::{ActivityKind, ActivityOp, AppState, Controller, PairState, Phase};
+use neutronsync::service::{
+    ActivityKind, ActivityOp, AppState, Controller, OverallStatus, PairState, Phase,
+};
 use neutronsync::updater::{self, UpdateInfo};
 
 // --- palette (reference/gui/palette/palette.md) -----------------------------
@@ -255,16 +257,7 @@ fn now_secs() -> i64 {
 }
 
 fn rel_time(ts: i64) -> String {
-    let d = (now_secs() - ts).max(0);
-    match d {
-        0..=44 => "just now".into(),
-        45..=89 => "1 minute ago".into(),
-        90..=3599 => format!("{} minutes ago", d / 60),
-        3600..=7199 => "1 hour ago".into(),
-        7200..=86399 => format!("{} hours ago", d / 3600),
-        86400..=172799 => "yesterday".into(),
-        _ => format!("{} days ago", d / 86400),
-    }
+    neutronsync::datefmt::rel_time(now_secs(), ts)
 }
 
 fn galley_w(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
@@ -469,10 +462,30 @@ struct Toast {
 // system tray (tray-icon / GTK AppIndicator) — lives in the headless daemon
 // ============================================================================
 
-/// The app icon as a `tray_icon::Icon` (RGBA).
-fn tray_icon_image() -> Option<tray_icon::Icon> {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png")).ok()?;
-    tray_icon::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok()
+/// One tray icon per overall status: the app logo with that status's badge.
+/// Built once at startup (the logo is decoded and shrunk a single time), so
+/// swapping the icon later is just a clone.
+fn tray_status_icons() -> Vec<(OverallStatus, tray_icon::Icon)> {
+    use neutronsync::icon::{status_icon_rgba, ALL_STATUSES, ICON_SIZE};
+    let Ok(logo) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/logo.png"))
+    else {
+        return Vec::new();
+    };
+    let (small, w, h) = downscale_rgba(
+        &logo.rgba,
+        logo.width as usize,
+        logo.height as usize,
+        ICON_SIZE,
+    );
+    ALL_STATUSES
+        .iter()
+        .filter_map(|&status| {
+            let rgba = status_icon_rgba(&small, w, h, status);
+            tray_icon::Icon::from_rgba(rgba, ICON_SIZE as u32, ICON_SIZE as u32)
+                .ok()
+                .map(|icon| (status, icon))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +1574,17 @@ impl App {
                     "Scanning…"
                 },
                 current_op_line(snap),
+            )
+        } else if retrying_total(snap) > 0 {
+            let n = retrying_total(snap);
+            (
+                WARN,
+                Icon::Info,
+                "Some files failed to sync",
+                format!(
+                    "{n} file{} will be retried automatically",
+                    if n == 1 { "" } else { "s" }
+                ),
             )
         } else if watching {
             (
@@ -3125,6 +3149,11 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Opti
     }
 }
 
+/// Files across every pair that failed and are waiting out a retry backoff.
+fn retrying_total(snap: &AppState) -> usize {
+    snap.pairs.iter().map(|p| p.retrying).sum()
+}
+
 fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
     let first_run = ps.is_some_and(|p| p.last_synced.is_none());
     let (col, text) = match ps.map(|p| p.phase) {
@@ -3152,7 +3181,16 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
                 .unwrap_or_else(|| "Error".into()),
         ),
         Some(Phase::Synced) | Some(Phase::Idle) | None => {
-            if watching {
+            let retrying = ps.map_or(0, |p| p.retrying);
+            if retrying > 0 {
+                (
+                    WARN,
+                    format!(
+                        "{retrying} file{} waiting to retry",
+                        if retrying == 1 { "" } else { "s" }
+                    ),
+                )
+            } else if watching {
                 (ACCENT, "Auto · watching".to_string())
             } else {
                 match ps.and_then(|p| p.last_synced) {
@@ -3603,10 +3641,15 @@ fn run_daemon() {
         return;
     }
 
+    let (mut last_status, mut last_line) = ctrl.status_summary();
     let menu = Menu::new();
+    // Disabled: a read-only status line, kept current by the tick below.
+    let status_i = MenuItem::new(&last_line, false, None);
     let open_i = MenuItem::new("Open protondrive4linux", true, None);
     let sync_i = MenuItem::new("Sync now", true, None);
     let quit_i = MenuItem::new("Quit", true, None);
+    let _ = menu.append(&status_i);
+    let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&open_i);
     let _ = menu.append(&sync_i);
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -3617,13 +3660,14 @@ fn run_daemon() {
         quit_i.id().clone(),
     );
 
+    let icons = tray_status_icons();
     let mut builder = TrayIconBuilder::new()
-        .with_tooltip("protondrive4linux")
+        .with_tooltip(&last_line)
         .with_menu(Box::new(menu));
-    if let Some(icon) = tray_icon_image() {
-        builder = builder.with_icon(icon);
+    if let Some((_, icon)) = icons.iter().find(|(s, _)| *s == last_status) {
+        builder = builder.with_icon(icon.clone());
     }
-    let _tray = match builder.build() {
+    let tray = match builder.build() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("protondrive4linux: system tray unavailable: {e}");
@@ -3641,7 +3685,8 @@ fn run_daemon() {
     let mut last_mtime = file_mtime(&config_path);
     let mut want_watch = cfg.auto_sync;
     let mut pending_restart = false;
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+    let mut last_text_at = std::time::Instant::now();
+    let tick = gtk::glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         // tray menu
         while let Ok(ev) = menu_rx.try_recv() {
             let id = ev.id();
@@ -3686,6 +3731,26 @@ fn run_daemon() {
             }
         }
 
+        // Tray status: swap the icon when the overall state changes. The menu's
+        // status line follows too, but it changes with every file during a big
+        // sync, so text-only changes are throttled to once a second.
+        let (status, line) = ctrl_cb.status_summary();
+        let status_changed = status != last_status;
+        if status_changed {
+            if let Some((_, icon)) = icons.iter().find(|(s, _)| *s == status) {
+                let _ = tray.set_icon(Some(icon.clone()));
+            }
+            last_status = status;
+        }
+        if line != last_line
+            && (status_changed || last_text_at.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            status_i.set_text(&line);
+            let _ = tray.set_tooltip(Some(&line));
+            last_line = line;
+            last_text_at = std::time::Instant::now();
+        }
+
         // Publish our live state so an open window can display what the daemon
         // is doing (scanning, syncing, per-file ops) — the window has no other
         // view into this separate process.
@@ -3695,6 +3760,8 @@ fn run_daemon() {
     });
 
     gtk::main();
+    // Drop the tick (and the tray icon it owns) while GTK is still alive.
+    tick.remove();
     ctrl.stop_watch();
 }
 

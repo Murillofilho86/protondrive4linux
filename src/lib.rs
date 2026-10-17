@@ -12,6 +12,8 @@ pub mod config;
 pub mod datefmt;
 pub mod engine;
 pub mod events;
+#[cfg(feature = "gui")]
+pub mod icon;
 pub mod ignore;
 pub mod logger;
 pub mod models;
