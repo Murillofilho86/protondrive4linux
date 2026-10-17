@@ -125,32 +125,42 @@ pub enum SyncEvent {
     /// keyring answers - which is announced with an [`SyncEvent::Auth`].
     KeyringUnreachable,
     /// The mass-deletion guard held a run's deletions back: they would have
-    /// removed `files` files, too many of the `tracked` the pair holds, which is
-    /// far more often a mistake (an unmounted drive, a folder emptied by
-    /// accident) than intended. Nothing was deleted; the run still transferred.
-    /// It is re-reported by every run until the user confirms or restores.
+    /// removed `remote` files from Proton Drive and `local` from this computer,
+    /// too many of the `tracked` the pair holds, which is far more often a mistake
+    /// (an unmounted drive, a folder emptied by accident) than intended. Nothing
+    /// was deleted; the run still transferred. It is re-reported by every run
+    /// until the user confirms or restores.
     DeletesHeld {
         pair: String,
-        files: usize,
+        remote: usize,
+        local: usize,
         tracked: usize,
     },
 }
 
-/// What to tell the user when the guard held `files` deletions of `tracked`
-/// back: what it saw, that nothing was deleted, and both ways out - deleting for
-/// real, or getting the files back.
-pub fn held_deletes_text(pair: &str, files: usize, tracked: usize) -> String {
+/// What to tell the user when the guard held deletions back - `remote` files'
+/// worth on Proton Drive and `local` on this computer, of the `tracked` the pair
+/// holds: what it saw, that nothing was deleted, and both ways out (deleting for
+/// real, or getting the files back). The pair is not named at the start - a
+/// frontend shows it beside this - but is in the commands.
+pub fn held_deletes_text(pair: &str, remote: usize, local: usize, tracked: usize) -> String {
+    let files = remote + local;
     let percent = if tracked == 0 {
         0
     } else {
         (files * 100).div_ceil(tracked).min(100)
     };
+    let counted = crate::datefmt::counted(files, "deletion", "deletions");
+    let where_ = match (remote, local) {
+        (_, 0) => " on Proton Drive".to_string(),
+        (0, _) => " on this computer".to_string(),
+        _ => format!(" ({remote} on Proton Drive, {local} on this computer)"),
+    };
     format!(
-        "{pair}: held back {} ({percent}% of the {} this folder pair tracks) - that looks like a \
-         mistake, such as an unmounted drive or a folder emptied by accident, so nothing was \
-         deleted. If you meant it: `protondrive4linux sync --allow-mass-delete {pair}`. To get \
-         the files back instead: `protondrive4linux sync --resync {pair}`.",
-        crate::datefmt::counted(files, "deletion", "deletions"),
+        "held back {counted}{where_}, {percent}% of the {} this folder pair tracks - that looks \
+         like a mistake, such as an unmounted drive or a folder emptied by accident, so nothing \
+         was deleted. If you meant it: `protondrive4linux sync --allow-mass-delete {pair}`. To \
+         get the files back instead: `protondrive4linux sync --resync {pair}`.",
         crate::datefmt::counted(tracked, "file", "files"),
     )
 }

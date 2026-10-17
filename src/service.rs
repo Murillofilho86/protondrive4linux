@@ -524,7 +524,8 @@ impl EventSink for StateSink {
             }
             SyncEvent::DeletesHeld {
                 pair,
-                files,
+                remote,
+                local,
                 tracked,
             } => {
                 // Needs the user: shown as the pair's problem until a run no
@@ -532,7 +533,7 @@ impl EventSink for StateSink {
                 // The same sentence again (every run re-plans the same deletions
                 // and holds them again) is the same news: one feed row, not one
                 // per run.
-                let text = crate::events::held_deletes_text(pair, *files, *tracked);
+                let text = crate::events::held_deletes_text(pair, *remote, *local, *tracked);
                 let repeat = s
                     .pair_mut(pair)
                     .is_some_and(|p| p.last_error.as_deref() == Some(text.as_str()));
@@ -541,7 +542,7 @@ impl EventSink for StateSink {
                     p.last_error = Some(text.clone());
                 }
                 if !repeat {
-                    s.push(ActivityKind::Error, text);
+                    s.push(ActivityKind::Error, format!("{pair}: {text}"));
                 }
             }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
@@ -1038,7 +1039,8 @@ mod tests {
         };
         let held = SyncEvent::DeletesHeld {
             pair: "docs".into(),
-            files: 300,
+            remote: 300,
+            local: 0,
             tracked: 400,
         };
         sink.emit(&held);
@@ -1048,7 +1050,7 @@ mod tests {
         assert_eq!(p.phase, Phase::Error);
         let msg = p.last_error.as_deref().unwrap();
         assert!(
-            msg.contains("held back 300 deletions") && msg.contains("75%"),
+            msg.contains("held back 300 deletions on Proton Drive") && msg.contains("75%"),
             "{msg}"
         );
         assert_eq!(

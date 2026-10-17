@@ -1363,7 +1363,7 @@ fn a_deletion_far_bigger_than_the_allowance_is_held_back_and_says_how_to_go_on()
             rec.held()
         );
         assert!(
-            rec.held()[0].contains("files: 300") && rec.held()[0].contains("tracked: 400"),
+            rec.held()[0].contains("remote: 300, local: 0, tracked: 400"),
             "{:?}",
             rec.held()
         );
@@ -1517,7 +1517,18 @@ fn deletions_that_the_remote_makes_are_held_back_too() {
             "streaming={streaming}: {:?}",
             rec.held()
         );
-        assert!(errors.iter().any(|e| e.contains("held back")), "{errors:?}");
+        // the files would have gone from THIS computer, and the message says so
+        assert!(
+            rec.held()[0].contains("remote: 0, local: 300"),
+            "{:?}",
+            rec.held()
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("held back 300 deletions on this computer")),
+            "streaming={streaming}: {errors:?}"
+        );
     }
 }
 

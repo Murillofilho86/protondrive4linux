@@ -45,7 +45,8 @@ type PlanOutcome = (
 /// the pair tracks.
 #[derive(Clone, Copy, Debug)]
 struct Held {
-    files: usize,
+    remote: usize,
+    local: usize,
     tracked: usize,
 }
 
@@ -74,7 +75,10 @@ pub struct DeleteBudget {
     allowed: usize,
     tracked: usize,
     used: AtomicUsize,
-    held: AtomicUsize,
+    /// The files whose deletion was refused, by side: `(local, remote)`. A set,
+    /// because a folder that is held back is then descended into, and its files
+    /// are refused again one by one - they are still the same files.
+    held: Mutex<(HashSet<String>, HashSet<String>)>,
     tripped: AtomicBool,
 }
 
@@ -101,7 +105,7 @@ impl DeleteBudget {
             allowed,
             tracked,
             used: AtomicUsize::new(0),
-            held: AtomicUsize::new(0),
+            held: Mutex::new((HashSet::new(), HashSet::new())),
             tripped: AtomicBool::new(false),
         })
     }
@@ -116,21 +120,20 @@ impl DeleteBudget {
         self.tracked
     }
 
-    /// Ask to delete `files` files. All or nothing: `false` means hold them back,
-    /// and the budget is tripped for the rest of the run.
+    /// Ask to delete `files` files. All or nothing: `false` means hold them back
+    /// (and say which, with [`DeleteBudget::hold`]); the budget is then tripped
+    /// for the rest of the run.
     pub fn reserve(&self, files: usize) -> bool {
         if files == 0 {
             return true;
         }
         if self.tripped.load(Ordering::SeqCst) {
-            self.held.fetch_add(files, Ordering::SeqCst);
             return false;
         }
         let mut used = self.used.load(Ordering::SeqCst);
         loop {
             if used + files > self.allowed {
                 self.tripped.store(true, Ordering::SeqCst);
-                self.held.fetch_add(files, Ordering::SeqCst);
                 return false;
             }
             match self
@@ -153,10 +156,28 @@ impl DeleteBudget {
         self.tripped.load(Ordering::SeqCst)
     }
 
-    /// How many files' deletions were held back (at least those asked for after
-    /// the trip; for an up-front trip, how many looked missing).
+    /// Record the files whose deletion was just refused - those on this computer
+    /// and those on Proton Drive - so the user is told what was held and where.
+    pub fn hold(
+        &self,
+        local: impl IntoIterator<Item = String>,
+        remote: impl IntoIterator<Item = String>,
+    ) {
+        let mut held = self.held.lock().unwrap();
+        held.0.extend(local);
+        held.1.extend(remote);
+    }
+
+    /// How many files' deletions were held back, each counted once.
     pub fn held(&self) -> usize {
-        self.held.load(Ordering::SeqCst)
+        let held = self.held.lock().unwrap();
+        held.0.len() + held.1.len()
+    }
+
+    /// `(remote, local)`: the files held back on Proton Drive, and on this computer.
+    pub fn held_sides(&self) -> (usize, usize) {
+        let held = self.held.lock().unwrap();
+        (held.1.len(), held.0.len())
     }
 }
 
@@ -184,18 +205,28 @@ pub fn census_missing(pair: &Pair, tracked: usize) -> usize {
     tracked.saturating_sub(present)
 }
 
-/// How many files the deletes in `plan` would remove: each file once, and a
-/// folder as the files the baseline holds under it. A whole-tree plan lists both
-/// a folder and every file in it, so they are collected as one set, not summed.
-fn planned_delete_files(plan: &Plan, base: &BTreeMap<String, Entry>) -> usize {
-    let mut files: HashSet<&str> = HashSet::new();
+/// The files the deletes in `plan` would remove, as `(local, remote)`: from this
+/// computer and from Proton Drive. Each file once, and a folder as the files the
+/// baseline holds under it: a whole-tree plan lists both a folder and every file
+/// in it, so they are collected into one set per side, not summed.
+fn planned_delete_sets(
+    plan: &Plan,
+    base: &BTreeMap<String, Entry>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut local: HashSet<String> = HashSet::new();
+    let mut remote: HashSet<String> = HashSet::new();
     for op in plan
         .ops
         .iter()
         .filter(|o| matches!(o.action, Action::DeleteLocal | Action::DeleteRemote))
     {
+        let set = if op.action == Action::DeleteLocal {
+            &mut local
+        } else {
+            &mut remote
+        };
         if !op.is_dir {
-            files.insert(op.path.as_str());
+            set.insert(op.path.clone());
             continue;
         }
         let prefix = format!("{}/", op.path);
@@ -204,11 +235,11 @@ fn planned_delete_files(plan: &Plan, base: &BTreeMap<String, Entry>) -> usize {
             .take_while(|(k, _)| k.starts_with(&prefix))
         {
             if !e.is_dir {
-                files.insert(k.as_str());
+                set.insert(k.clone());
             }
         }
     }
-    files.len()
+    (local, remote)
 }
 
 /// One run's retry-backoff bookkeeping (M4-004), bundled so it travels
@@ -801,7 +832,17 @@ fn report_if_tripped(
     let Some(b) = budget.filter(|b| b.tripped() && b.held() > 0) else {
         return 0;
     };
-    report_held(log, events, pair, b.held(), b.tracked());
+    let (remote, local) = b.held_sides();
+    report_held(
+        log,
+        events,
+        pair,
+        Held {
+            remote,
+            local,
+            tracked: b.tracked(),
+        },
+    );
     1
 }
 
@@ -1311,12 +1352,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         // as a whole - over budget, none of its deletions happen.
         let mut held = None;
         if let Some(b) = &budget {
-            let files = planned_delete_files(&plan, &base);
-            if !b.reserve(files) {
+            let (local_files, remote_files) = planned_delete_sets(&plan, &base);
+            if !b.reserve(local_files.len() + remote_files.len()) {
                 plan.ops
                     .retain(|op| !matches!(op.action, Action::DeleteRemote | Action::DeleteLocal));
                 held = Some(Held {
-                    files,
+                    remote: remote_files.len(),
+                    local: local_files.len(),
                     tracked: b.tracked(),
                 });
             }
@@ -2489,10 +2531,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         if let Some(h) = held {
             // A run that held deletions back is not a clean one: it counts as a
             // problem (exit status, the pair's state) until the user settles it.
-            report_held(self.log, self.events, pair, h.files, h.tracked);
-            result.errors.push(crate::events::held_deletes_text(
-                &pair.name, h.files, h.tracked,
-            ));
+            report_held(self.log, self.events, pair, h);
+            result.errors.push(held_error(pair, h));
         }
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
@@ -2557,12 +2597,14 @@ impl<'a, R: Remote> Engine<'a, R> {
         }
         self.budget = None;
         if let Some(b) = budget.as_deref().filter(|b| b.tripped() && b.held() > 0) {
-            report_held(self.log, self.events, pair, b.held(), b.tracked());
-            errors.push(crate::events::held_deletes_text(
-                &pair.name,
-                b.held(),
-                b.tracked(),
-            ));
+            let (remote, local) = b.held_sides();
+            let held = Held {
+                remote,
+                local,
+                tracked: b.tracked(),
+            };
+            report_held(self.log, self.events, pair, held);
+            errors.push(held_error(pair, held));
         }
         if !self.dry_run && !self.cancelled() {
             let _ = crate::state::set_last_synced(
@@ -2893,7 +2935,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         // run's shared budget, so a walk over many folders spends one allowance.
         // Without a shared budget (a single-folder run) it makes its own.
         let mut held_alone: Option<Held> = None;
-        let planned = planned_delete_files(&plan, base_all);
+        let (planned_local, planned_remote) = planned_delete_sets(&plan, base_all);
+        let planned = planned_local.len() + planned_remote.len();
         if planned > 0 {
             let own;
             let budget: Option<&DeleteBudget> = match &self.budget {
@@ -2910,10 +2953,12 @@ impl<'a, R: Remote> Engine<'a, R> {
                     });
                     if self.budget.is_none() {
                         held_alone = Some(Held {
-                            files: planned,
+                            remote: planned_remote.len(),
+                            local: planned_local.len(),
                             tracked: b.tracked(),
                         });
                     }
+                    b.hold(planned_local, planned_remote);
                 }
             }
         }
@@ -2946,10 +2991,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         let tracked = new_base.len();
         let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
         if let Some(h) = held_alone {
-            report_held(self.log, self.events, pair, h.files, h.tracked);
-            result.errors.push(crate::events::held_deletes_text(
-                &pair.name, h.files, h.tracked,
-            ));
+            report_held(self.log, self.events, pair, h);
+            result.errors.push(held_error(pair, h));
         }
 
         // Purge descendant baseline rows ONLY for sub-folders whose delete
@@ -3000,23 +3043,21 @@ impl<'a, R: Remote> Engine<'a, R> {
 }
 
 /// Say, in the log and to the frontends, that the guard held deletions back.
-fn report_held(
-    log: &Logger,
-    events: Option<&dyn EventSink>,
-    pair: &Pair,
-    files: usize,
-    tracked: usize,
-) {
-    log.warn(&crate::events::held_deletes_text(
-        &pair.name, files, tracked,
-    ));
+fn report_held(log: &Logger, events: Option<&dyn EventSink>, pair: &Pair, held: Held) {
+    log.warn(&format!("{:?}: {}", pair.name, held_error(pair, held)));
     if let Some(sink) = events {
         sink.emit(&SyncEvent::DeletesHeld {
             pair: pair.name.clone(),
-            files,
-            tracked,
+            remote: held.remote,
+            local: held.local,
+            tracked: held.tracked,
         });
     }
+}
+
+/// The text of a held-back run, as an entry of a result's errors.
+fn held_error(pair: &Pair, held: Held) -> String {
+    crate::events::held_deletes_text(&pair.name, held.remote, held.local, held.tracked)
 }
 
 /// Say, in the log and to the frontends, that a pair was pointed at other
@@ -3381,7 +3422,7 @@ fn sha1_file(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_next_at, planned_delete_files, safe_join, safe_join_to_write, symlink_in_path,
+        backoff_next_at, planned_delete_sets, safe_join, safe_join_to_write, symlink_in_path,
         DeleteBudget,
     };
     use crate::config::{Config, ConflictPolicy, LocalDelete, UpdateChannel};
@@ -3472,15 +3513,21 @@ mod tests {
         });
         assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 200);
         assert!(b.tripped());
-        // 800 asked, 200 granted: the rest was held
-        assert_eq!(b.held(), 600);
         // once tripped, even a small request is refused for the rest of the run
         assert!(!b.reserve(1));
         // all or nothing: a request that does not fit is refused whole
         let fresh = DeleteBudget::new(&c, &pair(), &base_of(1000)).unwrap();
         assert!(fresh.reserve(150));
         assert!(!fresh.reserve(100), "150 + 100 > 200");
-        assert_eq!(fresh.held(), 100);
+        // what was refused is remembered by file and side, each file once:
+        // a folder held back and then descended into is refused again file by file
+        fresh.hold((0..100).map(|i| format!("a/f{i}")), std::iter::empty());
+        fresh.hold(
+            (0..100).map(|i| format!("a/f{i}")),
+            (0..5).map(|i| format!("r{i}")),
+        );
+        assert_eq!(fresh.held(), 105);
+        assert_eq!(fresh.held_sides(), (5, 100));
     }
 
     #[test]
@@ -3503,14 +3550,21 @@ mod tests {
         ] {
             plan.add(Op::new(Action::DeleteRemote, path, dir, ""));
         }
-        assert_eq!(planned_delete_files(&plan, &base), 3);
+        let counts = |plan: &Plan| {
+            let (l, r) = planned_delete_sets(plan, &base);
+            (l.len(), r.len())
+        };
+        assert_eq!(counts(&plan), (0, 3));
         // a shallow plan lists only the folder
         let mut shallow = Plan::default();
         shallow.add(Op::new(Action::DeleteLocal, "d", true, ""));
-        assert_eq!(planned_delete_files(&shallow, &base), 3);
-        // and anything that is not a delete does not count
+        assert_eq!(counts(&shallow), (3, 0));
+        // anything that is not a delete does not count
         shallow.add(Op::new(Action::Upload, "other/x", false, ""));
-        assert_eq!(planned_delete_files(&shallow, &base), 3);
+        assert_eq!(counts(&shallow), (3, 0));
+        // and the two sides are told apart
+        shallow.add(Op::new(Action::DeleteRemote, "other/x", false, ""));
+        assert_eq!(counts(&shallow), (3, 1));
     }
 
     #[test]
