@@ -64,4 +64,6 @@ Not something to do casually — see `docs/contributing/CONTRIBUTING.md` for ful
 
 ### Tests
 
+`tests/data_loss.rs` is the data-loss review as tests (`docs/DATA_LOSS_REVIEW.md` has the matrix): each is a way a sync client has lost somebody's file, and **each fails when the guard it names is removed** - keep it that way, and add one before you add a guard. It shares the in-memory remote with `tests/engine.rs` (`tests/common/fake_remote.rs`). `tests/disaster/` kills real processes (the whole process group, so the CLI dies mid-write too).
+
 `tests/engine.rs` is the executable spec for sync semantics — it uses a `FakeRemote`/in-memory store to exercise the engine (initial upload/download, modify/delete propagation, conflict handling, idempotency, structured events) without needing the real `proton-drive` CLI. When changing merge/conflict/deletion logic, check this file first for the invariant being tested before changing behavior.

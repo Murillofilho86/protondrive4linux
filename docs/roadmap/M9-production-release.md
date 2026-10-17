@@ -22,10 +22,64 @@ original (`SECURITY_AUDIT.md`): dependency audit, credenciais, permissões, IPC.
 - [ ] Command injection — idem, formalizar como teste, não só revisão manual.
 
 ## M9-003 — Revisão de perda de dados
-**Status: 🔶 Parcial.** Overlap direto com M1 (disaster suite, offline recovery). Não é uma
-issue nova — é o checkpoint de "M1 realmente fechou" antes do release candidate. Cenários:
-`kill -9`, power loss, network loss, disk full, permission denied, remote unavailable, local
-unavailable, conflict, rename, large file, large tree.
+**Status: ✅ Revisão feita, correções mescladas; falta uma decisão (ver abaixo).** Overlap direto
+com M1 (disaster suite, offline recovery). Não é uma issue nova — é o checkpoint de "M1 realmente
+fechou" antes do release candidate. Cenários: `kill -9`, power loss, network loss, disk full,
+permission denied, remote unavailable, local unavailable, conflict, rename, large file, large tree.
+
+O relatório completo — método, achados, matriz de cenários com o teste que mostra cada um, limites
+que ficam e o que não deu para verificar — está em
+[`docs/DATA_LOSS_REVIEW.md`](../DATA_LOSS_REVIEW.md) (em inglês, como o resto da documentação de
+código).
+
+### Método
+Ler o engine perguntando "como isto pode perder o arquivo de alguém?", escrever um teste para cada
+resposta e **guardar só os que falham no código de antes** (11 falharam), corrigir, e depois
+sabotar a correção de propósito para ver o teste certo falhar (mutation check). Isso pegou dois
+testes cegos: um teste de desastre que matava só o processo pai (o CLI órfão terminava de escrever
+o arquivo) e um teste da guarda de pasta que nunca chegava ao código que deveria exercitar.
+
+### Achados corrigidos (todos com teste que falhava na `master`)
+- [x] Download que morre no meio deixava arquivo parcial com o nome final, ou trocava a cópia boa
+      por um pedaço; um download "bem-sucedido" truncado era enviado por cima da cópia boa do
+      remoto; uma edição feita durante a execução era sobrescrita (**#85**, `src/staged.rs`).
+- [x] Cópia de conflito sobrescrevia um arquivo existente com o mesmo nome (**#85**).
+- [x] Raiz local vazia (HD externo desmontado), pasta ilegível no `sync` em lote, arquivo/pasta
+      trocado por symlink e par apontado para outra pasta apagavam o remoto; escrita através de
+      symlink para fora da raiz (**#86**).
+- [x] Dois arquivos de mesmo tamanho com mtimes diferentes eram tomados por "drift": a edição
+      local sumia dos dois lados (**#87**).
+- [x] Apagar uma pasta levava junto arquivos que nunca sincronizaram (locais ou remotos); rename
+      falso-positivo mandava o conteúdo antigo para o nome novo (**#87**).
+
+### Cenários
+- [x] `kill -9` / SIGTERM (inclusive no meio de um download, matando o grupo de processos).
+- [x] Power loss — por raciocínio: baseline em SQLite WAL com `synchronous = FULL` (fixado por
+      teste) e `fsync` do arquivo baixado *antes* do baseline. Não dá para rodar de verdade aqui.
+- [x] Network loss (offline, timeout do CLI no meio de um download).
+- [x] Disk full — **simulado** (download que escreve parte e falha); disco cheio de verdade não foi
+      criado.
+- [x] Permission denied (pasta/arquivo ilegível, destino sem escrita).
+- [x] Remote unavailable / local unavailable (raiz ausente, raiz vazia, listagem falha).
+- [x] Conflict, rename, large tree.
+- [~] Large file — o download é verificado e atômico, mas o limite é de tempo: uma transferência
+      que não termina em `cli_timeout_secs` (1800 s por padrão) é morta e tentada de novo para
+      sempre. Arquivo de vários GB em link lento precisa de `cli.cli_timeout_secs` maior.
+
+### Pendente (decisão do mantenedor, não bug)
+- **Disjuntor de deleção em massa** (como o `--max-delete` do rclone): com `propagate_deletes`
+  ligado, um caso que ninguém previu ainda apagaria muito. Todos os casos achados hoje têm guarda
+  própria e as deleções são recuperáveis (lixeira do desktop / lixeira online do Proton), mas
+  falta a rede de segurança genérica. Precisa de um limiar **e** de um jeito de confirmar "foi
+  de propósito" na CLI, no tray e na janela — decisão de produto.
+- Limites documentados em `docs/DATA_LOSS_REVIEW.md` § Limits (timeout vs arquivo grande, timeout
+  mata só o processo filho, duas execuções ao mesmo tempo não são impedidas, nomes de arquivo
+  não-UTF-8, lista de ignorados silenciosa, `size+mtime` como heurística).
+
+### Gate
+"Nenhum `risk:data-loss` crítico aberto": **atendido** — nenhum caso de perda conhecido segue sem
+correção ou guarda. O que fica são os limites acima e a ressalva de que nada foi exercitado contra
+o `proton-drive` real (sem conta de teste), nem com queda de energia ou disco cheio de verdade.
 
 ## M9-004 — Release candidate
 **Status: ⬜ Não iniciado.** Criar `v1.0.0-rc1`.
