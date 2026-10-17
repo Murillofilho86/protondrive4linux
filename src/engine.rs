@@ -35,6 +35,13 @@ use crate::trash::trash_local;
 /// scan was incomplete, and the set of baseline rows to prune).
 type PlanOutcome = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
 
+/// A pair root that comes back empty only holds deletions back when at least
+/// this many files are on record for the pair. An unmounted drive or a folder
+/// emptied by mistake is a folder full of files going missing at once; deleting
+/// the only file of a small folder is just a deletion, and holding that back
+/// would make the guard a nuisance rather than a safety net.
+const EMPTY_ROOT_MIN_FILES: usize = 5;
+
 /// One run's retry-backoff bookkeeping (M4-004), bundled so it travels
 /// between `apply()` and `run_downloads()` as a single argument: `state` is
 /// this pair's current backoff state going into the run (read-only);
@@ -182,7 +189,9 @@ pub fn run_sync_scoped(
 /// Excluded sub-trees are skipped. Comparison is size+mtime (conservative: a
 /// false positive just triggers a scoped sync that reconciles correctly).
 pub fn local_change_folders(cfg: &Config, pair: &Pair) -> Vec<String> {
-    let base = crate::state::load_baseline(&cfg.state_dir, &pair.name).unwrap_or_default();
+    let base = crate::state::load_baseline_for(&cfg.state_dir, pair)
+        .map(|(b, _)| b)
+        .unwrap_or_default();
     let root = &pair.local;
     if !root.exists() {
         return Vec::new();
@@ -342,8 +351,11 @@ pub fn run_sync_streaming(
     // One shared baseline snapshot for the whole walk. Each folder reads only its
     // own (disjoint) rows from it, and only its own reconcile writes them, so a
     // snapshot taken now stays correct throughout.
-    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
-        Ok(b) => std::sync::Arc::new(b),
+    let base = match crate::state::load_baseline_for(&cfg.state_dir, pair) {
+        Ok((b, moved)) => {
+            note_pair_moved(log, events, pair, moved);
+            std::sync::Arc::new(b)
+        }
         Err(e) => {
             log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
             return RunSummary {
@@ -488,8 +500,11 @@ pub fn run_sync_shallow_many(
             pairs: 1,
         };
     }
-    let base = match crate::state::load_baseline(&cfg.state_dir, &pair.name) {
-        Ok(b) => std::sync::Arc::new(b),
+    let base = match crate::state::load_baseline_for(&cfg.state_dir, pair) {
+        Ok((b, moved)) => {
+            note_pair_moved(log, events, pair, moved);
+            std::sync::Arc::new(b)
+        }
         Err(e) => {
             log.error(&format!("baseline load failed for {:?}: {e}", pair.name));
             return RunSummary {
@@ -632,16 +647,22 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// Walk the local tree. In sha1 mode, files whose size+mtime match the
     /// baseline reuse the stored hash instead of being re-read (a
     /// (size,mtime)->sha1 cache), so only changed files are hashed.
+    ///
+    /// Also returns how many places it could not see into - a folder it was not
+    /// allowed to open, a tracked folder that is now a symlink. Whatever is in
+    /// them is simply absent from the result, which reads as "deleted"; a caller
+    /// that sees a non-zero count must not delete on that basis.
     fn scan_local(
         &self,
         root: &Path,
         baseline: &BTreeMap<String, Entry>,
         pair: &Pair,
         scope: Option<&str>,
-    ) -> BTreeMap<String, Entry> {
+    ) -> (BTreeMap<String, Entry>, usize) {
         let mut out = BTreeMap::new();
+        let mut blind = 0usize;
         if !root.exists() {
-            return out;
+            return (out, blind);
         }
         // A scoped sync walks only `root/<scope>` but still yields paths relative
         // to `root`, so keys line up with the baseline. A missing scoped folder
@@ -651,7 +672,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             None => root.to_path_buf(),
         };
         if !start.exists() {
-            return out;
+            return (out, blind);
         }
         let want_sha1 = self.cfg.compare == Compare::Sha1;
         // Prune excluded subtrees from the walk itself (`filter_entry` stops
@@ -676,8 +697,22 @@ impl<'a, R: Remote> Engine<'a, R> {
                     None => true,
                 }
             })
-            .filter_map(|e| e.ok())
         {
+            // A folder the walk could not open (permissions, an I/O error) is
+            // not an empty folder: say so instead of dropping the error.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    blind += 1;
+                    self.log.warn(&format!(
+                        "local scan: cannot read {}: {err}",
+                        err.path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    ));
+                    continue;
+                }
+            };
             let rel = match entry
                 .path()
                 .strip_prefix(root)
@@ -745,9 +780,24 @@ impl<'a, R: Remote> Engine<'a, R> {
                         remote_id: None,
                     },
                 );
+            } else if let Some(b) = baseline.get(&rel) {
+                // A symlink, pipe, socket or device where a tracked file or
+                // folder used to be. It is not a deletion: carry a file forward
+                // untouched (it is neither uploaded nor trashed), and for a folder
+                // - whose contents can no longer be seen - hold back deletions.
+                self.log.warn(&format!(
+                    "local scan: {rel} is a symlink or special file now, not a regular \
+                     {}; left alone",
+                    if b.is_dir { "folder" } else { "file" }
+                ));
+                if b.is_dir {
+                    blind += 1;
+                } else {
+                    out.insert(rel.clone(), b.clone());
+                }
             }
         }
-        out
+        (out, blind)
     }
 
     /// Returns the remote tree, the relative folders that could not be listed
@@ -811,10 +861,11 @@ impl<'a, R: Remote> Engine<'a, R> {
         // a scoped sync, restrict the baseline to rows strictly UNDER the scope
         // so nothing outside it is ever seen as missing (and thus deleted) — the
         // scan, reconcile and additive commit all stay within the sub-tree.
+        let (full, moved) = crate::state::load_baseline_for(&self.cfg.state_dir, pair)?;
+        note_pair_moved(self.log, self.events, pair, moved);
         let base: BTreeMap<String, Entry> = if resync {
             BTreeMap::new()
         } else {
-            let full = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
             match scope {
                 Some(s) => {
                     let prefix = format!("{s}/");
@@ -848,9 +899,46 @@ impl<'a, R: Remote> Engine<'a, R> {
             );
         }
 
-        let local = self.scan_local(&pair.local, &base, pair, scope);
+        let (local, local_blind) = self.scan_local(&pair.local, &base, pair, scope);
         let (remote, remote_failed, remote_root_missing) = self.scan_remote(pair, scope)?;
         let mut incomplete = !remote_failed.is_empty();
+        if local_blind > 0 {
+            incomplete = true;
+            self.log.warn(&format!(
+                "local scan incomplete for {:?}: {local_blind} place(s) could not be read; \
+                 syncing without deletions this run.",
+                pair.name,
+            ));
+            self.emit(SyncEvent::Error {
+                pair: Some(pair.name.clone()),
+                text: format!(
+                    "{} couldn't be read here — synced without deletions, will retry",
+                    crate::datefmt::counted(local_blind, "folder", "folders")
+                ),
+            });
+        }
+        // The pair root itself came back with nothing in it while the baseline
+        // knows files: an unmounted drive's mount point, a folder emptied by
+        // mistake, a restore that has not finished. Whatever it is, "every file
+        // was deleted" is the least likely reading, and the cost of being wrong
+        // is the remote copy: hold deletions back, and say why.
+        let tracked_files = base
+            .iter()
+            .filter(|(k, e)| !e.is_dir && !pair.is_excluded(k))
+            .count();
+        if scope.is_none() && !resync && local.is_empty() && tracked_files >= EMPTY_ROOT_MIN_FILES {
+            incomplete = true;
+            self.log.warn(&format!(
+                "the local folder of {:?} is empty but {tracked_files} file(s) are on record; \
+                 syncing without deletions. If the drive is unmounted, mount it; if you \
+                 emptied the folder on purpose, delete those files on Proton Drive too.",
+                pair.name,
+            ));
+            self.emit(SyncEvent::Error {
+                pair: Some(pair.name.clone()),
+                text: "local folder is empty — synced without deletions (unmounted drive?)".into(),
+            });
+        }
         if incomplete {
             self.log.warn(&format!(
                 "remote scan incomplete for {:?}: {} folder(s) could not be listed; \
@@ -1570,7 +1658,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
             // Guard the destination against a remote-controlled name escaping
             // the sync root; skip (don't abort the batch) anything unsafe.
-            let local_full = match safe_join(&pair.local, &op.path) {
+            let local_full = match safe_join_to_write(&pair.local, &op.path) {
                 Ok(p) => p,
                 Err(e) => {
                     let msg = e.to_string();
@@ -1709,7 +1797,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         op: &Op,
         new_base: &mut BTreeMap<String, Entry>,
     ) -> Result<()> {
-        let local_full = safe_join(&pair.local, &op.path)?;
+        let local_full = safe_join_to_write(&pair.local, &op.path)?;
         let remote_full = remote_join(&pair.remote, &op.path);
         match op.action {
             Action::MkdirRemote => self.ensure_remote_dir(&pair.remote, &op.path)?,
@@ -1792,7 +1880,7 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// first, then moved over the destination only once it has arrived whole and
     /// the destination is still what `expect.local` says (see [`staged`]).
     fn fetch_into_place(&self, pair: &Pair, rel: &str, expect: &Expect) -> Result<()> {
-        let local_full = safe_join(&pair.local, rel)?;
+        let local_full = safe_join_to_write(&pair.local, rel)?;
         let dest_dir = local_full
             .parent()
             .map(|p| p.to_path_buf())
@@ -1817,7 +1905,7 @@ impl<'a, R: Remote> Engine<'a, R> {
         rel: &str,
         new_base: &mut BTreeMap<String, Entry>,
     ) -> Result<()> {
-        let local_full = safe_join(&pair.local, rel)?;
+        let local_full = safe_join_to_write(&pair.local, rel)?;
         let stamp = epoch_to_stamp(now_epoch());
         // A name nothing is called yet: setting the local version aside must
         // never overwrite another file (an earlier conflict copy, say).
@@ -1996,7 +2084,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         pair: &Pair,
         folder: &str,
     ) -> Result<(SyncResult, Vec<String>)> {
-        let base_all = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let (base_all, moved) = crate::state::load_baseline_for(&self.cfg.state_dir, pair)?;
+        note_pair_moved(self.log, self.events, pair, moved);
         self.sync_pair_shallow_with_base(pair, folder, &base_all)
     }
 
@@ -2007,7 +2096,8 @@ impl<'a, R: Remote> Engine<'a, R> {
     /// with any `Remote` (including the test fake) and is the tested reference
     /// for the walk's semantics.
     pub fn sync_pair_streaming(&mut self, pair: &Pair) -> Result<SyncResult> {
-        let base = crate::state::load_baseline(&self.cfg.state_dir, &pair.name)?;
+        let (base, moved) = crate::state::load_baseline_for(&self.cfg.state_dir, pair)?;
+        note_pair_moved(self.log, self.events, pair, moved);
         let mut applied = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut frontier: Vec<String> = vec![String::new()];
@@ -2076,6 +2166,25 @@ impl<'a, R: Remote> Engine<'a, R> {
                 pair.local.display()
             );
         }
+        // A folder that is, or sits below, a symlink is not followed: listing it
+        // would read the link's target as if it were part of the tree, and a
+        // download into it would be written wherever the link points.
+        if let Some(link) = symlink_in_path(&pair.local, folder) {
+            self.log.warn(&format!(
+                "shallow: {} is a symlink; not following it ({label})",
+                link.display()
+            ));
+            return Ok((
+                SyncResult {
+                    pair: pair.name.clone(),
+                    applied: 0,
+                    errors: Vec::new(),
+                    plan_summary: String::new(),
+                    was_in_sync: true,
+                },
+                Vec::new(),
+            ));
+        }
         // An excluded folder (a user exclude, a junk name, a download's staging
         // folder) is invisible to the engine: nothing to list on either side. A
         // watcher event inside one must not cost a CLI call to find that out.
@@ -2120,16 +2229,31 @@ impl<'a, R: Remote> Engine<'a, R> {
         // exhaustion under the concurrent walk) must NOT be read as "everything
         // here was deleted" — that would trash still-present remote files. Flag
         // it and suppress deletes this run, exactly like a failed remote listing.
-        let local_failed = match std::fs::read_dir(&dir_path) {
+        // The same goes for an error half way through the listing (a network
+        // filesystem dropping out): what came after it is unknown, not gone.
+        let mut local_failed = false;
+        match std::fs::read_dir(&dir_path) {
             Err(e) => {
                 self.log.warn(&format!(
                     "shallow: local listing failed for {}: {e}; syncing without deletions",
                     dir_path.display()
                 ));
-                true
+                local_failed = true;
             }
             Ok(rd) => {
-                for e in rd.flatten() {
+                for e in rd {
+                    let e = match e {
+                        Ok(e) => e,
+                        Err(err) => {
+                            self.log.warn(&format!(
+                                "shallow: local listing of {} broke off: {err}; \
+                                 syncing without deletions",
+                                dir_path.display()
+                            ));
+                            local_failed = true;
+                            continue;
+                        }
+                    };
                     let name = e.file_name().to_string_lossy().replace('\\', "/");
                     if staged::is_staging_name(&name) {
                         // A download in progress, or its leftovers if the process
@@ -2199,11 +2323,48 @@ impl<'a, R: Remote> Engine<'a, R> {
                                 }
                             }
                         }
+                    } else if let Some(b) = base_direct.get(&rel) {
+                        // A symlink, pipe, socket or device where a tracked file
+                        // or folder used to be is not a deletion: a file is
+                        // carried forward untouched, and a folder (whose contents
+                        // can no longer be seen) holds deletions back.
+                        self.log.warn(&format!(
+                            "shallow: {rel} is a symlink or special file now, not a \
+                             regular {}; left alone",
+                            if b.is_dir { "folder" } else { "file" }
+                        ));
+                        if b.is_dir {
+                            local_failed = true;
+                        } else {
+                            local_direct.insert(rel.clone(), b.clone());
+                        }
                     }
                 }
-                false
             }
+        }
+        // The pair root came back empty while the baseline knows items in it: an
+        // unmounted drive's mount point, a folder emptied by mistake. Hold
+        // deletions back (see `plan`).
+        let tracked_files = if folder.is_empty() && local_direct.is_empty() {
+            base_all
+                .iter()
+                .filter(|(k, e)| !e.is_dir && !pair.is_excluded(k))
+                .count()
+        } else {
+            0
         };
+        if folder.is_empty() && !local_failed && tracked_files >= EMPTY_ROOT_MIN_FILES {
+            local_failed = true;
+            self.log.warn(&format!(
+                "shallow: the local folder of {:?} is empty but {tracked_files} file(s) are on \
+                 record; syncing without deletions (unmounted drive?)",
+                pair.name,
+            ));
+            self.emit(SyncEvent::Error {
+                pair: Some(pair.name.clone()),
+                text: "local folder is empty — synced without deletions (unmounted drive?)".into(),
+            });
+        }
 
         // REMOTE direct children (single non-recursive listing). A transport
         // error means we can't see the folder — suppress deletes this run rather
@@ -2351,6 +2512,22 @@ impl<'a, R: Remote> Engine<'a, R> {
     }
 }
 
+/// Say, in the log and to the frontends, that a pair was pointed at other
+/// folders and its old record discarded (a no-op when it was not).
+fn note_pair_moved(
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    pair: &Pair,
+    moved: Option<crate::state::PairMoved>,
+) {
+    let Some(m) = moved else { return };
+    let text = m.describe(&pair.name);
+    log.warn(&text);
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::Info { text });
+    }
+}
+
 /// Mark the op just added to `plan` as the one that settles a conflict.
 fn settle_last(plan: &mut Plan, resolution: ConflictResolution) {
     if let Some(op) = plan.ops.last_mut() {
@@ -2403,6 +2580,37 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 // --- free helpers -----------------------------------------------------------
+/// The first symlink among the folders `rel` passes through below `root` (the
+/// last component included), if any. `root` itself may be a symlink - a user can
+/// keep their sync folder anywhere - but nothing inside it is followed.
+fn symlink_in_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        cur.push(comp);
+        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(cur);
+        }
+    }
+    None
+}
+
+/// [`safe_join`] for a path something is about to be written to: also refuses
+/// one whose parent folders include a symlink, which would land the write
+/// wherever the link points - outside the sync root. (The last component may be
+/// a link: moving a file over it replaces the link, not what it points at.)
+fn safe_join_to_write(root: &Path, rel: &str) -> Result<PathBuf> {
+    let full = safe_join(root, rel)?;
+    if let Some((parent, _)) = rel.rsplit_once('/') {
+        if let Some(link) = symlink_in_path(root, parent) {
+            anyhow::bail!(
+                "refusing to write {rel:?}: {} is a symlink and may lead outside the sync root",
+                link.display()
+            );
+        }
+    }
+    Ok(full)
+}
+
 fn classify(
     current: &BTreeMap<String, Entry>,
     base: &BTreeMap<String, Entry>,
@@ -2636,10 +2844,48 @@ fn sha1_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_next_at, safe_join};
+    use super::{backoff_next_at, safe_join, safe_join_to_write, symlink_in_path};
     use crate::config::{Config, ConflictPolicy, LocalDelete, UpdateChannel};
     use crate::models::Compare;
     use std::path::Path;
+
+    #[test]
+    fn writes_are_refused_through_a_symlink_but_not_onto_one_or_under_a_linked_root() {
+        let base = std::env::temp_dir().join(format!(
+            "protondrive4linux-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = base.join("real");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("link")).unwrap();
+        std::os::unix::fs::symlink(real.join("sub"), real.join("sublink")).unwrap();
+
+        // Through a link: refused, however deep.
+        assert!(safe_join_to_write(&real, "link/a.txt").is_err());
+        assert!(safe_join_to_write(&real, "link/x/y/a.txt").is_err());
+        assert_eq!(symlink_in_path(&real, "link/x"), Some(real.join("link")));
+        // Onto a link (the last component) is how a file replaces one: allowed.
+        assert!(safe_join_to_write(&real, "link").is_ok());
+        assert!(safe_join_to_write(&real, "sublink").is_ok());
+        // Ordinary paths, including ones that do not exist yet.
+        assert!(safe_join_to_write(&real, "sub/a.txt").is_ok());
+        assert!(safe_join_to_write(&real, "new/dir/a.txt").is_ok());
+        assert_eq!(symlink_in_path(&real, "sub/a.txt"), None);
+        // The root itself may be a link (the sync folder can live anywhere).
+        let linked_root = base.join("linked-root");
+        std::os::unix::fs::symlink(&real, &linked_root).unwrap();
+        assert!(safe_join_to_write(&linked_root, "sub/a.txt").is_ok());
+        assert!(safe_join_to_write(&linked_root, "link/a.txt").is_err());
+        // The escapes `safe_join` already refuses still are.
+        assert!(safe_join_to_write(&real, "../etc/passwd").is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn safe_join_allows_nested_but_rejects_escapes() {
