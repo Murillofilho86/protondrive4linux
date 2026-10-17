@@ -749,3 +749,378 @@ fn an_unchanged_pair_keeps_its_baseline_across_runs() {
     let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
     assert_eq!(keys, ["/my-files/docs/b.txt"], "{keys:?}");
 }
+
+// --- same size is not same content ---------------------------------------------------
+
+/// Both sides edit `a.txt` to different content of the SAME size, at different
+/// times. `remote_sha1`: whether the remote lists a content digest.
+fn dual_edit_same_size(remote_sha1: bool) -> (Tmp, std::rc::Rc<std::cell::RefCell<Store>>) {
+    let t = Tmp::new(if remote_sha1 {
+        "same-size-sha"
+    } else {
+        "same-size"
+    });
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    store.borrow_mut().report_sha1 = remote_sha1;
+    write(&t.path().join("local/a.txt"), "AAAA");
+    set_local_mtime(&t.path().join("local/a.txt"), 1_000_000);
+    run(&c, fake, false);
+    // the remote lists the baseline's modification time
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000_000);
+    write(&t.path().join("local/a.txt"), "LLLL");
+    set_local_mtime(&t.path().join("local/a.txt"), 1_000_100);
+    store
+        .borrow_mut()
+        .files
+        .insert("/my-files/docs/a.txt".into(), b"RRRR".to_vec());
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000_200);
+    (t, store)
+}
+
+#[test]
+fn two_different_edits_of_the_same_size_are_a_conflict_not_metadata_drift() {
+    // "Same size, different mtime" used to be taken for drift: the baseline was
+    // refreshed to the local file and nothing was done - and on the next run the
+    // remote's mtime no longer matched the baseline, so it was downloaded over
+    // the local file. The local edit was gone from both sides.
+    for remote_sha1 in [false, true] {
+        let (t, store) = dual_edit_same_size(remote_sha1);
+        let c = cfg(t.path());
+        for i in 0..3 {
+            let (f, _s) = reuse(&store);
+            run(&c, f, false);
+            let all = everything(&t, &store);
+            assert!(
+                all.iter().any(|b| b == "LLLL"),
+                "sha1={remote_sha1} run {i}: the local edit is gone everywhere: {all:?}"
+            );
+            assert!(
+                all.iter().any(|b| b == "RRRR"),
+                "sha1={remote_sha1} run {i}: the remote edit is gone everywhere: {all:?}"
+            );
+        }
+        // and it settles: one conflict copy, nothing multiplying
+        let conflicts = local_names(&t)
+            .into_iter()
+            .filter(|n| n.contains("conflict"))
+            .count();
+        assert_eq!(conflicts, 1, "sha1={remote_sha1}: {:?}", local_names(&t));
+    }
+}
+
+#[test]
+fn the_same_content_with_drifted_times_is_not_a_conflict_when_the_digest_proves_it() {
+    // Both sides touched, nothing changed: with the remote's SHA-1 to hand the
+    // two are provably the same file, so no conflict copy is made.
+    let t = Tmp::new("same-size-drift");
+    let c = cfg(t.path());
+    let (fake, store) = FakeRemote::new();
+    store.borrow_mut().report_sha1 = true;
+    write(&t.path().join("local/a.txt"), "SAME");
+    set_local_mtime(&t.path().join("local/a.txt"), 1_000_000);
+    run(&c, fake, false);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000_000);
+    // both sides are "touched": new times, identical bytes
+    set_local_mtime(&t.path().join("local/a.txt"), 1_000_100);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000_200);
+    for _ in 0..3 {
+        let (f, _s) = reuse(&store);
+        run(&c, f, false);
+    }
+    assert_eq!(local_names(&t), ["a.txt"], "a needless conflict copy");
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/a.txt")).unwrap(),
+        "SAME"
+    );
+}
+
+#[test]
+fn files_made_independently_on_both_sides_with_equal_sizes_are_both_kept() {
+    // The first sync of a folder that already exists on both sides: two
+    // different `notes.txt` of the same length. One was silently replaced by the
+    // other.
+    for remote_sha1 in [false, true] {
+        let t = Tmp::new("first-sync-same-size");
+        let c = cfg(t.path());
+        let (fake, store) = FakeRemote::new();
+        store.borrow_mut().report_sha1 = remote_sha1;
+        write(&t.path().join("local/notes.txt"), "LLLL");
+        set_local_mtime(&t.path().join("local/notes.txt"), 1_000_100);
+        store
+            .borrow_mut()
+            .files
+            .insert("/my-files/docs/notes.txt".into(), b"RRRR".to_vec());
+        store
+            .borrow_mut()
+            .mtimes
+            .insert("/my-files/docs/notes.txt".into(), 1_000_200);
+        run(&c, fake, false);
+        for i in 0..3 {
+            let (f, _s) = reuse(&store);
+            run(&c, f, false);
+            let all = everything(&t, &store);
+            assert!(
+                all.iter().any(|b| b == "LLLL"),
+                "sha1={remote_sha1} run {i}: LLLL lost: {all:?}"
+            );
+            assert!(
+                all.iter().any(|b| b == "RRRR"),
+                "sha1={remote_sha1} run {i}: RRRR lost: {all:?}"
+            );
+        }
+    }
+}
+
+// --- deleting a folder must not take what never synced with it -------------------
+
+#[test]
+fn a_folder_removed_remotely_keeps_local_files_that_never_synced() {
+    // The folder goes (propagated from the remote), but a file made here after the
+    // last sync - whose upload then fails - lives in it. `local_delete = remove`
+    // unlinks without a trash to recover from.
+    for walk in ["batch", "streaming"] {
+        let t = Tmp::new("dir-delete-local");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        c.local_delete = neutronsync::config::LocalDelete::Remove;
+        let (fake, store) = FakeRemote::new();
+        write(&t.path().join("local/sub/old.txt"), "old");
+        run(&c, fake, false);
+        {
+            let mut s = store.borrow_mut();
+            s.files.remove("/my-files/docs/sub/old.txt");
+            s.dirs.remove("/my-files/docs/sub");
+            s.fail_upload = Some("/my-files/docs/sub/new.txt".into());
+        }
+        write(
+            &t.path().join("local/sub/new.txt"),
+            "brand new, never synced",
+        );
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            let _ = try_run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        assert!(
+            t.path().join("local/sub/new.txt").exists(),
+            "{walk}: a never-synced local file was deleted along with the remotely removed folder"
+        );
+        // Once the upload can work again the file reaches the remote - by the
+        // same kind of walk, which has to go into the folder that was kept.
+        store.borrow_mut().fail_upload = None;
+        clear_retry_backoff(&c, "docs");
+        for _ in 0..2 {
+            let (f, _s) = reuse(&store);
+            if walk == "batch" {
+                run(&c, f, false);
+            } else {
+                run_streaming(&c, f);
+            }
+        }
+        assert_eq!(
+            store
+                .borrow()
+                .files
+                .get("/my-files/docs/sub/new.txt")
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .as_deref(),
+            Some("brand new, never synced"),
+            "{walk}"
+        );
+        assert!(t.path().join("local/sub/new.txt").exists(), "{walk}");
+    }
+}
+
+#[test]
+fn a_folder_removed_remotely_keeps_a_local_file_edited_since_the_last_sync() {
+    let t = Tmp::new("dir-delete-edited");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    c.local_delete = neutronsync::config::LocalDelete::Remove;
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/sub/doc.txt"), "v1");
+    run(&c, fake, false);
+    {
+        let mut s = store.borrow_mut();
+        s.files.remove("/my-files/docs/sub/doc.txt");
+        s.dirs.remove("/my-files/docs/sub");
+    }
+    write(&t.path().join("local/sub/doc.txt"), "v2, edited here since");
+    let (f, _s) = reuse(&store);
+    run_streaming(&c, f);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/sub/doc.txt")).unwrap(),
+        "v2, edited here since"
+    );
+}
+
+#[test]
+fn a_folder_removed_remotely_is_still_removed_when_nothing_in_it_is_new() {
+    // The guard must not make deleting folders impossible.
+    for walk in ["batch", "streaming"] {
+        let t = Tmp::new("dir-delete-clean");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        c.local_delete = neutronsync::config::LocalDelete::Remove;
+        let (fake, store) = FakeRemote::new();
+        write(&t.path().join("local/keep.txt"), "keep");
+        write(&t.path().join("local/sub/old.txt"), "old");
+        write(&t.path().join("local/sub/deeper/x.txt"), "x");
+        run(&c, fake, false);
+        {
+            let mut s = store.borrow_mut();
+            s.files.retain(|k, _| !k.contains("/sub/"));
+            s.dirs.retain(|d| !d.contains("/sub"));
+        }
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        assert!(!t.path().join("local/sub").exists(), "{walk}: not removed");
+        assert!(t.path().join("local/keep.txt").exists());
+    }
+}
+
+#[test]
+fn a_folder_removed_locally_keeps_remote_files_this_machine_never_saw() {
+    for walk in ["batch", "streaming"] {
+        let t = Tmp::new("dir-delete-remote");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        let (fake, store) = FakeRemote::new();
+        write(&t.path().join("local/sub/old.txt"), "old");
+        run(&c, fake, false);
+        // another device adds a file in the folder; this machine removes the folder
+        store.borrow_mut().files.insert(
+            "/my-files/docs/sub/from-phone.txt".into(),
+            b"photo".to_vec(),
+        );
+        std::fs::remove_dir_all(t.path().join("local/sub")).unwrap();
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        assert!(
+            store
+                .borrow()
+                .files
+                .contains_key("/my-files/docs/sub/from-phone.txt"),
+            "{walk}: a remote file this machine never saw was trashed with the folder"
+        );
+        // The folder stays for now; the next runs settle what is in it: the file
+        // this machine knew (and the user deleted) goes, the new one comes down.
+        for _ in 0..2 {
+            let (f, _s) = reuse(&store);
+            run(&c, f, false);
+        }
+        let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["/my-files/docs/sub/from-phone.txt"],
+            "{walk}: {keys:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(t.path().join("local/sub/from-phone.txt")).unwrap(),
+            "photo",
+            "{walk}"
+        );
+    }
+}
+
+#[test]
+fn a_folder_removed_locally_is_still_removed_remotely_when_nothing_in_it_is_new() {
+    for walk in ["batch", "streaming"] {
+        let t = Tmp::new("dir-delete-remote-clean");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        let (fake, store) = FakeRemote::new();
+        write(&t.path().join("local/keep.txt"), "keep");
+        write(&t.path().join("local/sub/old.txt"), "old");
+        write(&t.path().join("local/sub/deeper/x.txt"), "x");
+        run(&c, fake, false);
+        std::fs::remove_dir_all(t.path().join("local/sub")).unwrap();
+        let (f, _s) = reuse(&store);
+        if walk == "batch" {
+            run(&c, f, false);
+        } else {
+            run_streaming(&c, f);
+        }
+        let keys: Vec<String> = store.borrow().files.keys().cloned().collect();
+        assert_eq!(keys, ["/my-files/docs/keep.txt"], "{walk}: {keys:?}");
+    }
+}
+
+// --- renames ---------------------------------------------------------------------
+
+#[test]
+fn a_new_file_with_the_size_and_time_of_a_deleted_one_is_not_a_rename() {
+    // delete a.bin, create b.bin: the same size and the same (whole-second)
+    // modification time - a build output, a batch of files extracted together -
+    // looked like a move. The remote then renamed the OLD content to b.bin and the
+    // new content was never uploaded.
+    for remote_sha1 in [true, false] {
+        let t = Tmp::new("rename-false");
+        let mut c = cfg(t.path());
+        c.propagate_deletes = true;
+        let (fake, store) = FakeRemote::new();
+        store.borrow_mut().report_sha1 = remote_sha1;
+        write(&t.path().join("local/a.bin"), "AAAAAAAA");
+        set_local_mtime(&t.path().join("local/a.bin"), 1_000_000);
+        run(&c, fake, false);
+        std::fs::remove_file(t.path().join("local/a.bin")).unwrap();
+        write(&t.path().join("local/b.bin"), "BBBBBBBB");
+        set_local_mtime(&t.path().join("local/b.bin"), 1_000_000);
+        let (f, _s) = reuse(&store);
+        run(&c, f, false);
+        let rf = remote_files(&store);
+        // With the remote's digest the claim is checked and refused. Without
+        // one, nothing can tell the two apart and the old behaviour stands.
+        if remote_sha1 {
+            assert_eq!(
+                rf.get("/my-files/docs/b.bin").map(String::as_str),
+                Some("BBBBBBBB"),
+                "b.bin's real content never reached the remote: {rf:?}"
+            );
+            assert_eq!(store.borrow().moves, 0, "it was taken for a rename");
+        }
+    }
+}
+
+#[test]
+fn a_real_rename_is_still_a_move_even_with_digests() {
+    let t = Tmp::new("rename-true");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    store.borrow_mut().report_sha1 = true;
+    write(&t.path().join("local/a.txt"), "hello world");
+    run(&c, fake, false);
+    std::fs::rename(t.path().join("local/a.txt"), t.path().join("local/b.txt")).unwrap();
+    let (f, _s) = reuse(&store);
+    run(&c, f, false);
+    let rf = remote_files(&store);
+    assert_eq!(
+        rf.get("/my-files/docs/b.txt").map(String::as_str),
+        Some("hello world")
+    );
+    assert!(!rf.contains_key("/my-files/docs/a.txt"));
+    assert_eq!(store.borrow().moves, 1, "should have been a move");
+}

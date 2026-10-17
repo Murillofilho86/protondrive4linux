@@ -175,8 +175,19 @@ fn cmd_upload(root: &Path, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match fs::copy(local_path, dest_dir.join(name)) {
-        Ok(_) => ExitCode::SUCCESS,
+    let dest = dest_dir.join(name);
+    match fs::copy(local_path, &dest) {
+        Ok(_) => {
+            // The real CLI stores the file's own modification time as the node's
+            // `claimedModificationTime`, so both sides list the same time for a
+            // file that was just uploaded; a copy would list "now".
+            if let Ok(mtime) = fs::metadata(local_path).and_then(|m| m.modified()) {
+                if let Ok(f) = fs::OpenOptions::new().write(true).open(&dest) {
+                    let _ = f.set_modified(mtime);
+                }
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
