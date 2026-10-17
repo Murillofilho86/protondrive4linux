@@ -113,6 +113,10 @@ fn is_content_change(kind: &notify_debouncer_full::notify::EventKind) -> bool {
     }
 }
 
+/// Name, inside the state dir, of the watcher's lock file (`doctor` reads it to
+/// tell whether a watcher is running).
+pub const LOCK_FILE: &str = "watch.lock";
+
 /// Single-instance lock so a watch daemon and, say, a systemd timer don't run
 /// the same pairs at once. Advisory: a PID file, checked against /proc.
 struct DaemonLock {
@@ -122,7 +126,7 @@ struct DaemonLock {
 impl DaemonLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)?;
-        let path = state_dir.join("watch.lock");
+        let path = state_dir.join(LOCK_FILE);
         // Atomic fast path: create_new (O_CREAT|O_EXCL) can't race with
         // another process doing the same, unlike a separate read-then-write -
         // two things starting at the same instant (a systemd timer and a

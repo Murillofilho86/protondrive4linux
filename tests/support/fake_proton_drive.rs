@@ -13,6 +13,12 @@
 //!   reliably send a signal to the parent while this call is in flight.
 //! - `FAKE_CLI_CRASH`: if set, exit 1 immediately instead of doing the
 //!   requested operation (simulates the CLI itself dying/erroring).
+//!
+//! Two more support `tests/doctor.rs`:
+//! - `FAKE_CLI_SIGNED_OUT`: if set, every command but `version` fails the way
+//!   the real CLI does when there is no session ("you need to login first").
+//! - `FAKE_CLI_VERSION`: the line `version` prints (default `fake-cli-drive
+//!   0.0.0-test`), to test how a CLI version is judged.
 
 use std::env;
 use std::fs;
@@ -228,8 +234,16 @@ fn main() -> ExitCode {
     };
 
     if cmd == "version" {
-        println!("fake-cli-drive 0.0.0-test");
+        println!(
+            "{}",
+            env::var("FAKE_CLI_VERSION").unwrap_or_else(|_| "fake-cli-drive 0.0.0-test".into())
+        );
         return ExitCode::SUCCESS;
+    }
+
+    if env::var("FAKE_CLI_SIGNED_OUT").is_ok() {
+        eprintln!("Error: you need to login first");
+        return ExitCode::FAILURE;
     }
 
     if cmd == "filesystem" {

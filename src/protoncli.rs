@@ -432,8 +432,17 @@ impl ProtonCli {
         Ok(())
     }
 
+    /// The CLI's untouched `filesystem list -j` output for `remote_path`, for
+    /// `doctor --probe`. A failure is returned with the CLI's own message rather
+    /// than as empty output: the point of the probe is to see what the CLI said.
     pub fn raw_list(&self, remote_path: &str) -> Result<String> {
-        let (_, out, _) = self.run(&["filesystem", "list", "-j", remote_path])?;
+        let (ok, out, err) = self.run(&["filesystem", "list", "-j", "--", remote_path])?;
+        if !ok {
+            bail!(
+                "list failed for {remote_path:?}: {}",
+                first_nonempty(&err, &out)
+            );
+        }
         Ok(out)
     }
 
@@ -446,7 +455,7 @@ impl ProtonCli {
         let payload: Value = serde_json::from_str(stdout).with_context(|| {
             format!(
                 "could not parse JSON from `filesystem list -j {remote_path}`; \
-                 run `protondrive4linux doctor` and adjust protoncli.rs"
+                 run `protondrive4linux doctor --probe` and adjust protoncli.rs"
             )
         })?;
         let rows = rows(&payload);
@@ -902,7 +911,42 @@ pub fn is_not_logged_in(s: &str) -> bool {
         // The keyring/secret-service is unreachable (locked, headless, no D-Bus):
         // the CLI has no session, which for us means "not signed in", NOT "node
         // not found" (the message ends in "No such file or directory").
-        || s.contains("failed to load session")
+        || s.contains(SESSION_LOAD_FAILED)
+}
+
+/// What the CLI says when it can't load its session at all.
+const SESSION_LOAD_FAILED: &str = "failed to load session";
+
+/// Whether an error is the CLI failing to reach its secret store (keyring
+/// locked, no D-Bus session, a headless box) rather than the user simply never
+/// having signed in. Both read as "not signed in" to the app, but the fix is
+/// different - signing in again won't help while the keyring is out of reach -
+/// so `doctor` says which.
+pub fn is_secret_store_unreachable(s: &str) -> bool {
+    s.to_ascii_lowercase().contains(SESSION_LOAD_FAILED)
+}
+
+/// The oldest `proton-drive` CLI this build is verified against. 0.8.0 is where
+/// `--conflict-strategy` was split into the `--file-conflict-strategy` /
+/// `--folder-conflict-strategy` pair every upload and download here passes, and
+/// where the `filesystem list -j` output changed shape.
+pub const MIN_CLI_VERSION: (u32, u32, u32) = (0, 8, 0);
+
+/// The first `major.minor[.patch]` number in the CLI's `version` output, e.g.
+/// `(0, 8, 0)` for "cli-drive 0.8.0" or "proton-drive v0.8.1-beta". `None` when
+/// there isn't one - the caller then shows the raw text and doesn't judge it,
+/// since refusing a CLI because its banner changed shape would be worse than
+/// not checking.
+pub fn parse_cli_version(s: &str) -> Option<(u32, u32, u32)> {
+    s.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter_map(|token| {
+            let mut parts = token.trim_matches('.').split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            Some((major, minor, patch))
+        })
+        .next()
 }
 
 // --- process/env helpers ----------------------------------------------------
@@ -1267,6 +1311,52 @@ mod tests {
         assert!(!is_not_logged_in("upload /x failed: connection reset"));
         assert!(!is_not_logged_in("rate limited, try again"));
         assert!(!is_not_logged_in(""));
+    }
+
+    #[test]
+    fn tells_an_unreachable_secret_store_from_a_plain_logout() {
+        let keyring = "Failed to load session from secrets (ensure you have secrets \
+                       available): Could not connect: No such file or directory (code: 1)";
+        assert!(super::is_secret_store_unreachable(keyring));
+        assert!(
+            super::is_not_logged_in(keyring),
+            "it is still a sign-in problem"
+        );
+        assert!(!super::is_secret_store_unreachable(
+            "You need to login first"
+        ));
+        assert!(!super::is_secret_store_unreachable(""));
+    }
+
+    #[test]
+    fn reads_the_version_out_of_whatever_banner_the_cli_prints() {
+        use super::parse_cli_version as v;
+        assert_eq!(v("cli-drive 0.8.0"), Some((0, 8, 0)));
+        assert_eq!(v("proton-drive v0.8.1-beta"), Some((0, 8, 1)));
+        assert_eq!(v("fake-cli-drive 0.0.0-test"), Some((0, 0, 0)));
+        assert_eq!(v("1.12"), Some((1, 12, 0)), "a missing patch is zero");
+        assert_eq!(
+            v("0.7.3\nbuilt 2025.01.02"),
+            Some((0, 7, 3)),
+            "the first one wins"
+        );
+        // Nothing version-shaped: don't guess.
+        assert_eq!(v(""), None);
+        assert_eq!(v("proton-drive"), None);
+        assert_eq!(v("build 20250102"), None, "a bare number is not a version");
+        assert_eq!(v("..."), None);
+    }
+
+    #[test]
+    fn the_minimum_cli_version_orders_as_expected() {
+        use super::{parse_cli_version as v, MIN_CLI_VERSION as MIN};
+        assert!(v("0.7.9").unwrap() < MIN);
+        assert!(v("0.8.0").unwrap() >= MIN);
+        assert!(
+            v("0.10.0").unwrap() >= MIN,
+            "numeric, not lexical, comparison"
+        );
+        assert!(v("1.0.0").unwrap() >= MIN);
     }
 
     #[test]
