@@ -2474,8 +2474,9 @@ impl App {
                     if setting_row(
                         ui,
                         "Desktop notifications",
-                        "Tell me when a file conflicts, a sync problem lasts, or I get \
-                         signed out. Sent by the tray, so it needs \"Run in system tray\".",
+                        "Tell me when a file conflicts, a sync problem lasts, I get \
+                         signed out, or background sync stops for good. Sent by the tray, \
+                         so it needs \"Run in system tray\".",
                         |ui| switch(ui, notes),
                     ) {
                         self.cfg.notifications = !notes;
@@ -4737,7 +4738,18 @@ mod supervisor {
             log_dir: cfg.log_dir(),
         };
         match tray_policy::supervise(&mut real) {
-            Outcome::TooManyRestarts => 1,
+            Outcome::TooManyRestarts => {
+                // The one moment nothing else says that sync is no longer running
+                // (the sync log has the reason, but nobody is reading it). Waits for
+                // the notification to be handed over: we are about to exit.
+                neutronsync::notify::announce_give_up(
+                    &cfg.state_dir,
+                    cfg.notifications,
+                    neutronsync::datefmt::now_epoch(),
+                    |n| neutronsync::notify::send_within(n, Duration::from_secs(3)),
+                );
+                1
+            }
             Outcome::Quit | Outcome::Stopped | Outcome::SessionGone => 0,
         }
     }

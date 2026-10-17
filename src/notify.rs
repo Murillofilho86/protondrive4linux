@@ -15,9 +15,13 @@
 //!   last notice stay quiet;
 //! - conflicts arriving together are batched into one notice, and notices are at
 //!   least [`CONFLICT_COOLDOWN_SECS`] apart (the rest wait and join the next);
-//! - a signed-out session notifies on the transition into it, not while it lasts.
+//! - a signed-out session notifies on the transition into it, not while it lasts;
+//! - the tray supervisor giving up on a tray that keeps dying notifies at most
+//!   once an hour ([`announce_give_up`]).
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::events::ConflictResolution;
 use crate::service::OverallStatus;
@@ -37,6 +41,8 @@ pub enum NoticeKind {
     Conflict,
     Error,
     SignedOut,
+    /// The tray supervisor stopped restarting a tray that keeps failing.
+    BackgroundSyncStopped,
 }
 
 /// What to show: a one-line summary and a short body.
@@ -182,6 +188,74 @@ fn conflict_notice(batch: &[ConflictRecord]) -> Notification {
         summary: format!("{} files conflicted", batch.len()),
         body: lines.join("\n"),
     }
+}
+
+/// Minimum gap between two "background sync stopped" notices.
+pub const GIVE_UP_COOLDOWN_SECS: i64 = 3600;
+
+/// File in the state folder holding when the last such notice was shown.
+pub const GIVE_UP_MARKER: &str = "tray-gave-up";
+
+/// What the user is told when the tray supervisor gives up. It names the way back
+/// (opening the app starts background sync again) and where the reason is.
+pub fn background_sync_stopped_notice() -> Notification {
+    Notification {
+        kind: NoticeKind::BackgroundSyncStopped,
+        summary: "Background sync stopped".into(),
+        body: "The tray kept failing, so protondrive4linux stopped restarting it. \
+               Open the app to try again; the sync log has the reason."
+            .into(),
+    }
+}
+
+/// Tell the user the tray supervisor gave up restarting the tray: the one moment
+/// nothing else says that sync is no longer running. At most once per
+/// [`GIVE_UP_COOLDOWN_SECS`] (so reopening the app and failing again doesn't
+/// nag), and only if notifications are `enabled`. `deliver` shows the notice and
+/// says whether it was shown; the time is recorded only when it was, so a
+/// desktop with no notification daemon at that moment is tried again next time.
+/// Returns whether a notice was shown.
+pub fn announce_give_up(
+    state_dir: &Path,
+    enabled: bool,
+    now: i64,
+    deliver: impl FnOnce(&Notification) -> bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    let marker = state_dir.join(GIVE_UP_MARKER);
+    let last: Option<i64> = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    // Quiet only while the last notice is recent; one stamped in the future (a
+    // clock that went backwards) must not silence this for hours.
+    if last.is_some_and(|t| (0..GIVE_UP_COOLDOWN_SECS).contains(&(now - t))) {
+        return false;
+    }
+    if !deliver(&background_sync_stopped_notice()) {
+        return false;
+    }
+    let _ = std::fs::write(&marker, now.to_string());
+    true
+}
+
+/// Run `f` on its own thread and wait at most `timeout` for it; `false` if it
+/// said so or didn't finish in time (the thread is left to finish on its own).
+fn run_within(timeout: Duration, f: impl FnOnce() -> bool + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).unwrap_or(false)
+}
+
+/// [`send`], but waiting for it (up to `timeout`) and saying whether the notice
+/// was handed over - for a process that is about to exit, where [`send_async`]'s
+/// detached thread would be killed before it could send anything.
+pub fn send_within(n: &Notification, timeout: Duration) -> bool {
+    let n = n.clone();
+    run_within(timeout, move || send(&n).is_ok())
 }
 
 /// Show `n` through the desktop's notification daemon.
@@ -568,5 +642,120 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].summary, "Conflict: b.txt");
+    }
+
+    // --- the supervisor giving up ----------------------------------------------
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-notify-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_give_up_notice_says_what_stopped_and_how_to_get_it_back() {
+        let n = background_sync_stopped_notice();
+        assert_eq!(n.kind, NoticeKind::BackgroundSyncStopped);
+        assert_eq!(n.summary, "Background sync stopped");
+        assert!(n.body.contains("Open the app to try again"), "{}", n.body);
+        assert!(n.body.contains("sync log"), "{}", n.body);
+    }
+
+    #[test]
+    fn a_give_up_is_announced_once_an_hour_and_only_when_notifications_are_on() {
+        let dir = temp_dir("giveup");
+        let shown = std::cell::Cell::new(0);
+        let deliver = |_: &Notification| {
+            shown.set(shown.get() + 1);
+            true
+        };
+
+        // Switched off: nothing is shown and nothing is recorded.
+        assert!(!announce_give_up(&dir, false, 1_000, deliver));
+        assert_eq!(shown.get(), 0);
+        assert!(!dir.join(GIVE_UP_MARKER).exists());
+
+        assert!(announce_give_up(&dir, true, 1_000, deliver));
+        assert_eq!(shown.get(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(GIVE_UP_MARKER)).unwrap(),
+            "1000"
+        );
+
+        // Failing again soon after (the app was reopened and the tray died
+        // again) stays quiet, right up to the end of the hour.
+        assert!(!announce_give_up(&dir, true, 1_000 + 60, deliver));
+        assert!(!announce_give_up(
+            &dir,
+            true,
+            1_000 + GIVE_UP_COOLDOWN_SECS - 1,
+            deliver
+        ));
+        assert_eq!(shown.get(), 1);
+
+        // After the hour it speaks again, and the clock restarts from there.
+        assert!(announce_give_up(
+            &dir,
+            true,
+            1_000 + GIVE_UP_COOLDOWN_SECS,
+            deliver
+        ));
+        assert_eq!(shown.get(), 2);
+        assert!(!announce_give_up(
+            &dir,
+            true,
+            1_000 + GIVE_UP_COOLDOWN_SECS + 1,
+            deliver
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_notice_that_could_not_be_shown_is_not_counted_so_the_next_give_up_tries_again() {
+        let dir = temp_dir("giveup-undelivered");
+        assert!(!announce_give_up(&dir, true, 5_000, |_| false));
+        assert!(
+            !dir.join(GIVE_UP_MARKER).exists(),
+            "nothing was shown, nothing recorded"
+        );
+        assert!(announce_give_up(&dir, true, 5_001, |_| true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_marker_from_the_future_or_gibberish_does_not_silence_it() {
+        let dir = temp_dir("giveup-marker");
+        // A clock that went backwards since the last notice.
+        std::fs::write(dir.join(GIVE_UP_MARKER), "999999999").unwrap();
+        assert!(announce_give_up(&dir, true, 1_000, |_| true));
+        std::fs::write(dir.join(GIVE_UP_MARKER), "not a time").unwrap();
+        assert!(announce_give_up(&dir, true, 1_000, |_| true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn waiting_for_a_notice_is_bounded_and_reports_what_happened() {
+        assert!(run_within(Duration::from_secs(5), || true));
+        assert!(!run_within(Duration::from_secs(5), || false));
+        // A notification daemon that never answers must not hold up an exiting
+        // supervisor.
+        let started = std::time::Instant::now();
+        let slow = run_within(Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_secs(3));
+            true
+        });
+        assert!(!slow);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
