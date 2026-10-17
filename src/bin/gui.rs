@@ -21,8 +21,10 @@ use eframe::egui::{
 use neutronsync::config::{
     self, Config, ConflictPolicy, LocalDelete, Pair, ThemePref, UpdateChannel,
 };
+use neutronsync::datefmt::counted;
 use neutronsync::events::ConflictResolution;
 use neutronsync::models::{Compare, Entry};
+use neutronsync::process_lock::{self, ProcessLock};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
     ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
@@ -574,70 +576,23 @@ fn tray_status_icons() -> Vec<(OverallStatus, tray_icon::Icon)> {
 // single-instance locks + process spawning (daemon <-> window coordination)
 // ---------------------------------------------------------------------------
 
-/// Advisory PID lock: a file under `state_dir` holding a PID, cross-checked
-/// against `/proc`. Removed on drop. Used so at most one daemon and one window
-/// run at a time.
-struct PidLock {
-    path: PathBuf,
-}
-
-impl PidLock {
-    /// Try to take the lock. Returns `None` if a live process already holds it.
-    fn acquire(state_dir: &std::path::Path, name: &str) -> Option<Self> {
-        let _ = std::fs::create_dir_all(state_dir);
-        let path = state_dir.join(name);
-        // Atomic fast path first (see watcher.rs's DaemonLock for why a plain
-        // check-then-write can't be trusted when two processes might start at
-        // the same instant).
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = f.write_all(std::process::id().to_string().as_bytes());
-            return Some(PidLock { path });
-        }
-        if pid_alive_from(&path) {
-            return None;
-        }
-        std::fs::write(&path, std::process::id().to_string()).ok()?;
-        Some(PidLock { path })
-    }
-}
-
-impl Drop for PidLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Last-modified time of a file, if it exists (used to detect config changes).
 fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Whether the PID recorded in `lock` names a currently-running process.
-fn pid_alive_from(lock: &std::path::Path) -> bool {
-    if let Ok(s) = std::fs::read_to_string(lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            return std::path::Path::new(&format!("/proc/{pid}")).exists();
-        }
-    }
-    false
-}
-
 const DAEMON_LOCK: &str = "tray-daemon.lock";
 const WINDOW_LOCK: &str = "window.lock";
 
-/// Is a headless tray daemon already running for this state dir?
+/// Is a headless tray daemon already running for this state dir? (Asks the lock
+/// who holds it - a live process, not merely a pid that still exists.)
 fn daemon_running(state_dir: &std::path::Path) -> bool {
-    pid_alive_from(&state_dir.join(DAEMON_LOCK))
+    process_lock::holder(&state_dir.join(DAEMON_LOCK)).is_some()
 }
 
 /// Is a GUI window already open for this state dir?
 fn window_running(state_dir: &std::path::Path) -> bool {
-    pid_alive_from(&state_dir.join(WINDOW_LOCK))
+    process_lock::holder(&state_dir.join(WINDOW_LOCK)).is_some()
 }
 
 /// Path of our own executable (falls back to the on-PATH name).
@@ -684,16 +639,14 @@ fn spawn_daemon() {
 /// exit path (closing the window alone still leaves the tray syncing). A killed
 /// window can't corrupt state: the baseline is only committed at the end of a
 /// completed sync, so an aborted transfer is simply retried next run.
+///
+/// Only the process the lock really names is signalled: a leftover `window.lock`
+/// whose pid has since gone to some other program must never get a SIGTERM.
 fn terminate_window(state_dir: &std::path::Path) {
-    let lock = state_dir.join(WINDOW_LOCK);
-    if let Ok(s) = std::fs::read_to_string(&lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status();
-            }
-        }
+    if let Some(pid) = process_lock::holder(&state_dir.join(WINDOW_LOCK)) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
     }
 }
 
@@ -766,7 +719,7 @@ struct App {
     // When true (run_in_tray), a headless daemon owns the tray + watcher; this
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
-    _win_lock: Option<PidLock>,
+    _win_lock: Option<ProcessLock>,
 
     // conflict inbox (M1-005): polled from the shared stats DB about once a
     // second, since the background daemon (a separate process) writes to it.
@@ -804,7 +757,7 @@ impl App {
             if !daemon_running(&cfg.state_dir) {
                 spawn_daemon();
             }
-            PidLock::acquire(&cfg.state_dir, WINDOW_LOCK)
+            process_lock::acquire(&cfg.state_dir.join(WINDOW_LOCK)).ok()
         } else {
             None
         };
@@ -1182,7 +1135,10 @@ impl App {
                 }
                 self.toast(
                     ctx,
-                    format!("Moved {n} folder(s) to trash — your Proton copy is untouched."),
+                    format!(
+                        "Moved {} to trash — your Proton copy is untouched.",
+                        counted(n, "folder", "folders")
+                    ),
                     false,
                 );
             }
@@ -1825,7 +1781,11 @@ impl App {
                 th().accent,
                 Icon::Cloud,
                 "Auto sync on",
-                format!("Watching {} folder(s) for changes", self.auto_names().len()),
+                format!(
+                    "Watching {} for changes{}",
+                    counted(self.auto_names().len(), "folder", "folders"),
+                    files_tail(snap)
+                ),
             )
         } else if snap.pairs.iter().any(|p| p.phase == Phase::Error) {
             (
@@ -3206,7 +3166,11 @@ fn current_op_line(snap: &AppState) -> String {
 }
 fn last_synced_line(snap: &AppState) -> String {
     match snap.pairs.iter().filter_map(|p| p.last_synced).max() {
-        Some(ts) => format!("All folders up to date · {}", rel_time(ts)),
+        Some(ts) => format!(
+            "All folders up to date · {}{}",
+            rel_time(ts),
+            files_tail(snap)
+        ),
         None => "Nothing synced yet".to_string(),
     }
 }
@@ -3680,11 +3644,44 @@ fn retrying_total(snap: &AppState) -> usize {
     snap.pairs.iter().map(|p| p.retrying).sum()
 }
 
-fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
+/// How a folder card's status line is coloured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tone {
+    Accent,
+    Danger,
+    Warn,
+    Ok,
+    Dim,
+}
+
+impl Tone {
+    fn color(self) -> Color32 {
+        match self {
+            Tone::Accent => th().accent,
+            Tone::Danger => th().danger,
+            Tone::Warn => th().warn,
+            Tone::Ok => th().ok,
+            Tone::Dim => th().dim,
+        }
+    }
+}
+
+/// The status line of a folder card: what the pair is doing or how it ended,
+/// and - once it has synced - how many files it holds. A pure function of the
+/// pair's state (and the time), so the wording is tested without a window.
+fn pair_status_text(ps: Option<&PairState>, watching: bool, now: i64) -> (Tone, String) {
     let first_run = ps.is_some_and(|p| p.last_synced.is_none());
-    let (col, text) = match ps.map(|p| p.phase) {
+    let files = ps.map_or(0, |p| p.tracked);
+    let with_files = |text: String| {
+        if files > 0 {
+            format!("{text} · {}", counted(files, "file", "files"))
+        } else {
+            text
+        }
+    };
+    match ps.map(|p| p.phase) {
         Some(Phase::Scanning) => (
-            th().accent,
+            Tone::Accent,
             if first_run {
                 "Initializing…"
             } else {
@@ -3692,17 +3689,22 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             }
             .to_string(),
         ),
-        Some(Phase::Syncing) => (
-            th().accent,
-            if first_run {
+        Some(Phase::Syncing) => {
+            let base = if first_run {
                 "Initializing…"
             } else {
                 "Syncing…"
-            }
-            .to_string(),
-        ),
+            };
+            let progress = ps.map(|p| p.progress).unwrap_or_default();
+            let text = if progress.total > 0 {
+                format!("{base} {} of {}", progress.done, progress.total)
+            } else {
+                base.to_string()
+            };
+            (Tone::Accent, text)
+        }
         Some(Phase::Error) => (
-            th().danger,
+            Tone::Danger,
             ps.and_then(|p| p.last_error.clone())
                 .unwrap_or_else(|| "Error".into()),
         ),
@@ -3710,26 +3712,177 @@ fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
             let retrying = ps.map_or(0, |p| p.retrying);
             if retrying > 0 {
                 (
-                    th().warn,
-                    format!(
-                        "{retrying} file{} waiting to retry",
-                        if retrying == 1 { "" } else { "s" }
-                    ),
+                    Tone::Warn,
+                    format!("{} waiting to retry", counted(retrying, "file", "files")),
                 )
             } else if watching {
-                (th().accent, "Auto · watching".to_string())
+                (Tone::Accent, with_files("Auto · watching".to_string()))
             } else {
                 match ps.and_then(|p| p.last_synced) {
-                    Some(ts) => (th().ok, format!("Synced · {}", rel_time(ts))),
-                    None => (th().dim, "Not synced yet".to_string()),
+                    Some(ts) => (
+                        Tone::Ok,
+                        with_files(format!(
+                            "Synced · {}",
+                            neutronsync::datefmt::rel_time(now, ts)
+                        )),
+                    ),
+                    None => (Tone::Dim, "Not synced yet".to_string()),
                 }
             }
         }
-    };
+    }
+}
+
+fn pair_status(ui: &mut egui::Ui, ps: Option<&PairState>, watching: bool) {
+    let (tone, text) = pair_status_text(ps, watching, now_secs());
     ui.horizontal(|ui| {
-        status_dot_small(ui, col);
+        status_dot_small(ui, tone.color());
         ui.label(RichText::new(text).size(12.0).color(th().dim));
     });
+}
+
+/// " · 4,733 files" for the banner lines: every folder's synced files together,
+/// or nothing until the first sync has counted any.
+fn files_tail(snap: &AppState) -> String {
+    let total: usize = snap.pairs.iter().map(|p| p.tracked).sum();
+    if total > 0 {
+        format!(" · {}", counted(total, "file", "files"))
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod status_text_tests {
+    use super::*;
+
+    fn pair(phase: Phase) -> PairState {
+        PairState {
+            name: "docs".into(),
+            local: String::new(),
+            remote: String::new(),
+            phase,
+            progress: neutronsync::service::Progress::default(),
+            scanned_folders: 0,
+            current_op: None,
+            last_error: None,
+            last_synced: Some(10_000 - 300),
+            tracked: 0,
+            retrying: 0,
+        }
+    }
+
+    const NOW: i64 = 10_000;
+
+    #[test]
+    fn a_synced_folder_says_when_and_how_many_files() {
+        let mut p = pair(Phase::Synced);
+        assert_eq!(
+            pair_status_text(Some(&p), false, NOW),
+            (Tone::Ok, "Synced · 5 minutes ago".to_string()),
+            "no count until one has been taken"
+        );
+        p.tracked = 4733;
+        assert_eq!(
+            pair_status_text(Some(&p), false, NOW),
+            (Tone::Ok, "Synced · 5 minutes ago · 4,733 files".to_string())
+        );
+        p.tracked = 1;
+        assert_eq!(
+            pair_status_text(Some(&p), false, NOW).1,
+            "Synced · 5 minutes ago · 1 file"
+        );
+    }
+
+    #[test]
+    fn a_watched_folder_shows_its_file_count_too() {
+        let mut p = pair(Phase::Idle);
+        p.tracked = 120;
+        assert_eq!(
+            pair_status_text(Some(&p), true, NOW),
+            (Tone::Accent, "Auto · watching · 120 files".to_string())
+        );
+        p.tracked = 0;
+        assert_eq!(pair_status_text(Some(&p), true, NOW).1, "Auto · watching");
+    }
+
+    #[test]
+    fn a_syncing_folder_shows_how_far_along_it_is() {
+        let mut p = pair(Phase::Syncing);
+        p.progress = neutronsync::service::Progress {
+            done: 37,
+            total: 120,
+        };
+        assert_eq!(
+            pair_status_text(Some(&p), true, NOW),
+            (Tone::Accent, "Syncing… 37 of 120".to_string())
+        );
+        // Before the plan is known there is nothing to count.
+        p.progress = neutronsync::service::Progress::default();
+        assert_eq!(pair_status_text(Some(&p), true, NOW).1, "Syncing…");
+        // A folder that has never synced is initializing, not syncing.
+        p.last_synced = None;
+        p.progress = neutronsync::service::Progress { done: 3, total: 40 };
+        assert_eq!(
+            pair_status_text(Some(&p), false, NOW).1,
+            "Initializing… 3 of 40"
+        );
+        assert_eq!(
+            pair_status_text(Some(&pair(Phase::Scanning)), false, NOW).1,
+            "Scanning…"
+        );
+    }
+
+    #[test]
+    fn failures_and_retries_come_before_the_count() {
+        let mut p = pair(Phase::Synced);
+        p.tracked = 50;
+        p.retrying = 1;
+        assert_eq!(
+            pair_status_text(Some(&p), true, NOW),
+            (Tone::Warn, "1 file waiting to retry".to_string())
+        );
+        p.retrying = 1200;
+        assert_eq!(
+            pair_status_text(Some(&p), true, NOW).1,
+            "1,200 files waiting to retry"
+        );
+        let mut e = pair(Phase::Error);
+        e.last_error = Some("upload x: nope".into());
+        assert_eq!(
+            pair_status_text(Some(&e), false, NOW),
+            (Tone::Danger, "upload x: nope".to_string())
+        );
+        e.last_error = None;
+        assert_eq!(pair_status_text(Some(&e), false, NOW).1, "Error");
+    }
+
+    #[test]
+    fn a_folder_that_never_synced_says_so() {
+        let mut p = pair(Phase::Idle);
+        p.last_synced = None;
+        assert_eq!(
+            pair_status_text(Some(&p), false, NOW),
+            (Tone::Dim, "Not synced yet".to_string())
+        );
+        assert_eq!(pair_status_text(None, false, NOW).1, "Not synced yet");
+    }
+
+    #[test]
+    fn the_banner_tail_adds_up_every_folder() {
+        let mut a = pair(Phase::Synced);
+        let mut b = pair(Phase::Synced);
+        let snap = |pairs: Vec<PairState>| AppState {
+            pairs,
+            ..Default::default()
+        };
+        assert_eq!(files_tail(&snap(vec![a.clone(), b.clone()])), "");
+        a.tracked = 4000;
+        b.tracked = 733;
+        assert_eq!(files_tail(&snap(vec![a.clone(), b])), " · 4,733 files");
+        a.tracked = 1;
+        assert_eq!(files_tail(&snap(vec![a])), " · 1 file");
+    }
 }
 
 fn status_dot_small(ui: &mut egui::Ui, col: Color32) {
@@ -4309,9 +4462,9 @@ fn run_daemon() {
             return;
         }
     };
-    let _lock = match PidLock::acquire(&cfg.state_dir, DAEMON_LOCK) {
-        Some(l) => l,
-        None => {
+    let _lock = match process_lock::acquire(&cfg.state_dir.join(DAEMON_LOCK)) {
+        Ok(l) => l,
+        Err(_) => {
             eprintln!("protondrive4linux: a tray daemon is already running");
             return;
         }
@@ -4417,11 +4570,16 @@ fn run_daemon() {
                 ctrl_cb.commit_config(newcfg);
                 ctrl_cb.stop_watch();
                 pending_restart = true;
-                eprintln!("protondrive4linux: config changed; reloaded ({pairs} folder(s))");
+                eprintln!(
+                    "protondrive4linux: config changed; reloaded ({})",
+                    counted(pairs, "folder", "folders")
+                );
             }
         }
         // Start the watcher once the previous one has released watch.lock.
-        if pending_restart && !pid_alive_from(&state_dir.join("watch.lock")) {
+        if pending_restart
+            && process_lock::holder(&state_dir.join(neutronsync::watcher::LOCK_FILE)).is_none()
+        {
             pending_restart = false;
             if want_watch {
                 let names = auto_names_of(&ctrl_cb.config());

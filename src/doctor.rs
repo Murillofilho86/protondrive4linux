@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::config::{self, Config};
+use crate::process_lock::LockState;
 use crate::protoncli::{self, ProtonCli, Remote};
 
 /// Proton's Drive API host: what the CLI talks to, so being able to open an
@@ -1105,7 +1106,10 @@ fn check_systemd(host: &dyn Host) -> Check {
 }
 
 /// Is a watcher (the tray app's, `protondrive4linux watch`, or the systemd
-/// service - they all take the same lock) running right now?
+/// service - they all take the same lock) running right now? Asked of the lock
+/// itself (see [`crate::process_lock`]), which names the holder by pid, start
+/// time and boot id: a leftover record from a watcher that was killed, or whose
+/// pid has since gone to another program, reads as stale rather than running.
 fn check_daemon(loaded: Option<&Config>) -> Check {
     let (id, title) = ("daemon", "Watcher");
     let Some(cfg) = loaded else {
@@ -1116,62 +1120,42 @@ fn check_daemon(loaded: Option<&Config>) -> Check {
         );
     };
     let lock = cfg.state_dir.join(crate::watcher::LOCK_FILE);
-    let Ok(text) = fs::read_to_string(&lock) else {
-        return Check::new(
+    match crate::process_lock::inspect(&lock) {
+        LockState::Free => Check::new(
             id,
             title,
             Level::Info,
             "none running (start one with the tray app, `protondrive4linux watch`, or the \
              systemd service)",
-        );
-    };
-    let Ok(pid) = text.trim().parse::<u32>() else {
-        return Check::new(
+        ),
+        LockState::Held { pid } => {
+            let program = fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+            Check::new(
+                id,
+                title,
+                Level::Ok,
+                match program {
+                    Some(name) => format!("running: pid {pid} ({name})"),
+                    None => format!("running: pid {pid}"),
+                },
+            )
+        }
+        LockState::Stale { pid } => Check::new(
             id,
             title,
             Level::Info,
             format!(
-                "{} is unreadable; the next watcher replaces it",
-                lock.display()
+                "none running (a leftover lock names pid {pid}, {}; harmless - the next \
+                 watcher replaces it)",
+                if Path::new(&format!("/proc/{pid}")).exists() {
+                    "which is now another program"
+                } else {
+                    "which is gone"
+                }
             ),
-        );
-    };
-    let alive = Path::new(&format!("/proc/{pid}")).exists();
-    let program = if alive {
-        fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-    } else {
-        None
-    };
-    lock_verdict(pid, alive, program.as_deref())
-}
-
-/// What a lock file naming `pid` means. A lock outlives a watcher that was
-/// killed rather than stopped (a crash, a power cut, SIGKILL), and the pid it
-/// names may since have gone to an unrelated program - routine after a reboot,
-/// when pids start over - so a live pid only counts if it is one of ours.
-/// `program` is its executable's name, `None` when `/proc` won't say (another
-/// user's process), which is taken as ours rather than called stale on a guess.
-fn lock_verdict(pid: u32, alive: bool, program: Option<&str>) -> Check {
-    let (id, title) = ("daemon", "Watcher");
-    let stale = |why: String| {
-        Check::new(
-            id,
-            title,
-            Level::Info,
-            format!("none running (a stale lock names pid {pid}, {why}; harmless)"),
-        )
-    };
-    if !alive {
-        return stale("which is gone".to_string());
-    }
-    match program {
-        Some(name) if !name.contains("protondrive4linux") => {
-            stale(format!("which is now another program, `{name}`"))
-        }
-        Some(name) => Check::new(id, title, Level::Ok, format!("running: pid {pid} ({name})")),
-        None => Check::new(id, title, Level::Ok, format!("running: pid {pid}")),
+        ),
     }
 }
 
@@ -2149,17 +2133,59 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_naming_a_pid_that_is_not_ours_or_is_gone_is_stale_and_no_lock_is_idle() {
-        let tmp = Tmp::new("daemon");
+    fn no_lock_or_an_empty_one_means_none_running() {
+        let tmp = Tmp::new("daemon-free");
         let cfg = loaded_state(&tmp);
         let lock = cfg.state_dir.join(crate::watcher::LOCK_FILE);
 
         let c = check_daemon(Some(&cfg));
         assert_eq!(c.level, Level::Info);
-        assert!(c.detail.starts_with("none running"));
+        assert!(c.detail.starts_with("none running"), "{}", c.detail);
 
-        // A live pid that isn't one of ours - this test binary - is a reused one.
-        fs::write(&lock, std::process::id().to_string()).unwrap();
+        // What a watcher leaves when it stops cleanly.
+        fs::write(&lock, "").unwrap();
+        assert!(check_daemon(Some(&cfg)).detail.starts_with("none running"));
+        assert_eq!(check_daemon(None).level, Level::Skip);
+    }
+
+    #[test]
+    fn a_lock_held_by_a_live_process_is_a_running_watcher() {
+        let tmp = Tmp::new("daemon-held");
+        let cfg = loaded_state(&tmp);
+        let lock = cfg.state_dir.join(crate::watcher::LOCK_FILE);
+        // This test process stands in for the watcher.
+        let _held = crate::process_lock::acquire(&lock).unwrap();
+        let c = check_daemon(Some(&cfg));
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        assert!(
+            c.detail
+                .starts_with(&format!("running: pid {}", std::process::id())),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn a_leftover_lock_is_stale_whether_its_process_is_gone_or_its_pid_was_reused() {
+        let tmp = Tmp::new("daemon-stale");
+        let cfg = loaded_state(&tmp);
+        let lock = cfg.state_dir.join(crate::watcher::LOCK_FILE);
+
+        // A killed watcher's record: beyond pid_max (4194304), so no such process.
+        fs::write(&lock, "4999999 12345 some-boot").unwrap();
+        let c = check_daemon(Some(&cfg));
+        assert_eq!(c.level, Level::Info);
+        assert!(
+            c.detail.contains("pid 4999999, which is gone"),
+            "{}",
+            c.detail
+        );
+
+        // The pid of a live process, but not the one that wrote the record: what a
+        // reboot does to a lock left behind. Used to read as a running watcher.
+        let mine = crate::process_lock::record_for(std::process::id()).unwrap();
+        let boot = mine.split_whitespace().nth(2).unwrap();
+        fs::write(&lock, format!("{} 1 {boot}", std::process::id())).unwrap();
         let c = check_daemon(Some(&cfg));
         assert_eq!(c.level, Level::Info);
         assert!(
@@ -2168,42 +2194,11 @@ mod tests {
             c.detail
         );
 
-        // Beyond pid_max (4194304), so no such process.
-        fs::write(&lock, "4999999").unwrap();
-        let c = check_daemon(Some(&cfg));
-        assert_eq!(c.level, Level::Info);
-        assert!(c.detail.contains("stale lock"), "{}", c.detail);
-
-        fs::write(&lock, "not a pid").unwrap();
-        assert!(check_daemon(Some(&cfg)).detail.contains("unreadable"));
-        assert_eq!(check_daemon(None).level, Level::Skip);
-    }
-
-    #[test]
-    fn a_live_pid_counts_only_if_it_is_one_of_ours() {
-        let running = lock_verdict(42, true, Some("protondrive4linux-gui"));
-        assert_eq!(running.level, Level::Ok);
-        assert_eq!(running.detail, "running: pid 42 (protondrive4linux-gui)");
-
-        // Pids start over after a reboot, so a leftover lock can name anything.
-        let reused = lock_verdict(42, true, Some("firefox"));
-        assert_eq!(reused.level, Level::Info);
-        assert!(
-            reused.detail.contains("now another program, `firefox`"),
-            "{}",
-            reused.detail
-        );
-
-        // Another user's process: /proc won't name it, so don't call it stale on a guess.
-        let unknown = lock_verdict(42, true, None);
-        assert_eq!(
-            (unknown.level, unknown.detail.as_str()),
-            (Level::Ok, "running: pid 42")
-        );
-
-        let gone = lock_verdict(42, false, None);
-        assert_eq!(gone.level, Level::Info);
-        assert!(gone.detail.contains("which is gone"), "{}", gone.detail);
+        // The same from an older version: a bare pid that isn't one of ours.
+        fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(check_daemon(Some(&cfg))
+            .detail
+            .contains("which is now another program"));
     }
 
     #[test]

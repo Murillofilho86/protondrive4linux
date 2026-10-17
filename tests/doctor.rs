@@ -11,147 +11,14 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use neutronsync::doctor::{self, ConfigState, Env, Host, Level, Options};
 
-const BIN: &str = env!("CARGO_BIN_EXE_protondrive4linux");
-const FAKE_CLI: &str = env!("CARGO_BIN_EXE_fake-proton-drive");
-
-struct Sandbox {
-    root: PathBuf,
-}
-
-impl Sandbox {
-    fn new(tag: &str) -> Sandbox {
-        let root = std::env::temp_dir().join(format!(
-            "protondrive4linux-doctor-it-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        for d in ["remote/my-files", "docs", "empty-bin", "home", "xdg-share"] {
-            fs::create_dir_all(root.join(d)).unwrap();
-        }
-        Sandbox { root }
-    }
-
-    fn path(&self, p: &str) -> PathBuf {
-        self.root.join(p)
-    }
-
-    /// A config for the sandbox: the CLI at `cli`, state under the sandbox, one
-    /// pair. The file is 0600 in a 0700 folder, as `init` would leave it.
-    fn write_config(&self, cli: &Path) -> PathBuf {
-        let dir = self.path("conf");
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let file = dir.join("c.toml");
-        fs::write(
-            &file,
-            format!(
-                "[cli]\nbinary = {:?}\n[options]\nstate_dir = {:?}\n\
-                 [[pair]]\nname = \"docs\"\nlocal = {:?}\nremote = \"docs\"\n",
-                cli.display().to_string(),
-                self.path("state").display().to_string(),
-                self.path("docs").display().to_string(),
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-        file
-    }
-
-    /// Run `protondrive4linux -c CONFIG <args>` with only the environment we
-    /// give it (the fake CLI is told where its remote lives and which version to
-    /// report).
-    fn run(&self, config: &Path, args: &[&str]) -> Output {
-        let mut cmd = self.command();
-        cmd.arg("-c").arg(config).args(args);
-        cmd.output().expect("the binary runs")
-    }
-
-    fn command(&self) -> Command {
-        let mut cmd = Command::new(BIN);
-        cmd.env_clear()
-            .current_dir(&self.root)
-            .env("PATH", self.path("empty-bin"))
-            .env("HOME", self.path("home"))
-            .env("XDG_CONFIG_HOME", self.path("home/.config"))
-            .env("XDG_DATA_HOME", self.path("home/.local/share"))
-            .env("XDG_DATA_DIRS", self.path("xdg-share"))
-            .env("FAKE_REMOTE_ROOT", self.path("remote"))
-            .env("FAKE_CLI_VERSION", "cli-drive 0.8.0");
-        cmd
-    }
-
-    /// A stand-in `proton-drive` that runs the fake CLI with `env` set, so a
-    /// library-level test can pick the version or sign-out state per test
-    /// without touching this process's environment.
-    fn wrapper(&self, env: &str) -> PathBuf {
-        let path = self.path("proton-drive");
-        fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nFAKE_REMOTE_ROOT={:?} FAKE_CLI_VERSION='cli-drive 0.8.0' {env} \
-                 exec {FAKE_CLI:?} \"$@\"\n",
-                self.path("remote").display().to_string()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        settle(&path);
-        path
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        // Put back anything a test made unreadable before deleting.
-        for d in ["conf", "state"] {
-            let _ = fs::set_permissions(self.root.join(d), fs::Permissions::from_mode(0o700));
-        }
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
-
-/// Start `path` once and stop it again, retrying while the kernel says "text
-/// file busy" (ETXTBSY): another test thread forking while this file is still
-/// open for writing leaves its child holding a copy of the descriptor for a
-/// moment, and exec-ing the file then fails. After one successful start nobody
-/// holds it for writing, so later runs - including the ones the binary makes -
-/// are safe.
-fn settle(path: &Path) {
-    for _ in 0..400 {
-        match Command::new(path)
-            .arg("--settle")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(5)),
-            Ok(mut child) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
-            }
-            Err(_) => return,
-        }
-    }
-}
-
-fn text(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn code(out: &Output) -> i32 {
-    out.status.code().expect("exited normally")
-}
+mod common;
+use common::{code, settle, text, Sandbox, FAKE_CLI};
 
 // --- the real binary ------------------------------------------------------------
 
@@ -309,9 +176,9 @@ fn a_missing_local_folder_is_a_warning() {
 }
 
 /// Start a process whose executable is named `name` (a copy of the fake CLI,
-/// which sleeps `FAKE_CLI_SLEEP_MS` before doing anything) and write its pid
-/// into the watcher's lock file, the way a real watcher would.
-fn fake_watcher(sb: &Sandbox, name: &str) -> std::process::Child {
+/// which sleeps `FAKE_CLI_SLEEP_MS` before doing anything), and make the state
+/// folder ready for a lock file.
+fn sleeper(sb: &Sandbox, name: &str) -> std::process::Child {
     let exe = sb.path(name);
     fs::copy(FAKE_CLI, &exe).unwrap();
     settle(&exe);
@@ -323,16 +190,21 @@ fn fake_watcher(sb: &Sandbox, name: &str) -> std::process::Child {
         .unwrap();
     fs::create_dir_all(sb.path("state")).unwrap();
     fs::set_permissions(sb.path("state"), fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(sb.path("state/watch.lock"), child.id().to_string()).unwrap();
     child
+}
+
+fn write_lock(sb: &Sandbox, record: &str) {
+    fs::write(sb.path("state/watch.lock"), record).unwrap();
 }
 
 #[test]
 fn a_running_watcher_is_reported_from_its_lock() {
     let sb = Sandbox::new("watcher");
     let cfg = sb.write_config(Path::new(FAKE_CLI));
-    let mut watcher = fake_watcher(&sb, "protondrive4linux-watch-test");
+    let mut watcher = sleeper(&sb, "protondrive4linux-watch-test");
     let pid = watcher.id();
+    // The record a real watcher writes: its pid, start time and the boot id.
+    write_lock(&sb, &neutronsync::process_lock::record_for(pid).unwrap());
     let report = text(&sb.run(&cfg, &["doctor", "--offline"]));
     let _ = watcher.kill();
     let _ = watcher.wait();
@@ -345,21 +217,32 @@ fn a_running_watcher_is_reported_from_its_lock() {
 }
 
 #[test]
-fn a_lock_naming_a_pid_that_now_belongs_to_another_program_is_stale() {
+fn a_lock_whose_pid_now_belongs_to_another_process_is_stale() {
     let sb = Sandbox::new("reusedpid");
     let cfg = sb.write_config(Path::new(FAKE_CLI));
-    let mut other = fake_watcher(&sb, "not-ours");
+    let mut other = sleeper(&sb, "not-ours");
     let pid = other.id();
-    let report = text(&sb.run(&cfg, &["doctor", "--offline"]));
+    // Same pid, live process, but it did not write this record: a different
+    // start time. What a lock left over from before a reboot looks like.
+    let mine = neutronsync::process_lock::record_for(pid).unwrap();
+    let boot = mine.split_whitespace().nth(2).unwrap();
+    write_lock(&sb, &format!("{pid} 1 {boot}"));
+    let identity = text(&sb.run(&cfg, &["doctor", "--offline"]));
+    // And the bare pid older versions wrote: only "is it one of our programs" can
+    // be asked, and a process called `not-ours` isn't.
+    write_lock(&sb, &pid.to_string());
+    let legacy = text(&sb.run(&cfg, &["doctor", "--offline"]));
     let _ = other.kill();
     let _ = other.wait();
-    assert!(
-        report.contains(&format!(
-            "• Watcher        none running (a stale lock names pid {pid}, which is now another \
-             program, `not-ours`; harmless)"
-        )),
-        "{report}"
-    );
+    for report in [identity, legacy] {
+        assert!(report.contains("• Watcher        none running"), "{report}");
+        assert!(
+            report.contains(&format!(
+                "a leftover lock names pid {pid}, which is now another program"
+            )),
+            "{report}"
+        );
+    }
 }
 
 #[test]
