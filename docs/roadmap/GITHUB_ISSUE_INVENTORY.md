@@ -13,7 +13,7 @@ Legenda de status em `GITHUB_PROJECT_SETUP.md`.
 | M1-002 | Transactional sync execution | M1 | `type:refactor` `area:sync` `risk:data-loss` | ✅ |
 | M1-003 | Baseline integrity | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ |
 | M1-004 | Rename detection | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ (limitação do CLI documentada) |
-| M1-005 | Conflict Manager | M1 | `type:feature` `area:sync` `risk:data-loss` | 🔶 (engine ✅, falta GUI) |
+| M1-005 | Conflict Manager | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ |
 | M1-006 | Content verification | M1 | `type:feature` `area:sync` `risk:data-loss` | ✅ (falta benchmark) |
 | M1-007 | Offline recovery | M1 | `type:test` `area:sync` `risk:data-loss` | ✅ |
 | M2-001 | Release signing | M2 | `type:security` `area:security` `priority:critical` | ✅ (verificado em `v0.4.2` com `gpg --verify`) |

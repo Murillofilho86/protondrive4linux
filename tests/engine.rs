@@ -12,7 +12,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use neutronsync::config::{Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
 use neutronsync::engine::Engine;
-use neutronsync::events::{EventSink, SyncEvent};
+use neutronsync::events::{ConflictResolution, EventSink, SyncEvent};
 use neutronsync::logger::Logger;
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::{ListOutcome, Remote};
@@ -715,6 +715,175 @@ fn sha1_mode_idempotent() {
     let mut eng = Engine::new(&c, fake2, &log, false);
     let res = eng.sync_pair(&c.pairs[0], false).unwrap();
     assert_eq!(res.applied, 0, "sha1 second run is a no-op");
+}
+
+/// Collects only the structured conflict events (path, resolution, copy).
+type ConflictEvent = (String, ConflictResolution, Option<String>);
+struct ConflictCap(std::sync::Mutex<Vec<ConflictEvent>>);
+impl EventSink for ConflictCap {
+    fn emit(&self, ev: &SyncEvent) {
+        if let SyncEvent::Conflict {
+            path,
+            resolution,
+            copy,
+            ..
+        } = ev
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.clone(), *resolution, copy.clone()));
+        }
+    }
+}
+
+/// One sync run, returning every conflict event it emitted.
+fn run_capturing_conflicts(cfg: &Config, remote: FakeRemote, dry_run: bool) -> Vec<ConflictEvent> {
+    let cap = ConflictCap(Default::default());
+    {
+        let log = Logger::silent();
+        let mut eng = Engine::new(cfg, remote, &log, dry_run);
+        eng.set_observer(Some(&cap), None);
+        eng.sync_pair(&cfg.pairs[0], false).unwrap();
+    }
+    cap.0.into_inner().unwrap()
+}
+
+/// Leave `a.txt` changed on both sides since the last sync (different sizes,
+/// so detection never hinges on mtime granularity).
+fn diverge_a(t: &Tmp, c: &Config) -> Rc<RefCell<Store>> {
+    let (fake, store) = FakeRemote::new();
+    write(&t.path().join("local/a.txt"), "base");
+    run(c, fake, false);
+    write(&t.path().join("local/a.txt"), "local-change");
+    store.borrow_mut().files.insert(
+        "/my-files/docs/a.txt".into(),
+        b"remote-change-different".to_vec(),
+    );
+    store
+}
+
+#[test]
+fn keep_both_conflict_reports_the_preserved_copy() {
+    let t = Tmp::new("conf-ev-both");
+    let c = cfg(t.path());
+    let store = diverge_a(&t, &c);
+    let (fake, _s) = reuse(&store);
+    let evs = run_capturing_conflicts(&c, fake, false);
+    assert_eq!(evs.len(), 1, "exactly one conflict event: {evs:?}");
+    let (path, res, copy) = &evs[0];
+    assert_eq!(path, "a.txt");
+    assert_eq!(*res, ConflictResolution::KeptBoth);
+    let copy = copy.as_deref().expect("keep-both names the preserved copy");
+    assert!(
+        copy.starts_with("a (conflict ") && copy.ends_with(").txt"),
+        "unexpected copy name {copy:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local").join(copy)).unwrap(),
+        "local-change",
+        "the named copy really holds the local version"
+    );
+}
+
+#[test]
+fn newer_conflict_reports_which_side_won() {
+    // Local newer -> the local version is kept (uploaded).
+    let t = Tmp::new("conf-ev-newer-local");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let store = diverge_a(&t, &c);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000);
+    set_local_mtime(&t.path().join("local/a.txt"), 2_000);
+    let (fake, _s) = reuse(&store);
+    assert_eq!(
+        run_capturing_conflicts(&c, fake, false),
+        vec![("a.txt".to_string(), ConflictResolution::KeptLocal, None)]
+    );
+
+    // Remote newer -> the remote version is kept (downloaded).
+    let t = Tmp::new("conf-ev-newer-remote");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let store = diverge_a(&t, &c);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 2_000);
+    set_local_mtime(&t.path().join("local/a.txt"), 1_000);
+    let (fake, _s) = reuse(&store);
+    assert_eq!(
+        run_capturing_conflicts(&c, fake, false),
+        vec![("a.txt".to_string(), ConflictResolution::KeptRemote, None)]
+    );
+}
+
+#[test]
+fn skipped_conflict_is_reported_on_every_run_until_it_is_settled() {
+    // `Skip` leaves both sides alone and the conflict is re-detected each run,
+    // so it must be (re-)reported each run - the store dedupes, the engine
+    // doesn't have to remember.
+    let t = Tmp::new("conf-ev-skip");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Skip;
+    let store = diverge_a(&t, &c);
+    for _ in 0..2 {
+        let (fake, _s) = reuse(&store);
+        assert_eq!(
+            run_capturing_conflicts(&c, fake, false),
+            vec![("a.txt".to_string(), ConflictResolution::Skipped, None)]
+        );
+    }
+}
+
+#[test]
+fn dry_run_reports_no_conflicts() {
+    for policy in [
+        ConflictPolicy::KeepBoth,
+        ConflictPolicy::Newer,
+        ConflictPolicy::Skip,
+    ] {
+        let t = Tmp::new("conf-ev-dry");
+        let mut c = cfg(t.path());
+        c.conflict = policy;
+        let store = diverge_a(&t, &c);
+        let (fake, _s) = reuse(&store);
+        assert!(
+            run_capturing_conflicts(&c, fake, true).is_empty(),
+            "a dry run settles nothing, so it must report nothing ({policy:?})"
+        );
+    }
+}
+
+#[test]
+fn a_conflict_whose_transfer_failed_is_not_reported_until_it_succeeds() {
+    // `Newer` settles by uploading the local version. If that upload fails the
+    // conflict is NOT settled - it's re-detected next run - so nothing may be
+    // reported yet; the successful retry reports it exactly once.
+    let t = Tmp::new("conf-ev-fail");
+    let mut c = cfg(t.path());
+    c.conflict = ConflictPolicy::Newer;
+    let store = diverge_a(&t, &c);
+    store
+        .borrow_mut()
+        .mtimes
+        .insert("/my-files/docs/a.txt".into(), 1_000);
+    set_local_mtime(&t.path().join("local/a.txt"), 2_000);
+
+    store.borrow_mut().fail_upload = Some("/my-files/docs/a.txt".into());
+    let (fake, _s) = reuse(&store);
+    assert!(run_capturing_conflicts(&c, fake, false).is_empty());
+
+    store.borrow_mut().fail_upload = None;
+    clear_retry_backoff(&c, &c.pairs[0].name);
+    let (fake, _s) = reuse(&store);
+    assert_eq!(
+        run_capturing_conflicts(&c, fake, false),
+        vec![("a.txt".to_string(), ConflictResolution::KeptLocal, None)]
+    );
 }
 
 struct CapSink(std::sync::Arc<std::sync::Mutex<Vec<String>>>);

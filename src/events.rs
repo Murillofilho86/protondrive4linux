@@ -6,6 +6,56 @@
 //! emits these to an optional [`EventSink`]; `service::Controller` turns them
 //! into observable [`crate::service::AppState`].
 
+/// How a both-sides-changed conflict was settled (or, for `Skipped`, not).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// Both versions were kept: the local one was renamed to a
+    /// "(conflict ...)" copy and the remote one now holds the original name.
+    KeptBoth,
+    /// The local version won (`conflict = "newer"`, local was newer); the
+    /// remote copy was replaced.
+    KeptLocal,
+    /// The remote version won (`conflict = "newer"`, remote was newer); the
+    /// local copy was replaced.
+    KeptRemote,
+    /// Left untouched on both sides (`conflict = "skip"`): it needs a manual
+    /// decision, and is re-detected on every run until the two sides agree.
+    Skipped,
+}
+
+impl ConflictResolution {
+    /// Stable identifier, as stored in the conflicts table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConflictResolution::KeptBoth => "kept-both",
+            ConflictResolution::KeptLocal => "kept-local",
+            ConflictResolution::KeptRemote => "kept-remote",
+            ConflictResolution::Skipped => "skipped",
+        }
+    }
+
+    /// Inverse of [`ConflictResolution::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "kept-both" => ConflictResolution::KeptBoth,
+            "kept-local" => ConflictResolution::KeptLocal,
+            "kept-remote" => ConflictResolution::KeptRemote,
+            "skipped" => ConflictResolution::Skipped,
+            _ => return None,
+        })
+    }
+
+    /// A short phrase for logs: what happened to the two versions.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ConflictResolution::KeptBoth => "kept both versions",
+            ConflictResolution::KeptLocal => "kept the local version (it was newer)",
+            ConflictResolution::KeptRemote => "kept the remote version (it was newer)",
+            ConflictResolution::Skipped => "left untouched (conflict = skip)",
+        }
+    }
+}
+
 /// A single structured event about sync progress.
 #[derive(Clone, Debug)]
 pub enum SyncEvent {
@@ -47,6 +97,17 @@ pub enum SyncEvent {
         applied: usize,
         errors: usize,
         tracked: usize,
+    },
+    /// A file changed on both sides since the last sync and was settled per
+    /// the conflict policy (or, for `Skipped`, left for the user). Emitted
+    /// once the resolution has actually completed - never for a transfer that
+    /// failed, which is simply re-detected next run. `copy` is the preserved
+    /// local copy's path for `KeptBoth`.
+    Conflict {
+        pair: String,
+        path: String,
+        resolution: ConflictResolution,
+        copy: Option<String>,
     },
     /// Free-form informational line (mirrors a log line).
     Info { text: String },

@@ -69,6 +69,15 @@ No content comparison, no conflict — a directory is a container, not a value:
 | `Newer` | Compares mtimes; whichever is newer wins (upload or download). If either side lacks an mtime, **falls back to `KeepBoth`** rather than guessing — same safety guarantee as the default. (`conflict_newer_local_wins`, `conflict_newer_remote_wins`, `conflict_newer_without_remote_mtime_falls_back_to_keep_both`) |
 | `Skip` | Neither side is touched; baseline row is left as Noop until the user resolves it manually. (`conflict_skip_leaves_both_sides_untouched`) |
 
+**Every policy reports how it settled the conflict** (`SyncEvent::Conflict`, emitted only once the
+resolution has actually completed - a failed transfer is re-detected next run and reports nothing
+yet; a dry run reports nothing): `KeepBoth` -> `KeptBoth` with the preserved copy's name, `Newer` ->
+`KeptLocal` / `KeptRemote`, `Skip` -> `Skipped` (re-reported on every run until the user settles
+it). The events feed the conflict inbox (`conflicts` table in `stats.db`). A `Skipped` entry
+auto-clears when its file finally syncs. (`keep_both_conflict_reports_the_preserved_copy`,
+`newer_conflict_reports_which_side_won`, `skipped_conflict_is_reported_on_every_run_until_it_is_settled`,
+`dry_run_reports_no_conflicts`, `a_conflict_whose_transfer_failed_is_not_reported_until_it_succeeds`)
+
 ## Renames (`detect_renames`, post-processing on the plan)
 
 After the table above produces a plan, same-content delete+create pairs are collapsed into a

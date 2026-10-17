@@ -126,8 +126,10 @@ sem o CLI oficial expor a operação — fechar a issue documentando a limitaç�
 
 ## M1-005 — Conflict Manager
 **Labels**: `type:feature`, `area:sync`, `risk:data-loss`
-**Status: 🔶 Parcial (engine ✅, GUI ⬜).** Já existe `ConflictPolicy::{KeepBoth, Newer, Skip}`
-configurável, com seletor na GUI, e agora as três políticas têm cobertura de teste completa.
+**Status: ✅ Concluído.** `ConflictPolicy::{KeepBoth, Newer, Skip}` configurável, com seletor na
+GUI e cobertura de teste completa das três políticas, e agora uma **caixa de entrada de
+conflitos** na GUI (página *Conflicts*, com contador na barra lateral) com o histórico de como
+cada um foi resolvido.
 
 ### Testes adicionados (fechando o gap encontrado em `SYNC_STATE_MATRIX.md`)
 `conflict_newer_local_wins`, `conflict_newer_remote_wins`,
@@ -135,19 +137,39 @@ configurável, com seletor na GUI, e agora as três políticas têm cobertura de
 um vencedor sem mtime comparável dos dois lados — cai em `KeepBoth`, nunca escolhe um lado às
 cegas) e `conflict_skip_leaves_both_sides_untouched`, todos em `tests/engine.rs`.
 
-### Gap real restante (GUI)
-Não existe uma "caixa de entrada de conflitos" na GUI (lista dos arquivos em conflito aguardando
-decisão) nem histórico de qual resolução foi aplicada a qual arquivo — hoje só existe a política
-global. Isto é feature de GUI + log, não de engine — fica para quando M5 (Desktop Experience)
-for atacado, já que é a mesma camada de trabalho.
+### A caixa de entrada (antes era o gap real restante)
+Achado ao fazer isto: o engine não dizia a ninguém que um conflito aconteceu. `Skip` vira um
+`Noop`, que nem emite evento de operação (não aparecia em lugar nenhum além de uma linha de log),
+e `Newer` vira um upload/download comum, indistinguível de uma sincronização normal. Agora toda
+política relata como resolveu, com um evento estruturado (`SyncEvent::Conflict { pair, path,
+resolution, copy }`) emitido **só quando a resolução de fato terminou** — uma transferência que
+falhou é re-detectada na rodada seguinte e não relata nada ainda; um dry run não relata nada.
+
+- `KeptBoth` (com o nome da cópia preservada), `KeptLocal`/`KeptRemote` (`Newer`: quem ganhou) e
+  `Skipped` (re-relatado a cada rodada até o usuário resolver; a caixa de entrada deduplica).
+- Persistido na tabela `conflicts` do `stats.db` (compartilhado entre o daemon da bandeja, a
+  janela e as execuções de CLI). Um conflito `Skipped` se resolve sozinho — sai da caixa — quando
+  o arquivo finalmente sincroniza (o usuário igualou os dois lados, ou trocou a política).
+- GUI: página **Conflicts** com contador na barra lateral; cada cartão diz o que aconteceu com as
+  duas versões em linguagem simples, com **Show folder** e **Dismiss**; **Show resolved** mostra
+  o histórico. `protondrive4linux-gui --page conflicts` abre direto nela (serve de deep link).
+- CLI: `status` mostra quantos conflitos estão sem resolver; o `watch` headless (unit do systemd)
+  agora grava no mesmo DB, então também alimenta a caixa de entrada e o feed de Activity (antes
+  não gravava nada).
+- Log de texto: cada resolução vira uma linha (`conflict on a.txt: kept both versions (copy: ...)`).
+
+Limitação conhecida de `Newer`: o lado mais antigo é *substituído* (no remoto vai pra lixeira do
+Proton; localmente o download sobrescreve) — a caixa de entrada avisa qual versão foi mantida,
+mas não guarda a perdedora. Quem não quer isso usa `keep-both` (o padrão).
 
 ### Critérios de aceite
 - [x] Conflito nunca destrói automaticamente a outra versão (`keep-both` é sempre seguro).
 - [x] CLI/config suporta resolução (política global).
 - [x] Teste para `ConflictPolicy::Newer` (incluindo o fallback para `KeepBoth` sem mtime).
 - [x] Teste para `ConflictPolicy::Skip`.
-- [ ] GUI exibe conflitos (lista/inbox por arquivo).
-- [ ] Histórico de resolução disponível no log.
+- [x] GUI exibe conflitos (lista/inbox por arquivo).
+- [x] Histórico de resolução disponível no log (linha no log de texto + tabela `conflicts` com
+      "Show resolved" na GUI).
 
 ## M1-006 — Content verification
 **Labels**: `type:feature`, `area:sync`, `risk:data-loss`
@@ -193,7 +215,7 @@ não só uma falha pontual de listagem.
       cheio, timeout de rede real, e a corrida watch/rescan seguem documentados como não
       cobertos (exigem CLI real ou infraestrutura privilegiada, não código faltando).
 - [x] Baseline integrity check implementado e testado.
-- [ ] Conflict inbox na GUI.
+- [x] Conflict inbox na GUI.
 - [x] Offline recovery testado.
 - [x] Nenhum `risk:data-loss` crítico aberto (os 3 cenários fora de escopo são limitações de
       ambiente/CLI oficial documentadas, não riscos abertos do fork).

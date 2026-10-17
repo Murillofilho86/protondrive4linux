@@ -19,10 +19,11 @@ use eframe::egui::{
 };
 
 use neutronsync::config::{self, Config, ConflictPolicy, LocalDelete, Pair, UpdateChannel};
+use neutronsync::events::ConflictResolution;
 use neutronsync::models::{Compare, Entry};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
-    ActivityKind, ActivityOp, AppState, Controller, OverallStatus, PairState, Phase,
+    ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
 };
 use neutronsync::updater::{self, UpdateInfo};
 
@@ -75,6 +76,7 @@ enum Icon {
     Upload,
     Download,
     Copy,
+    Warning,
 }
 
 fn icon_glyph(icon: Icon) -> &'static str {
@@ -95,6 +97,7 @@ fn icon_glyph(icon: Icon) -> &'static str {
         Icon::Upload => ph::ARROW_UP,
         Icon::Download => ph::ARROW_DOWN,
         Icon::Copy => ph::COPY,
+        Icon::Warning => ph::WARNING,
     }
 }
 
@@ -439,14 +442,16 @@ fn status_dot(ui: &mut egui::Ui, col: Color32, pulse: bool) {
 enum Nav {
     Activity,
     Folders,
+    Conflicts,
     Settings,
     Account,
     About,
 }
 
-const NAV_ITEMS: [(Nav, Icon, &str); 5] = [
+const NAV_ITEMS: [(Nav, Icon, &str); 6] = [
     (Nav::Activity, Icon::Activity, "Activity"),
     (Nav::Folders, Icon::Folder, "Folders"),
+    (Nav::Conflicts, Icon::Warning, "Conflicts"),
     (Nav::Settings, Icon::Gear, "Settings"),
     (Nav::Account, Icon::User, "Account"),
     (Nav::About, Icon::Info, "About"),
@@ -685,6 +690,13 @@ struct App {
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
     _win_lock: Option<PidLock>,
+
+    // conflict inbox (M1-005): polled from the shared stats DB about once a
+    // second, since the background daemon (a separate process) writes to it.
+    conflicts: Vec<ConflictRecord>,
+    conflict_count: usize,
+    conflicts_polled: f64,
+    show_resolved: bool,
 }
 
 impl App {
@@ -714,7 +726,7 @@ impl App {
             cfg,
             config_path,
             config_loaded,
-            nav: Nav::Activity,
+            nav: start_page().unwrap_or(Nav::Activity),
             nav_t: 1.0,
             dirty: false,
             toast: None,
@@ -739,6 +751,10 @@ impl App {
             confirm_remove_local: None,
             mode_daemon,
             _win_lock: win_lock,
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            conflicts_polled: f64::NEG_INFINITY,
+            show_resolved: false,
         };
         // Resume Auto sync if it was on last time — but not in daemon mode, where
         // the daemon owns the watcher (only one watcher may hold the lock).
@@ -794,6 +810,15 @@ impl App {
 
     fn auto_names(&self) -> Vec<String> {
         auto_names_of(&self.cfg)
+    }
+
+    /// Re-read the conflict badge, and the list when the Conflicts page is up.
+    fn refresh_conflicts(&mut self, ctx: &egui::Context) {
+        self.conflicts_polled = ctx.input(|i| i.time);
+        self.conflict_count = self.ctrl.conflict_count();
+        if self.nav == Nav::Conflicts {
+            self.conflicts = self.ctrl.conflicts(self.show_resolved, 200);
+        }
     }
 
     fn set_nav(&mut self, nav: Nav) {
@@ -1191,6 +1216,12 @@ impl eframe::App for App {
         if self.mode_daemon {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
+        // The conflict inbox lives in the shared stats DB: refresh the badge
+        // (and the list, when it's the page on screen) about once a second.
+        if ctx.input(|i| i.time) - self.conflicts_polled >= 1.0 {
+            self.refresh_conflicts(ctx);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         // after a browser login, poll the account until signed in (or deadline),
         // so the app returns to itself without a manual Refresh.
         if let Some(until) = self.login_poll_until {
@@ -1239,6 +1270,7 @@ impl eframe::App for App {
                     match self.nav {
                         Nav::Activity => self.page_activity(ui, &snap),
                         Nav::Folders => self.page_folders(ui, &snap),
+                        Nav::Conflicts => self.page_conflicts(ui),
                         Nav::Settings => self.page_settings(ui),
                         Nav::Account => self.page_account(ui, &snap),
                         Nav::About => self.page_about(ui),
@@ -1374,6 +1406,18 @@ impl App {
                         ),
                         col,
                     );
+                    if *nav == Nav::Conflicts && self.conflict_count > 0 {
+                        let c = pos2(rect.right() - 22.0, rect.center().y);
+                        ui.painter().circle_filled(c, 10.0, WARN);
+                        let n = self.conflict_count;
+                        ui.painter().text(
+                            c,
+                            Align2::CENTER_CENTER,
+                            if n > 99 { "99+".into() } else { n.to_string() },
+                            FontId::new(11.0, ff_bold()),
+                            NAV_BG,
+                        );
+                    }
                     if resp.clicked() {
                         clicked = Some(*nav);
                     }
@@ -1934,6 +1978,149 @@ impl App {
             self.commit();
             self.ctrl.sync(vec![name], false);
             self.set_nav(Nav::Activity);
+        }
+    }
+
+    fn page_conflicts(&mut self, ui: &mut egui::Ui) {
+        let open_count = self.conflict_count;
+        self.page_header(ui, "Conflicts", |ui, app| {
+            if open_count > 0 && button(ui, None, "Dismiss all", Btn::Ghost, false, true).clicked()
+            {
+                app.ctrl.dismiss_all_conflicts();
+                app.conflicts_polled = f64::NEG_INFINITY;
+                ui.ctx().request_repaint();
+            }
+        });
+
+        let mut toggled = false;
+        let resolved_on = self.show_resolved;
+        egui::Sides::new().shrink_left().wrap().show(
+            ui,
+            |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Files that changed on both sides since the last sync, and what \
+                             was done about each. Nothing is ever deleted to settle one.",
+                        )
+                        .size(12.5)
+                        .color(DIM),
+                    )
+                    .wrap(),
+                );
+            },
+            |ui| {
+                toggled = switch(ui, resolved_on);
+                ui.label(RichText::new("Show resolved").size(12.5).color(DIM));
+            },
+        );
+        if toggled {
+            self.show_resolved = !self.show_resolved;
+            self.conflicts_polled = f64::NEG_INFINITY;
+            ui.ctx().request_repaint();
+        }
+        ui.add_space(10.0);
+
+        let mut dismiss: Option<i64> = None;
+        let mut reveal: Option<(String, String)> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width((ui.available_width() - 15.0).max(200.0));
+                if self.conflicts.is_empty() {
+                    empty_state(
+                        ui,
+                        "No conflicts",
+                        if self.show_resolved {
+                            "Nothing has conflicted yet."
+                        } else {
+                            "When a file changes on both sides, it shows up here with what \
+                             was done about it."
+                        },
+                    );
+                }
+                for c in &self.conflicts {
+                    let (tint, icon) = conflict_look(c);
+                    card_frame().show(ui, |ui| {
+                        egui::Sides::new().shrink_left().wrap().show(
+                            ui,
+                            |ui| {
+                                ui.horizontal(|ui| {
+                                    let (ir, _) =
+                                        ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                                    ui.painter().rect_filled(ir, 8.0, tint.gamma_multiply(0.18));
+                                    draw_icon(ui.painter(), ir.shrink(7.0), icon, tint);
+                                    ui.add_space(6.0);
+                                    ui.vertical(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&c.rel)
+                                                    .font(FontId::new(14.0, ff_bold()))
+                                                    .color(if c.dismissed { DIM } else { TEXT }),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(conflict_explanation(c))
+                                                    .size(12.0)
+                                                    .color(DIM),
+                                            )
+                                            .wrap(),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} · {}",
+                                                c.pair,
+                                                rel_time(c.ts)
+                                            ))
+                                            .size(11.5)
+                                            .color(DIM2),
+                                        );
+                                    });
+                                });
+                            },
+                            |ui| {
+                                if !c.dismissed
+                                    && button(ui, None, "Dismiss", Btn::Ghost, true, true).clicked()
+                                {
+                                    dismiss = Some(c.id);
+                                }
+                                if button(
+                                    ui,
+                                    Some(Icon::Folder),
+                                    "Show folder",
+                                    Btn::Secondary,
+                                    true,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    reveal = Some((c.pair.clone(), c.rel.clone()));
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                }
+            });
+
+        if let Some(id) = dismiss {
+            self.ctrl.dismiss_conflict(id);
+            self.conflicts_polled = f64::NEG_INFINITY;
+            ui.ctx().request_repaint();
+        }
+        if let Some((pair, rel)) = reveal {
+            match self.cfg.pairs.iter().find(|p| p.name == pair) {
+                Some(p) => {
+                    let full = p.local.join(&rel);
+                    open_path(full.parent().unwrap_or(&p.local));
+                }
+                None => {
+                    let msg = format!("The folder pair \"{pair}\" isn't configured any more.");
+                    self.toast(ui.ctx(), msg, true);
+                }
+            }
         }
     }
 
@@ -3146,6 +3333,59 @@ fn activity_row(ui: &mut egui::Ui, op: &ActivityOp, ts: i64, line: &str) -> Opti
         Some(Open::Folder)
     } else {
         None
+    }
+}
+
+/// `--page <name>` opens the window on that page, so a notification (or any
+/// launcher) can deep-link to it. An unknown or missing name means the default.
+fn start_page() -> Option<Nav> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--page")?;
+    match args.get(i + 1)?.as_str() {
+        "activity" => Some(Nav::Activity),
+        "folders" => Some(Nav::Folders),
+        "conflicts" => Some(Nav::Conflicts),
+        "settings" => Some(Nav::Settings),
+        "account" => Some(Nav::Account),
+        "about" => Some(Nav::About),
+        _ => None,
+    }
+}
+
+/// Icon and tint for a conflict card: an open skipped conflict is the only
+/// kind that needs the user, so it alone gets the warning treatment.
+fn conflict_look(c: &ConflictRecord) -> (Color32, Icon) {
+    if c.dismissed {
+        return (DIM2, Icon::Check);
+    }
+    match c.resolution {
+        ConflictResolution::Skipped => (WARN, Icon::Warning),
+        ConflictResolution::KeptBoth => (ACCENT, Icon::Copy),
+        ConflictResolution::KeptLocal => (ACCENT, Icon::Upload),
+        ConflictResolution::KeptRemote => (ACCENT, Icon::Download),
+    }
+}
+
+/// What happened to the two versions, in plain words.
+fn conflict_explanation(c: &ConflictRecord) -> String {
+    match c.resolution {
+        ConflictResolution::KeptBoth => match &c.copy_rel {
+            Some(copy) => format!(
+                "Both versions were kept. Your local version is now \"{}\".",
+                copy.rsplit('/').next().unwrap_or(copy)
+            ),
+            None => "Both versions were kept.".into(),
+        },
+        ConflictResolution::KeptLocal => {
+            "Your version was newer, so it replaced the one in Proton Drive.".into()
+        }
+        ConflictResolution::KeptRemote => {
+            "The Proton Drive version was newer, so it replaced your local one.".into()
+        }
+        ConflictResolution::Skipped if c.dismissed => "Settled: the file has synced since.".into(),
+        ConflictResolution::Skipped => "Nothing was changed. Edit or remove one of the \
+             versions and it will sync on its own."
+            .into(),
     }
 }
 
