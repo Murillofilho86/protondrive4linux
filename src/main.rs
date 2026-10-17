@@ -120,8 +120,16 @@ enum Cmd {
         pair: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Rebuild the record of what was in sync from scratch: both sides are
+        /// merged and nothing is deleted - the way to get back files a held-back
+        /// mass deletion would have removed.
         #[arg(long)]
         resync: bool,
+        /// Carry out a mass deletion the guard held back (more than
+        /// `max_delete_files` and `max_delete_percent` of what a pair tracks).
+        /// For one run: say it is intended.
+        #[arg(long)]
+        allow_mass_delete: bool,
         #[arg(long)]
         json: bool,
     },
@@ -159,8 +167,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             pair,
             dry_run,
             resync,
+            allow_mass_delete,
             json,
-        } => cmd_sync(cli, pair, *dry_run, *resync, *json),
+        } => cmd_sync(cli, pair, *dry_run, *resync, *allow_mass_delete, *json),
         Cmd::Watch { pair } => cmd_watch(cli, pair),
     }
 }
@@ -332,9 +341,11 @@ fn cmd_sync(
     pairs: &[String],
     dry_run: bool,
     resync: bool,
+    allow_mass_delete: bool,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let cfg = load_cfg(cli)?;
+    let mut cfg = load_cfg(cli)?;
+    cfg.allow_mass_delete = allow_mass_delete;
     let log = Logger::new(&cfg.log_dir(), cli.verbose, cli.quiet);
 
     // Select pairs.

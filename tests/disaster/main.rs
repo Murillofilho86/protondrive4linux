@@ -548,3 +548,82 @@ fn a_cli_that_hits_its_timeout_mid_download_leaves_no_partial_file_and_no_junk()
     assert_eq!(visible_local(&env), ["big.bin"]);
     assert_eq!(count_remote_files(&env), 1);
 }
+
+// --- the mass-deletion guard, through the real binary ------------------------------------
+
+/// Run `protondrive4linux sync p <extra...>` to completion; its exit code and
+/// everything it printed.
+fn sync_with(env: &Env, extra: &[&str]) -> (Option<i32>, String) {
+    let bin = env!("CARGO_BIN_EXE_protondrive4linux");
+    let out = Command::new(bin)
+        .args(["--config", env.config_path.to_str().unwrap(), "sync", "p"])
+        .args(extra)
+        .env("FAKE_REMOTE_ROOT", &env.remote_root)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run protondrive4linux");
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[test]
+fn the_cli_holds_a_mass_deletion_back_and_carries_it_out_when_told_to() {
+    let env = setup("mass-delete");
+    write_local_files(&env, 150);
+    run_clean_sync(&env);
+    assert_eq!(count_remote_files(&env), 150);
+    // an unmounted drive, an `rm -rf`: four fifths of the folder is gone (a run may delete 100)
+    for i in 0..120 {
+        std::fs::remove_file(env.local.join(format!("file-{i:04}.txt"))).unwrap();
+    }
+
+    // An ordinary run deletes nothing, fails loudly, and says what to do.
+    let (code, text) = sync_with(&env, &[]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("held back 120 deletions"), "{text}");
+    assert!(text.contains("--allow-mass-delete"), "{text}");
+    assert!(text.contains("--resync"), "{text}");
+    assert_eq!(
+        count_remote_files(&env),
+        150,
+        "something was deleted anyway"
+    );
+    // and so does the next, until somebody decides
+    let (code, _) = sync_with(&env, &[]);
+    assert_eq!(code, Some(1));
+    assert_eq!(count_remote_files(&env), 150);
+
+    // "I meant it": the deletion happens, and the run is clean.
+    let (code, text) = sync_with(&env, &["--allow-mass-delete"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(count_remote_files(&env), 30);
+    // and the confirmation was for that run only: ordinary runs are quiet again
+    let (code, text) = sync_with(&env, &[]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(count_remote_files(&env), 30);
+}
+
+#[test]
+fn the_cli_can_get_the_files_back_instead() {
+    let env = setup("mass-delete-restore");
+    write_local_files(&env, 150);
+    run_clean_sync(&env);
+    for i in 0..120 {
+        std::fs::remove_file(env.local.join(format!("file-{i:04}.txt"))).unwrap();
+    }
+    let (code, _) = sync_with(&env, &[]);
+    assert_eq!(code, Some(1));
+    // the other way out: merge both sides afresh, which brings them back
+    let (code, text) = sync_with(&env, &["--resync"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(count_local_files(&env), 150);
+    assert_eq!(count_remote_files(&env), 150);
+    let (code, _) = sync_with(&env, &[]);
+    assert_eq!(code, Some(0));
+}

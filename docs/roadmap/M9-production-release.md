@@ -66,12 +66,17 @@ o arquivo) e um teste da guarda de pasta que nunca chegava ao código que deveri
       que não termina em `cli_timeout_secs` (1800 s por padrão) é morta e tentada de novo para
       sempre. Arquivo de vários GB em link lento precisa de `cli.cli_timeout_secs` maior.
 
-### Pendente (decisão do mantenedor, não bug)
-- **Disjuntor de deleção em massa** (como o `--max-delete` do rclone): com `propagate_deletes`
-  ligado, um caso que ninguém previu ainda apagaria muito. Todos os casos achados hoje têm guarda
-  própria e as deleções são recuperáveis (lixeira do desktop / lixeira online do Proton), mas
-  falta a rede de segurança genérica. Precisa de um limiar **e** de um jeito de confirmar "foi
-  de propósito" na CLI, no tray e na janela — decisão de produto.
+### Disjuntor de deleção em massa (era a decisão pendente; implementado depois da revisão)
+- [x] Com `propagate_deletes` ligado, uma execução apaga no máximo o maior entre
+      `max_delete_files` (100) e `max_delete_percent` (20 %) dos arquivos que o par rastreia;
+      se passar disso **nada** é apagado (as transferências continuam) e o par fica com um erro
+      que diz como seguir: `sync --allow-mass-delete NOME` (foi de propósito) ou
+      `sync --resync NOME` (trazer os arquivos de volta). Um walk completo conta os arquivos que
+      ainda existem em disco antes da primeira deleção (HD desmontado / `rm -rf` não apaga
+      nada), e todos os workers de um walk gastam uma única franquia.
+- [ ] Botões "Apagar mesmo" / "Restaurar" na janela e notificação do tray (hoje a CLI e o erro
+      do par já cobrem; a GUI mostra o erro e o comando).
+- Limite que sobra: deleções fatiadas em várias execuções, cada uma abaixo da franquia.
 - Limites documentados em `docs/DATA_LOSS_REVIEW.md` § Limits (timeout vs arquivo grande, timeout
   mata só o processo filho, duas execuções ao mesmo tempo não são impedidas, nomes de arquivo
   não-UTF-8, lista de ignorados silenciosa, `size+mtime` como heurística).

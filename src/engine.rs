@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -33,7 +33,21 @@ use crate::trash::trash_local;
 
 /// `plan()`'s return: (the plan, the prospective new baseline, whether the
 /// scan was incomplete, and the set of baseline rows to prune).
-type PlanOutcome = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
+type PlanOutcome = (
+    Plan,
+    BTreeMap<String, Entry>,
+    bool,
+    HashSet<String>,
+    Option<Held>,
+);
+
+/// Deletions the guard held back from one plan: how many files, of how many
+/// the pair tracks.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    files: usize,
+    tracked: usize,
+}
 
 /// A pair root that comes back empty only holds deletions back when at least
 /// this many files are on record for the pair. An unmounted drive or a folder
@@ -41,6 +55,161 @@ type PlanOutcome = (Plan, BTreeMap<String, Entry>, bool, HashSet<String>);
 /// the only file of a small folder is just a deletion, and holding that back
 /// would make the guard a nuisance rather than a safety net.
 const EMPTY_ROOT_MIN_FILES: usize = 5;
+
+/// The mass-deletion guard. With deletes propagating, a single run may delete at
+/// most `allowed` files - the larger of `max_delete_files` and `max_delete_percent`
+/// of the files the pair tracks - unless it was told the deletion is intended
+/// (`Config::allow_mass_delete`). The first request that would go over trips the
+/// budget: it and every later one in the run is refused (the deletions are held
+/// back, the transfers carry on), and a run that tripped says so.
+///
+/// Every case the data-loss review found that makes a deletion look right when
+/// it is not (an unmounted drive, an unreadable folder, a moved pair, ...) has
+/// its own guard; this is the net under them for the one nobody thought of, and
+/// what bounds the damage when it is the remote that suddenly looks emptied.
+///
+/// Shared by every worker of a run, so a walk that reconciles many folders at
+/// once spends one budget, never one each.
+pub struct DeleteBudget {
+    allowed: usize,
+    tracked: usize,
+    used: AtomicUsize,
+    held: AtomicUsize,
+    tripped: AtomicBool,
+}
+
+impl DeleteBudget {
+    /// The budget of one run for `pair`, whose baseline is `base`. `None` when the
+    /// guard stands aside - the run was told the deletion is intended, or the pair
+    /// tracks so few files that no run could go over (a run can never delete more
+    /// than it tracks).
+    pub fn new(cfg: &Config, pair: &Pair, base: &BTreeMap<String, Entry>) -> Option<DeleteBudget> {
+        if cfg.allow_mass_delete || !cfg.propagate_deletes {
+            return None;
+        }
+        let tracked = base
+            .iter()
+            .filter(|(k, e)| !e.is_dir && !pair.is_excluded(k))
+            .count();
+        let allowed = cfg
+            .max_delete_files
+            .max(tracked.saturating_mul(cfg.max_delete_percent.min(100) as usize) / 100);
+        if allowed >= tracked {
+            return None;
+        }
+        Some(DeleteBudget {
+            allowed,
+            tracked,
+            used: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
+            tripped: AtomicBool::new(false),
+        })
+    }
+
+    /// How many files a run may delete.
+    pub fn allowed(&self) -> usize {
+        self.allowed
+    }
+
+    /// How many files the pair tracks.
+    pub fn tracked(&self) -> usize {
+        self.tracked
+    }
+
+    /// Ask to delete `files` files. All or nothing: `false` means hold them back,
+    /// and the budget is tripped for the rest of the run.
+    pub fn reserve(&self, files: usize) -> bool {
+        if files == 0 {
+            return true;
+        }
+        if self.tripped.load(Ordering::SeqCst) {
+            self.held.fetch_add(files, Ordering::SeqCst);
+            return false;
+        }
+        let mut used = self.used.load(Ordering::SeqCst);
+        loop {
+            if used + files > self.allowed {
+                self.tripped.store(true, Ordering::SeqCst);
+                self.held.fetch_add(files, Ordering::SeqCst);
+                return false;
+            }
+            match self
+                .used
+                .compare_exchange(used, used + files, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => used = now,
+            }
+        }
+    }
+
+    /// Refuse every deletion of the run, from the start (see [`census_missing`]).
+    /// What is held back is counted as it is asked for, as ever.
+    pub fn trip(&self) {
+        self.tripped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn tripped(&self) -> bool {
+        self.tripped.load(Ordering::SeqCst)
+    }
+
+    /// How many files' deletions were held back (at least those asked for after
+    /// the trip; for an up-front trip, how many looked missing).
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
+/// How many tracked files look to be missing from `pair`'s local folder, from a
+/// bare count of the files there: cheap (one stat walk, no listing of the remote)
+/// and exact enough for what it is for - telling, before a full walk deletes a
+/// single file, that most of the tree has gone. New local files hide some missing
+/// ones, which can only make it trip less.
+pub fn census_missing(pair: &Pair, tracked: usize) -> usize {
+    let root = &pair.local;
+    let present = walkdir::WalkDir::new(root)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.path()
+                .strip_prefix(root)
+                .ok()
+                .and_then(|p| p.to_str())
+                .is_none_or(|r| !pair.is_excluded(&r.replace('\\', "/")))
+        })
+        .flatten()
+        .filter(|e| e.file_type().is_file())
+        .count();
+    tracked.saturating_sub(present)
+}
+
+/// How many files the deletes in `plan` would remove: each file once, and a
+/// folder as the files the baseline holds under it. A whole-tree plan lists both
+/// a folder and every file in it, so they are collected as one set, not summed.
+fn planned_delete_files(plan: &Plan, base: &BTreeMap<String, Entry>) -> usize {
+    let mut files: HashSet<&str> = HashSet::new();
+    for op in plan
+        .ops
+        .iter()
+        .filter(|o| matches!(o.action, Action::DeleteLocal | Action::DeleteRemote))
+    {
+        if !op.is_dir {
+            files.insert(op.path.as_str());
+            continue;
+        }
+        let prefix = format!("{}/", op.path);
+        for (k, e) in base
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+        {
+            if !e.is_dir {
+                files.insert(k.as_str());
+            }
+        }
+    }
+    files.len()
+}
 
 /// One run's retry-backoff bookkeeping (M4-004), bundled so it travels
 /// between `apply()` and `run_downloads()` as a single argument: `state` is
@@ -375,6 +544,14 @@ pub fn run_sync_streaming(
             .clamp(2, 8)
     };
 
+    // One deletion allowance for the whole walk. Before it deletes a single file,
+    // a count of the files still on disk tells it whether most of the tree has
+    // gone (an unmounted drive, an emptied folder): then it deletes nothing.
+    let budget = DeleteBudget::new(cfg, pair, &base).map(Arc::new);
+    if let Some(b) = &budget {
+        census_trip(log, pair, b);
+    }
+
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
@@ -402,6 +579,7 @@ pub fn run_sync_streaming(
                     let proton = ProtonCli::new(cfg);
                     let mut eng = Engine::new(cfg, proton, log, false);
                     eng.set_observer(events, cancel);
+                    eng.set_budget(budget.clone());
                     loop {
                         if is_cancelled() {
                             break;
@@ -443,7 +621,8 @@ pub fn run_sync_streaming(
         let _ = crate::state::set_last_synced(&cfg.state_dir, &pair.name, now_epoch());
     }
     let applied = applied.load(Ordering::Relaxed);
-    let errors = errors.load(Ordering::Relaxed);
+    let mut errors = errors.load(Ordering::Relaxed);
+    errors += report_if_tripped(log, events, pair, budget.as_deref());
     if let Some(sink) = events {
         sink.emit(&SyncEvent::PairFinished {
             pair: pair.name.clone(),
@@ -524,6 +703,8 @@ pub fn run_sync_shallow_many(
     };
     let queue: Mutex<std::collections::VecDeque<String>> =
         Mutex::new(folders.iter().cloned().collect());
+    // One deletion allowance for the whole batch of folders.
+    let budget = DeleteBudget::new(cfg, pair, &base).map(Arc::new);
     let applied = AtomicUsize::new(0);
     let errors = AtomicUsize::new(0);
     let counter = AtomicUsize::new(0);
@@ -542,6 +723,7 @@ pub fn run_sync_shallow_many(
                 let proton = ProtonCli::new(cfg);
                 let mut eng = Engine::new(cfg, proton, log, false);
                 eng.set_observer(events, cancel);
+                eng.set_budget(budget.clone());
                 loop {
                     if is_cancelled() {
                         break;
@@ -574,7 +756,8 @@ pub fn run_sync_shallow_many(
         }
     });
     let applied = applied.load(Ordering::Relaxed);
-    let errors = errors.load(Ordering::Relaxed);
+    let mut errors = errors.load(Ordering::Relaxed);
+    errors += report_if_tripped(log, events, pair, budget.as_deref());
     if let Some(sink) = events {
         sink.emit(&SyncEvent::PairFinished {
             pair: pair.name.clone(),
@@ -590,6 +773,38 @@ pub fn run_sync_shallow_many(
     }
 }
 
+/// Before a full walk deletes anything: if far more of what the pair tracks is
+/// missing from the local folder than a run may delete, refuse every deletion of
+/// the run now rather than after the first `allowed` files are gone.
+fn census_trip(log: &Logger, pair: &Pair, budget: &DeleteBudget) {
+    let missing = census_missing(pair, budget.tracked());
+    if missing > budget.allowed() {
+        log.warn(&format!(
+            "{:?}: {} of the {} files it tracks are not on disk; holding every deletion back",
+            pair.name,
+            missing,
+            budget.tracked()
+        ));
+        budget.trip();
+    }
+}
+
+/// If the run's budget tripped, tell the user (once, for the run) and count it
+/// as the one problem it is; returns the number of errors to add.
+fn report_if_tripped(
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    pair: &Pair,
+    budget: Option<&DeleteBudget>,
+) -> usize {
+    // Tripped by the census but nothing was asked to be deleted: nothing to say.
+    let Some(b) = budget.filter(|b| b.tripped() && b.held() > 0) else {
+        return 0;
+    };
+    report_held(log, events, pair, b.held(), b.tracked());
+    1
+}
+
 pub struct Engine<'a, R: Remote> {
     cfg: &'a Config,
     remote: R,
@@ -599,6 +814,9 @@ pub struct Engine<'a, R: Remote> {
     ensured: HashSet<String>,
     events: Option<&'a dyn EventSink>,
     cancel: Option<&'a AtomicBool>,
+    /// The mass-deletion guard of the run this engine is part of, shared with
+    /// the other workers of a walk. `None`: each reconcile makes its own.
+    budget: Option<Arc<DeleteBudget>>,
 }
 
 impl<'a, R: Remote> Engine<'a, R> {
@@ -612,7 +830,13 @@ impl<'a, R: Remote> Engine<'a, R> {
             ensured: HashSet::new(),
             events: None,
             cancel: None,
+            budget: None,
         }
+    }
+
+    /// Share the run's deletion budget with this engine (see [`DeleteBudget`]).
+    pub fn set_budget(&mut self, budget: Option<Arc<DeleteBudget>>) {
+        self.budget = budget;
     }
 
     /// Attach a structured-event sink and/or a cancellation flag (used by the
@@ -897,6 +1121,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         // scan, reconcile and additive commit all stay within the sub-tree.
         let (full, moved) = crate::state::load_baseline_for(&self.cfg.state_dir, pair)?;
         note_pair_moved(self.log, self.events, pair, moved);
+        // The guard counts against everything the pair tracks, however narrow
+        // this run's scope: a scoped run is not a licence to delete more.
+        let budget = if resync {
+            None
+        } else {
+            DeleteBudget::new(self.cfg, pair, &full)
+        };
         let base: BTreeMap<String, Entry> = if resync {
             BTreeMap::new()
         } else {
@@ -1076,7 +1307,21 @@ impl<'a, R: Remote> Engine<'a, R> {
         if !incomplete {
             detect_renames(&mut plan, &base, &local, &remote, &pair.local);
         }
-        Ok((plan, new_base, incomplete, prune_excluded))
+        // The mass-deletion guard: the whole plan is known here, so it is judged
+        // as a whole - over budget, none of its deletions happen.
+        let mut held = None;
+        if let Some(b) = &budget {
+            let files = planned_delete_files(&plan, &base);
+            if !b.reserve(files) {
+                plan.ops
+                    .retain(|op| !matches!(op.action, Action::DeleteRemote | Action::DeleteLocal));
+                held = Some(Held {
+                    files,
+                    tracked: b.tracked(),
+                });
+            }
+        }
+        Ok((plan, new_base, incomplete, prune_excluded, held))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2208,7 +2453,8 @@ impl<'a, R: Remote> Engine<'a, R> {
         self.emit(SyncEvent::PairStarted {
             pair: pair.name.clone(),
         });
-        let (mut plan, new_base, incomplete, prune_excluded) = self.plan(pair, resync, scope)?;
+        let (mut plan, new_base, incomplete, prune_excluded, held) =
+            self.plan(pair, resync, scope)?;
         if incomplete {
             // Safety: never delete or move based on a partial view of the remote.
             plan.ops.retain(|op| {
@@ -2239,7 +2485,15 @@ impl<'a, R: Remote> Engine<'a, R> {
                 .collect(),
         });
         let tracked = new_base.len();
-        let (result, _deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        let (mut result, _deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        if let Some(h) = held {
+            // A run that held deletions back is not a clean one: it counts as a
+            // problem (exit status, the pair's state) until the user settles it.
+            report_held(self.log, self.events, pair, h.files, h.tracked);
+            result.errors.push(crate::events::held_deletes_text(
+                &pair.name, h.files, h.tracked,
+            ));
+        }
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
             applied: result.applied,
@@ -2274,6 +2528,12 @@ impl<'a, R: Remote> Engine<'a, R> {
     pub fn sync_pair_streaming(&mut self, pair: &Pair) -> Result<SyncResult> {
         let (base, moved) = crate::state::load_baseline_for(&self.cfg.state_dir, pair)?;
         note_pair_moved(self.log, self.events, pair, moved);
+        // The walk's one deletion allowance, as `run_sync_streaming` has it.
+        let budget = DeleteBudget::new(self.cfg, pair, &base).map(Arc::new);
+        if let Some(b) = &budget {
+            census_trip(self.log, pair, b);
+        }
+        self.budget = budget.clone();
         let mut applied = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut frontier: Vec<String> = vec![String::new()];
@@ -2294,6 +2554,15 @@ impl<'a, R: Remote> Engine<'a, R> {
             next.sort();
             next.dedup();
             frontier = next;
+        }
+        self.budget = None;
+        if let Some(b) = budget.as_deref().filter(|b| b.tripped() && b.held() > 0) {
+            report_held(self.log, self.events, pair, b.held(), b.tracked());
+            errors.push(crate::events::held_deletes_text(
+                &pair.name,
+                b.held(),
+                b.tracked(),
+            ));
         }
         if !self.dry_run && !self.cancelled() {
             let _ = crate::state::set_last_synced(
@@ -2619,6 +2888,35 @@ impl<'a, R: Remote> Engine<'a, R> {
                 )
             });
         }
+        // The mass-deletion guard. Judged on what this folder would delete (a
+        // folder counts as the files the baseline holds under it) against the
+        // run's shared budget, so a walk over many folders spends one allowance.
+        // Without a shared budget (a single-folder run) it makes its own.
+        let mut held_alone: Option<Held> = None;
+        let planned = planned_delete_files(&plan, base_all);
+        if planned > 0 {
+            let own;
+            let budget: Option<&DeleteBudget> = match &self.budget {
+                Some(b) => Some(b.as_ref()),
+                None => {
+                    own = DeleteBudget::new(self.cfg, pair, base_all);
+                    own.as_ref()
+                }
+            };
+            if let Some(b) = budget {
+                if !b.reserve(planned) {
+                    plan.ops.retain(|op| {
+                        !matches!(op.action, Action::DeleteRemote | Action::DeleteLocal)
+                    });
+                    if self.budget.is_none() {
+                        held_alone = Some(Held {
+                            files: planned,
+                            tracked: b.tracked(),
+                        });
+                    }
+                }
+            }
+        }
         // Baseline rows for direct children that are now EXCLUDED. (`base_direct`
         // already filters excludes out, so scan the full snapshot instead.) These
         // are pruned so a later re-include re-downloads rather than deleting.
@@ -2646,7 +2944,13 @@ impl<'a, R: Remote> Engine<'a, R> {
             .collect();
 
         let tracked = new_base.len();
-        let (result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        let (mut result, deleted_ok) = self.apply(pair, plan, new_base, prune_excluded);
+        if let Some(h) = held_alone {
+            report_held(self.log, self.events, pair, h.files, h.tracked);
+            result.errors.push(crate::events::held_deletes_text(
+                &pair.name, h.files, h.tracked,
+            ));
+        }
 
         // Purge descendant baseline rows ONLY for sub-folders whose delete
         // actually COMPLETED (in `deleted_ok`). A delete that was cancelled or
@@ -2692,6 +2996,26 @@ impl<'a, R: Remote> Engine<'a, R> {
         children.sort();
         children.dedup();
         Ok((result, children))
+    }
+}
+
+/// Say, in the log and to the frontends, that the guard held deletions back.
+fn report_held(
+    log: &Logger,
+    events: Option<&dyn EventSink>,
+    pair: &Pair,
+    files: usize,
+    tracked: usize,
+) {
+    log.warn(&crate::events::held_deletes_text(
+        &pair.name, files, tracked,
+    ));
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::DeletesHeld {
+            pair: pair.name.clone(),
+            files,
+            tracked,
+        });
     }
 }
 
@@ -3056,10 +3380,138 @@ fn sha1_file(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_next_at, safe_join, safe_join_to_write, symlink_in_path};
+    use super::{
+        backoff_next_at, planned_delete_files, safe_join, safe_join_to_write, symlink_in_path,
+        DeleteBudget,
+    };
     use crate::config::{Config, ConflictPolicy, LocalDelete, UpdateChannel};
     use crate::models::Compare;
     use std::path::Path;
+
+    fn entry(path: &str, is_dir: bool) -> crate::models::Entry {
+        crate::models::Entry {
+            path: path.into(),
+            is_dir,
+            size: 1,
+            ..Default::default()
+        }
+    }
+
+    fn pair() -> crate::config::Pair {
+        crate::config::Pair {
+            name: "docs".into(),
+            local: "/l".into(),
+            remote: "/r".into(),
+            auto: true,
+            exclude: vec!["skip".into()],
+        }
+    }
+
+    fn base_of(files: usize) -> std::collections::BTreeMap<String, crate::models::Entry> {
+        (0..files)
+            .map(|i| (format!("f{i:04}"), entry(&format!("f{i:04}"), false)))
+            .collect()
+    }
+
+    #[test]
+    fn the_budget_is_the_larger_of_the_floor_and_the_percentage_and_off_when_it_cannot_matter() {
+        let mut c = retry_cfg(30, 1800, 6);
+        c.propagate_deletes = true;
+        // 1000 files: 20% = 200 > 100
+        let b = DeleteBudget::new(&c, &pair(), &base_of(1000)).unwrap();
+        assert_eq!((b.allowed(), b.tracked()), (200, 1000));
+        // 300 files: 20% = 60 < 100
+        assert_eq!(
+            DeleteBudget::new(&c, &pair(), &base_of(300))
+                .unwrap()
+                .allowed(),
+            100
+        );
+        // 100 files or fewer: no run can delete more than it tracks
+        assert!(DeleteBudget::new(&c, &pair(), &base_of(100)).is_none());
+        assert!(DeleteBudget::new(&c, &pair(), &base_of(0)).is_none());
+        // told it is intended / nothing propagates: it stands aside
+        let mut sure = c.clone();
+        sure.allow_mass_delete = true;
+        assert!(DeleteBudget::new(&sure, &pair(), &base_of(1000)).is_none());
+        let mut keep = c.clone();
+        keep.propagate_deletes = false;
+        assert!(DeleteBudget::new(&keep, &pair(), &base_of(1000)).is_none());
+        // 100% turns it off
+        let mut off = c.clone();
+        off.max_delete_files = 0;
+        off.max_delete_percent = 100;
+        assert!(DeleteBudget::new(&off, &pair(), &base_of(1000)).is_none());
+        // excluded paths are not tracked
+        let mut base = base_of(150);
+        for i in 0..100 {
+            base.insert(format!("skip/x{i}"), entry(&format!("skip/x{i}"), false));
+        }
+        assert_eq!(
+            DeleteBudget::new(&c, &pair(), &base).unwrap().tracked(),
+            150
+        );
+    }
+
+    #[test]
+    fn the_budget_lets_exactly_its_allowance_through_however_many_workers_ask() {
+        let mut c = retry_cfg(30, 1800, 6);
+        c.propagate_deletes = true;
+        let b = DeleteBudget::new(&c, &pair(), &base_of(1000)).unwrap(); // allowed 200
+        let granted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..100 {
+                        if b.reserve(1) {
+                            granted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 200);
+        assert!(b.tripped());
+        // 800 asked, 200 granted: the rest was held
+        assert_eq!(b.held(), 600);
+        // once tripped, even a small request is refused for the rest of the run
+        assert!(!b.reserve(1));
+        // all or nothing: a request that does not fit is refused whole
+        let fresh = DeleteBudget::new(&c, &pair(), &base_of(1000)).unwrap();
+        assert!(fresh.reserve(150));
+        assert!(!fresh.reserve(100), "150 + 100 > 200");
+        assert_eq!(fresh.held(), 100);
+    }
+
+    #[test]
+    fn a_folder_and_the_files_in_it_are_one_deletion_not_two() {
+        use crate::models::{Action, Op, Plan};
+        let mut base = base_of(0);
+        for p in ["d/a", "d/b", "d/sub/c", "other/x"] {
+            base.insert(p.to_string(), entry(p, false));
+        }
+        base.insert("d".into(), entry("d", true));
+        base.insert("d/sub".into(), entry("d/sub", true));
+        let mut plan = Plan::default();
+        // a whole-tree plan lists the folder and each file in it
+        for (path, dir) in [
+            ("d", true),
+            ("d/sub", true),
+            ("d/a", false),
+            ("d/b", false),
+            ("d/sub/c", false),
+        ] {
+            plan.add(Op::new(Action::DeleteRemote, path, dir, ""));
+        }
+        assert_eq!(planned_delete_files(&plan, &base), 3);
+        // a shallow plan lists only the folder
+        let mut shallow = Plan::default();
+        shallow.add(Op::new(Action::DeleteLocal, "d", true, ""));
+        assert_eq!(planned_delete_files(&shallow, &base), 3);
+        // and anything that is not a delete does not count
+        shallow.add(Op::new(Action::Upload, "other/x", false, ""));
+        assert_eq!(planned_delete_files(&shallow, &base), 3);
+    }
 
     #[test]
     fn writes_are_refused_through_a_symlink_but_not_onto_one_or_under_a_linked_root() {
@@ -3132,6 +3584,9 @@ mod tests {
             download_limiter: crate::ratelimit::RateLimiter::new(),
             remote_root: "/my-files".into(),
             propagate_deletes: false,
+            max_delete_files: crate::config::DEFAULT_MAX_DELETE_FILES,
+            max_delete_percent: crate::config::DEFAULT_MAX_DELETE_PERCENT,
+            allow_mass_delete: false,
             auto_sync: false,
             run_in_tray: false,
             x11_compat: false,

@@ -13,6 +13,9 @@ use crate::models::Compare;
 use crate::ratelimit::RateLimiter;
 
 pub const DEFAULT_REMOTE_ROOT: &str = "/my-files";
+/// Defaults of the mass-deletion guard (see [`Config::max_delete_files`]).
+pub const DEFAULT_MAX_DELETE_FILES: usize = 100;
+pub const DEFAULT_MAX_DELETE_PERCENT: u8 = 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LocalDelete {
@@ -109,6 +112,20 @@ pub struct Config {
     pub retry_max_attempts: u32,
     pub remote_root: String,
     pub propagate_deletes: bool,
+    /// The mass-deletion guard: with deletes propagating, one run may delete at
+    /// most the larger of this many files and `max_delete_percent` of the files
+    /// the pair tracks. A run that would delete more deletes **nothing** (it still
+    /// transfers) and says so, because a deletion of that size is far more often
+    /// a mistake - an unmounted drive, a folder emptied by accident - than
+    /// intended. See [`crate::engine::DeleteBudget`].
+    pub max_delete_files: usize,
+    /// The percentage half of the guard above; 100 turns the guard off (a run
+    /// can never delete more than everything it tracks).
+    pub max_delete_percent: u8,
+    /// Runtime only, never read from or written to the config file: this run was
+    /// told the deletion is intended (`sync --allow-mass-delete`, the GUI's
+    /// confirm button), so the guard stands aside for it.
+    pub allow_mass_delete: bool,
     /// Start the watch daemon on launch (the GUI's global "Auto sync").
     pub auto_sync: bool,
     /// Keep running in the system tray when the window is closed.
@@ -206,6 +223,8 @@ struct RawCli {
 struct RawOptions {
     remote_root: Option<String>,
     propagate_deletes: Option<bool>,
+    max_delete_files: Option<usize>,
+    max_delete_percent: Option<u8>,
     local_delete: Option<String>,
     conflict: Option<String>,
     compare: Option<String>,
@@ -394,6 +413,13 @@ pub fn parse_str(text: &str, source: Option<PathBuf>) -> Result<Config> {
         }
     };
 
+    let max_delete_percent = opts
+        .max_delete_percent
+        .unwrap_or(DEFAULT_MAX_DELETE_PERCENT);
+    if max_delete_percent > 100 {
+        bail!("options.max_delete_percent must be 0..=100, got {max_delete_percent}");
+    }
+
     let local_delete = match opts.local_delete.as_deref().unwrap_or("trash") {
         "trash" => LocalDelete::Trash,
         "remove" => LocalDelete::Remove,
@@ -488,6 +514,9 @@ pub fn parse_str(text: &str, source: Option<PathBuf>) -> Result<Config> {
         download_limiter: RateLimiter::new(),
         remote_root,
         propagate_deletes: opts.propagate_deletes.unwrap_or(false),
+        max_delete_files: opts.max_delete_files.unwrap_or(DEFAULT_MAX_DELETE_FILES),
+        max_delete_percent,
+        allow_mass_delete: false,
         auto_sync: opts.auto_sync.unwrap_or(false),
         run_in_tray: opts.run_in_tray.unwrap_or(false),
         x11_compat: opts.x11_compat.unwrap_or(false),
@@ -634,6 +663,8 @@ struct OutCli {
 struct OutOptions {
     remote_root: String,
     propagate_deletes: bool,
+    max_delete_files: usize,
+    max_delete_percent: u8,
     auto_sync: bool,
     run_in_tray: bool,
     x11_compat: bool,
@@ -728,6 +759,8 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
         options: OutOptions {
             remote_root: cfg.remote_root.clone(),
             propagate_deletes: cfg.propagate_deletes,
+            max_delete_files: cfg.max_delete_files,
+            max_delete_percent: cfg.max_delete_percent,
             auto_sync: cfg.auto_sync,
             run_in_tray: cfg.run_in_tray,
             x11_compat: cfg.x11_compat,
@@ -818,6 +851,48 @@ mod tests {
         let cfg = load(Some(path.to_str().unwrap()));
         std::fs::remove_dir_all(&dir).ok();
         cfg
+    }
+
+    #[test]
+    fn the_mass_deletion_guard_has_defaults_can_be_set_and_round_trips() {
+        let cfg = load_str("guard-default", "").unwrap();
+        assert_eq!(cfg.max_delete_files, 100);
+        assert_eq!(cfg.max_delete_percent, 20);
+        assert!(
+            !cfg.allow_mass_delete,
+            "the confirmation is never on by default"
+        );
+
+        let cfg = load_str(
+            "guard-set",
+            "[options]\nmax_delete_files = 7\nmax_delete_percent = 100\n",
+        )
+        .unwrap();
+        assert_eq!((cfg.max_delete_files, cfg.max_delete_percent), (7, 100));
+        let again = parse_str(&to_toml(&cfg).unwrap(), None).unwrap();
+        assert_eq!(
+            (again.max_delete_files, again.max_delete_percent),
+            (7, 100),
+            "a save from the GUI must not reset the guard"
+        );
+
+        // A confirmation is for one run: it is neither read from the file nor
+        // written to it, so a saved config can never carry it forward.
+        let mut cfg = cfg;
+        cfg.allow_mass_delete = true;
+        let text = to_toml(&cfg).unwrap();
+        assert!(!text.contains("allow_mass_delete"), "{text}");
+        assert!(!parse_str(&text, None).unwrap().allow_mass_delete);
+        assert!(
+            load_str("guard-sneaky", "[options]\nallow_mass_delete = true\n")
+                .is_ok_and(|c| !c.allow_mass_delete),
+            "an option of that name in the file must not switch the guard off"
+        );
+
+        let err = load_str("guard-bad", "[options]\nmax_delete_percent = 150\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_delete_percent"), "{err}");
     }
 
     #[test]

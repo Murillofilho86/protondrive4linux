@@ -124,6 +124,35 @@ pub enum SyncEvent {
     /// intact, signing in again won't help, and sync resumes by itself once the
     /// keyring answers - which is announced with an [`SyncEvent::Auth`].
     KeyringUnreachable,
+    /// The mass-deletion guard held a run's deletions back: they would have
+    /// removed `files` files, too many of the `tracked` the pair holds, which is
+    /// far more often a mistake (an unmounted drive, a folder emptied by
+    /// accident) than intended. Nothing was deleted; the run still transferred.
+    /// It is re-reported by every run until the user confirms or restores.
+    DeletesHeld {
+        pair: String,
+        files: usize,
+        tracked: usize,
+    },
+}
+
+/// What to tell the user when the guard held `files` deletions of `tracked`
+/// back: what it saw, that nothing was deleted, and both ways out - deleting for
+/// real, or getting the files back.
+pub fn held_deletes_text(pair: &str, files: usize, tracked: usize) -> String {
+    let percent = if tracked == 0 {
+        0
+    } else {
+        (files * 100).div_ceil(tracked).min(100)
+    };
+    format!(
+        "{pair}: held back {} ({percent}% of the {} this folder pair tracks) - that looks like a \
+         mistake, such as an unmounted drive or a folder emptied by accident, so nothing was \
+         deleted. If you meant it: `protondrive4linux sync --allow-mass-delete {pair}`. To get \
+         the files back instead: `protondrive4linux sync --resync {pair}`.",
+        crate::datefmt::counted(files, "deletion", "deletions"),
+        crate::datefmt::counted(tracked, "file", "files"),
+    )
 }
 
 /// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:

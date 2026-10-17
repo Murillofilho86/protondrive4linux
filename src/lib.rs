@@ -72,6 +72,10 @@ remote_root = "/my-files"
 # online trash, local -> desktop trash (see local_delete). A missing baseline
 # unions both sides, so a lost sync state never triggers a mass delete.
 propagate_deletes = true
+# One run deletes at most max(max_delete_files, max_delete_percent % of what a pair
+# tracks); more than that is held back, not done (see the README). 100 % = off.
+# max_delete_files = 100
+# max_delete_percent = 20
 # How a propagated deletion removes the LOCAL copy:
 #   trash   send it to the freedesktop trash via gio (recoverable)
 #   remove  unlink permanently (no recovery)
