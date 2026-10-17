@@ -50,6 +50,9 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 # child and have the kernel stop it if the supervisor dies. Not a new crate - it
 # is already in the tree under most of the others.
 libc = { version = "0.2", optional = true }
+# PNG encoder for `protondrive4linux-gui --screenshots` (documentation pictures).
+# Not a new crate: it is already in the tree, with the same features, under `image`.
+png = { version = "0.18", optional = true }
 
 [profile.release]
 opt-level = "z"   # optimise for size ("lite")
@@ -73,6 +76,7 @@ gui = [
     "dep:sha2",
     "dep:zbus",
     "dep:libc",
+    "dep:png",
 ]
 
 [[bin]]

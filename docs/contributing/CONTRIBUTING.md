@@ -46,6 +46,20 @@ gh pr create --fill
 This applies to every change, including ones made by Claude Code sessions
 working in this repo - branch + PR, not a direct commit to `master`.
 
+## Screenshots
+
+The pictures in `docs/screenshots/` (shown in the README and in
+[`docs/screenshots.md`](../screenshots.md)) are generated, not captured by hand:
+
+```sh
+scripts/screenshots.sh
+```
+
+runs `protondrive4linux-gui --screenshots`, which draws each page from made-up
+example data (`src/bin/gui/shots.rs`) and never reads your own config or files.
+When a change alters how a page looks, run it and commit the new pictures with
+the change; when you add a page, add a scene for it.
+
 ## Releasing
 
 Releases are built by `.github/workflows/release.yml` on a `v*` tag:

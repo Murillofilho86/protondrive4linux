@@ -50,6 +50,7 @@ Not something to do casually — see `docs/contributing/CONTRIBUTING.md` for ful
 
 - `src/main.rs` — `protondrive4linux` CLI (thin wrapper over the library: `login`, `init`, `sync`, `status`, `doctor`, `logout`, `watch`).
 - `src/bin/gui.rs` — `protondrive4linux-gui` (egui, behind `gui` feature). Intentionally thin over `service::Controller`; has no sync logic of its own.
+- `src/bin/gui/shots.rs` — `--screenshots <dir>`: draws each page from made-up example scenes and writes PNGs (`scripts/screenshots.sh`; the pictures in `docs/screenshots/` come from it). Self-contained: it must never read the user's config, state, themes or desktop entries, never call the CLI, and never print a real path (the Settings page prints the themes folder, hence the made-up `XDG_CONFIG_HOME`). When you add a page, add a scene; when a change alters how a page looks, regenerate and commit the pictures.
 
 ### Key design constraints (see `docs/SYNC_MODEL.md` for full detail)
 

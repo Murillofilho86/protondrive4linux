@@ -3324,6 +3324,7 @@ dependencies = [
  "gtk",
  "libc",
  "notify-debouncer-full",
+ "png",
  "rfd",
  "rusqlite",
  "semver",
