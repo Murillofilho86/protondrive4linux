@@ -117,7 +117,7 @@ When the background tray daemon is doing the work, an open window mirrors its li
 - A missing baseline (first run, or a wiped state dir) unions both sides rather than mirroring, so a lost baseline can't trigger a mass delete.
 - If a folder's local root is missing (an unmounted drive) or its remote base folder has vanished, the pair is refused for that run instead of being read as "everything was deleted".
 - A failed or interrupted run never poisons the wider sync: the baseline records a file only after its transfer actually completes, so a timeout, an error, or a run cancelled part-way leaves every other file's state untouched and retries the rest next run in the correct direction. This is what stops a half-finished run from later mistaking a not-yet-downloaded file for a deletion.
-- Conflicts keep both copies by default (`name (conflict <timestamp>).ext`).
+- Conflicts keep both copies by default (`name (conflict <timestamp>).ext`). The GUI's **Conflicts** page lists every file that changed on both sides and what was done about it - including `conflict = "skip"` ones, which are left untouched until you settle them - and `protondrive4linux status` reports how many are unresolved.
 
 ## Selective sync
 

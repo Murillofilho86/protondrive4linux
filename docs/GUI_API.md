@@ -65,6 +65,19 @@ For places with room for a single state (the tray icon), `AppState::overall()` c
 
 `controller.status_summary()` returns both under the state lock without cloning the activity feed, so it is cheap enough to poll several times a second. `PairState::retrying` counts files that failed and are still inside their backoff window: a run that merely *skips* them finishes with zero errors, so without it a pair would read as healthy while files are failing.
 
+## Conflict inbox
+
+Every conflict settlement is reported as `SyncEvent::Conflict { pair, path, resolution, copy }` (`ConflictResolution::{KeptBoth, KeptLocal, KeptRemote, Skipped}`) once it has actually completed, and the controller persists it to the shared stats DB, so a window sees conflicts the tray daemon (or a CLI run) recorded:
+
+```rust
+controller.conflict_count();                 // unresolved, for a badge
+controller.conflicts(false, 200);            // open ones, newest first (true = include resolved history)
+controller.dismiss_conflict(id);             // acknowledge one (moves to the history)
+controller.dismiss_all_conflicts();
+```
+
+A `Skipped` conflict is re-reported on every run until the user settles it; the store keeps one open entry and clears it automatically once the file syncs.
+
 ## Commands (all non-blocking)
 
 ```rust

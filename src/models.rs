@@ -1,5 +1,7 @@
 //! Core data types shared across the engine.
 
+use crate::events::ConflictResolution;
+
 /// A single node (file or directory) at a path relative to a pair root.
 ///
 /// `path` is always POSIX-style and relative (no leading slash). Directories
@@ -112,6 +114,12 @@ pub struct Op {
     pub reason: String,
     /// Source path for rename/move actions (`path` is the destination).
     pub from: Option<String>,
+    /// Set when this op is how a both-sides-changed conflict gets settled
+    /// (`conflict = "newer"`'s upload/download, or `"skip"`'s no-op), so the
+    /// engine can report the resolution once the op has actually completed.
+    /// `None` for ordinary ops, and for `Action::Conflict` (keep-both), whose
+    /// resolution is reported by `resolve_conflict` itself with the copy's name.
+    pub conflict: Option<ConflictResolution>,
 }
 
 impl Op {
@@ -127,7 +135,14 @@ impl Op {
             is_dir,
             reason: reason.into(),
             from: None,
+            conflict: None,
         }
+    }
+
+    /// Mark this op as how a conflict gets settled (see [`Op::conflict`]).
+    pub fn settling(mut self, resolution: ConflictResolution) -> Self {
+        self.conflict = Some(resolution);
+        self
     }
 
     /// A rename/move op: `from` -> `to` (stored in `path`).
@@ -143,6 +158,7 @@ impl Op {
             is_dir: false,
             reason: reason.into(),
             from: Some(from.into()),
+            conflict: None,
         }
     }
 

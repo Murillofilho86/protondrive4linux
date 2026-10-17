@@ -24,22 +24,31 @@ struct DbSink {
 
 impl EventSink for DbSink {
     fn emit(&self, ev: &SyncEvent) {
-        if let SyncEvent::OpFinished {
-            pair,
-            action,
-            path,
-            ok,
-            error,
-        } = ev
-        {
-            let _ = self.stats.record_op(
+        let now = neutronsync::datefmt::now_epoch();
+        match ev {
+            SyncEvent::OpFinished {
                 pair,
                 action,
                 path,
-                *ok,
-                error.as_deref(),
-                neutronsync::datefmt::now_epoch(),
-            );
+                ok,
+                error,
+            } => {
+                let _ = self
+                    .stats
+                    .record_op(pair, action, path, *ok, error.as_deref(), now);
+            }
+            // So a conflict settled by a CLI run still reaches the GUI's inbox.
+            SyncEvent::Conflict {
+                pair,
+                path,
+                resolution,
+                copy,
+            } => {
+                let _ = self
+                    .stats
+                    .record_conflict(pair, path, *resolution, copy.as_deref(), now);
+            }
+            _ => {}
         }
     }
 }
@@ -207,6 +216,17 @@ fn cmd_status(cli: &Cli) -> anyhow::Result<ExitCode> {
             p.local.display(),
             p.remote
         );
+    }
+    // Only if a stats DB already exists: `status` must not create one.
+    if cfg.state_dir.join("stats.db").exists() {
+        if let Ok(n) = Stats::open(&cfg.state_dir).and_then(|s| s.conflict_count()) {
+            if n > 0 {
+                println!(
+                    "conflicts       {n} unresolved (listed on the GUI's Conflicts page; \
+                     see the sync log for how each was settled)"
+                );
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -382,6 +402,17 @@ fn cmd_watch(cli: &Cli, pairs: &[String]) -> anyhow::Result<ExitCode> {
     }
     // CLI runs until Ctrl-C; the stop flag is only used by the GUI toggle.
     let stop = std::sync::atomic::AtomicBool::new(false);
-    neutronsync::watcher::watch(&cfg, selected, &log, &stop)?;
+    // Record into the shared stats DB like `sync` does, so a headless watcher
+    // (the systemd unit) still feeds the GUI's Activity feed and Conflicts inbox.
+    let db_sink = Stats::open(&cfg.state_dir)
+        .ok()
+        .map(|stats| DbSink { stats });
+    neutronsync::watcher::watch_with(
+        &cfg,
+        selected,
+        &log,
+        &stop,
+        db_sink.as_ref().map(|s| s as &dyn EventSink),
+    )?;
     Ok(ExitCode::SUCCESS)
 }

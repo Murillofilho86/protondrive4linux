@@ -19,7 +19,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
 
-use crate::events::{EventSink, SyncEvent};
+use crate::events::{ConflictResolution, EventSink, SyncEvent};
 
 use crate::config::{remote_join, strip_root, Config, ConflictPolicy, LocalDelete, Pair};
 use crate::datefmt::{epoch_to_stamp, now_epoch};
@@ -1161,19 +1161,19 @@ impl<'a, R: Remote> Engine<'a, R> {
     ) {
         match self.cfg.conflict {
             ConflictPolicy::Skip => {
-                plan.add(Op::new(
-                    Action::Noop,
-                    path,
-                    false,
-                    "conflict skipped (both changed)",
-                ));
+                plan.add(
+                    Op::new(Action::Noop, path, false, "conflict skipped (both changed)")
+                        .settling(ConflictResolution::Skipped),
+                );
             }
             ConflictPolicy::Newer => match (le.and_then(|e| e.mtime), re.and_then(|e| e.mtime)) {
                 (Some(lm), Some(rm)) if lm >= rm => {
-                    self.emit_upload(path, le, plan, nb, "conflict: local newer")
+                    self.emit_upload(path, le, plan, nb, "conflict: local newer");
+                    settle_last(plan, ConflictResolution::KeptLocal);
                 }
                 (Some(_), Some(_)) => {
-                    self.emit_download(path, re, plan, nb, "conflict: remote newer")
+                    self.emit_download(path, re, plan, nb, "conflict: remote newer");
+                    settle_last(plan, ConflictResolution::KeptRemote);
                 }
                 _ => self.emit_conflict_keep_both(path, re, plan, nb),
             },
@@ -1350,6 +1350,11 @@ impl<'a, R: Remote> Engine<'a, R> {
             }
             self.log.info(&op.describe());
             if op.action == Action::Noop {
+                // `conflict = "skip"` leaves both sides alone, but the user has
+                // to hear about it: it never sorts itself out.
+                if let (Some(res), false) = (op.conflict, self.dry_run) {
+                    self.report_conflict(pair, &op.path, res, None);
+                }
                 continue;
             }
             if self.dry_run {
@@ -1391,6 +1396,9 @@ impl<'a, R: Remote> Engine<'a, R> {
                     // deletes/no-ops, which aren't in `pending`).
                     done.insert(op.path.clone());
                     retry_clears.push(op.path.clone());
+                    if let Some(res) = op.conflict {
+                        self.report_conflict(pair, &op.path, res, None);
+                    }
                 }
                 Err(e) => {
                     let msg = format!("{} {}: {e}", op.action.label(), op.path);
@@ -1431,6 +1439,13 @@ impl<'a, R: Remote> Engine<'a, R> {
                     &mut done,
                     &mut retry,
                 );
+                for op in &downloads {
+                    if let Some(res) = op.conflict {
+                        if done.contains(&op.path) {
+                            self.report_conflict(pair, &op.path, res, None);
+                        }
+                    }
+                }
             }
         }
 
@@ -1688,6 +1703,28 @@ impl<'a, R: Remote> Engine<'a, R> {
         Ok(())
     }
 
+    /// Report how a conflict was settled: a text-log line (the resolution
+    /// history for CLI users) and a structured event for frontends.
+    fn report_conflict(
+        &self,
+        pair: &Pair,
+        path: &str,
+        resolution: ConflictResolution,
+        copy: Option<&str>,
+    ) {
+        self.log.info(&format!(
+            "  conflict on {path}: {}{}",
+            resolution.describe(),
+            copy.map(|c| format!(" (copy: {c})")).unwrap_or_default()
+        ));
+        self.emit(SyncEvent::Conflict {
+            pair: pair.name.clone(),
+            path: path.to_string(),
+            resolution,
+            copy: copy.map(str::to_string),
+        });
+    }
+
     fn resolve_conflict(
         &mut self,
         pair: &Pair,
@@ -1718,6 +1755,7 @@ impl<'a, R: Remote> Engine<'a, R> {
             &conflict_full.to_string_lossy(),
             &remote_join(&pair.remote, parent),
         )?;
+        self.report_conflict(pair, rel, ConflictResolution::KeptBoth, Some(&conflict_rel));
         let size = std::fs::metadata(&conflict_full)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -2197,6 +2235,13 @@ impl<'a, R: Remote> Engine<'a, R> {
         children.sort();
         children.dedup();
         Ok((result, children))
+    }
+}
+
+/// Mark the op just added to `plan` as the one that settles a conflict.
+fn settle_last(plan: &mut Plan, resolution: ConflictResolution) {
+    if let Some(op) = plan.ops.last_mut() {
+        op.conflict = Some(resolution);
     }
 }
 

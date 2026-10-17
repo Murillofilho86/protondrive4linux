@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::events::ConflictResolution;
 use crate::models::Entry;
 
 /// Stamped into the DB's `PRAGMA user_version` on every successful open. Bump
@@ -36,6 +37,23 @@ pub struct OpRecord {
     pub ok: bool,
     /// Why it failed, when it did. `None` for successful ops.
     pub error: Option<String>,
+}
+
+/// One entry in the conflict inbox (M1-005): a file that changed on both sides
+/// and how it was settled.
+#[derive(Clone, Debug)]
+pub struct ConflictRecord {
+    pub id: i64,
+    /// Epoch seconds the conflict was settled (or first seen, for `Skipped`).
+    pub ts: i64,
+    pub pair: String,
+    /// The path that conflicted, relative to the pair root.
+    pub rel: String,
+    pub resolution: ConflictResolution,
+    /// For `KeptBoth`: the preserved local copy's path.
+    pub copy_rel: Option<String>,
+    /// The user has acknowledged it (or, for `Skipped`, the file synced).
+    pub dismissed: bool,
 }
 
 impl Stats {
@@ -114,7 +132,17 @@ impl Stats {
                  attempts INTEGER NOT NULL,
                  next_at  INTEGER NOT NULL,
                  PRIMARY KEY (pair, rel)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS conflicts (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 pair       TEXT    NOT NULL,
+                 rel        TEXT    NOT NULL,
+                 ts         INTEGER NOT NULL,
+                 resolution TEXT    NOT NULL,
+                 copy_rel   TEXT,
+                 dismissed  INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_conflicts_open ON conflicts(pair, rel, dismissed);",
         )
         .context("initialising stats schema")?;
         // Migrate older DBs that predate the per-file state column. Existing
@@ -149,7 +177,10 @@ impl Stats {
         conn.execute_batch(
             "CREATE TABLE events (pair TEXT NOT NULL, folder TEXT NOT NULL, ts INTEGER NOT NULL);
              CREATE TABLE ops (pair TEXT NOT NULL, action TEXT NOT NULL, path TEXT NOT NULL, ok INTEGER NOT NULL, ts INTEGER NOT NULL, error TEXT);
-             CREATE TABLE retry_state (pair TEXT NOT NULL, rel TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, PRIMARY KEY (pair, rel));",
+             CREATE TABLE retry_state (pair TEXT NOT NULL, rel TEXT NOT NULL, attempts INTEGER NOT NULL, next_at INTEGER NOT NULL, PRIMARY KEY (pair, rel));
+             CREATE TABLE conflicts (id INTEGER PRIMARY KEY AUTOINCREMENT, pair TEXT NOT NULL, rel TEXT NOT NULL, ts INTEGER NOT NULL, resolution TEXT NOT NULL, copy_rel TEXT, dismissed INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE pair_state (pair TEXT PRIMARY KEY, last_synced INTEGER);
+             CREATE TABLE baseline (pair TEXT NOT NULL, rel TEXT NOT NULL, is_dir INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER, sha1 TEXT, remote_id TEXT, state TEXT NOT NULL DEFAULT 'synced', PRIMARY KEY (pair, rel));",
         )?;
         Ok(Stats {
             conn: Mutex::new(conn),
@@ -359,6 +390,29 @@ impl Stats {
             for rel in removed {
                 del.execute(params![pair, rel])?;
             }
+            // A skipped conflict is settled once its file finally syncs (the user
+            // made the two sides agree, or switched the policy) or disappears:
+            // take it out of the inbox. Looked up first - there are normally
+            // none, and a big commit shouldn't pay a statement per file for it.
+            let open: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT rel FROM conflicts
+                     WHERE pair = ?1 AND resolution = 'skipped' AND dismissed = 0",
+                )?;
+                let rows = stmt.query_map(params![pair], |r| r.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            if !open.is_empty() {
+                let mut dismiss = tx.prepare(
+                    "UPDATE conflicts SET dismissed = 1
+                     WHERE pair = ?1 AND rel = ?2 AND resolution = 'skipped' AND dismissed = 0",
+                )?;
+                for rel in open {
+                    if entries.contains_key(&rel) || removed.contains(&rel) {
+                        dismiss.execute(params![pair, rel])?;
+                    }
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -416,6 +470,118 @@ impl Stats {
         Ok(())
     }
 
+    /// Record how a conflict was settled. A `Skipped` conflict is re-detected on
+    /// every run until the user settles it, so while one is still open for the
+    /// same file this keeps that first entry (and its time) instead of piling up
+    /// a duplicate per run.
+    pub fn record_conflict(
+        &self,
+        pair: &str,
+        rel: &str,
+        resolution: ConflictResolution,
+        copy: Option<&str>,
+        ts: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if resolution == ConflictResolution::Skipped {
+            let open: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM conflicts
+                 WHERE pair = ?1 AND rel = ?2 AND resolution = 'skipped' AND dismissed = 0",
+                params![pair, rel],
+                |r| r.get(0),
+            )?;
+            if open > 0 {
+                return Ok(());
+            }
+        }
+        conn.execute(
+            "INSERT INTO conflicts(pair, rel, ts, resolution, copy_rel) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![pair, rel, ts, resolution.as_str(), copy],
+        )?;
+        Ok(())
+    }
+
+    /// Conflict inbox entries, newest first. Only unresolved ones unless
+    /// `include_dismissed` (the history view).
+    pub fn conflicts(&self, include_dismissed: bool, limit: usize) -> Result<Vec<ConflictRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, pair, rel, resolution, copy_rel, dismissed FROM conflicts
+             WHERE dismissed = 0 OR ?1
+             ORDER BY ts DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![include_dismissed, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, ts, pair, rel, resolution, copy_rel, dismissed) = row?;
+            // A row written by a newer build with a resolution this one doesn't
+            // know is skipped rather than guessed at.
+            let Some(resolution) = ConflictResolution::parse(&resolution) else {
+                continue;
+            };
+            out.push(ConflictRecord {
+                id,
+                ts,
+                pair,
+                rel,
+                resolution,
+                copy_rel,
+                dismissed: dismissed != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    /// How many conflicts are still unresolved (the inbox badge).
+    pub fn conflict_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conflicts WHERE dismissed = 0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Acknowledge one conflict (it stays in the history).
+    pub fn dismiss_conflict(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conflicts SET dismissed = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Acknowledge every open conflict.
+    pub fn dismiss_all_conflicts(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE conflicts SET dismissed = 1 WHERE dismissed = 0", [])?;
+        Ok(())
+    }
+
+    /// Keep only the newest `keep` acknowledged conflicts; open ones are never
+    /// pruned, however many there are.
+    pub fn prune_conflicts(&self, keep: usize) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM conflicts WHERE dismissed = 1 AND id NOT IN
+             (SELECT id FROM conflicts WHERE dismissed = 1 ORDER BY id DESC LIMIT ?1)",
+            params![keep as i64],
+        )?;
+        Ok(())
+    }
+
     /// Whether `pair` has any baseline rows (i.e. it has synced before).
     pub fn has_baseline(&self, pair: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
@@ -445,7 +611,14 @@ impl Stats {
     /// inherit stale baseline state.
     pub fn forget_pair(&self, pair: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        for tbl in ["baseline", "pair_state", "events", "ops"] {
+        for tbl in [
+            "baseline",
+            "pair_state",
+            "events",
+            "ops",
+            "retry_state",
+            "conflicts",
+        ] {
             conn.execute(&format!("DELETE FROM {tbl} WHERE pair = ?1"), params![pair])?;
         }
         Ok(())
@@ -455,7 +628,8 @@ impl Stats {
     pub fn wipe(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
-            "DELETE FROM baseline; DELETE FROM pair_state; DELETE FROM events; DELETE FROM ops;",
+            "DELETE FROM baseline; DELETE FROM pair_state; DELETE FROM events; DELETE FROM ops; \
+             DELETE FROM retry_state; DELETE FROM conflicts;",
         )?;
         Ok(())
     }
@@ -577,6 +751,164 @@ mod tests {
             .unwrap();
         assert_eq!(s.retry_state("p1").unwrap().get("a.txt"), Some(&(1, 100)));
         assert_eq!(s.retry_state("p2").unwrap().get("a.txt"), Some(&(5, 999)));
+    }
+
+    #[test]
+    fn conflicts_are_listed_newest_first_and_can_be_dismissed() {
+        let s = Stats::memory().unwrap();
+        s.record_conflict(
+            "p",
+            "a.txt",
+            ConflictResolution::KeptBoth,
+            Some("a (conflict x).txt"),
+            100,
+        )
+        .unwrap();
+        s.record_conflict("p", "b.txt", ConflictResolution::KeptLocal, None, 200)
+            .unwrap();
+        assert_eq!(s.conflict_count().unwrap(), 2);
+
+        let open = s.conflicts(false, 10).unwrap();
+        assert_eq!(
+            open.iter().map(|c| c.rel.as_str()).collect::<Vec<_>>(),
+            ["b.txt", "a.txt"],
+            "newest first"
+        );
+        assert_eq!(open[1].resolution, ConflictResolution::KeptBoth);
+        assert_eq!(open[1].copy_rel.as_deref(), Some("a (conflict x).txt"));
+
+        // Dismissed ones leave the inbox but stay in the history.
+        s.dismiss_conflict(open[0].id).unwrap();
+        assert_eq!(s.conflict_count().unwrap(), 1);
+        assert_eq!(s.conflicts(false, 10).unwrap().len(), 1);
+        let all = s.conflicts(true, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().find(|c| c.rel == "b.txt").unwrap().dismissed);
+
+        s.dismiss_all_conflicts().unwrap();
+        assert_eq!(s.conflict_count().unwrap(), 0);
+        assert_eq!(s.conflicts(true, 1).unwrap().len(), 1, "limit applies");
+    }
+
+    #[test]
+    fn a_skipped_conflict_is_not_duplicated_while_it_stays_open() {
+        let s = Stats::memory().unwrap();
+        for ts in [100, 200, 300] {
+            s.record_conflict("p", "a.txt", ConflictResolution::Skipped, None, ts)
+                .unwrap();
+        }
+        let open = s.conflicts(false, 10).unwrap();
+        assert_eq!(open.len(), 1, "re-detected each run, one inbox entry");
+        assert_eq!(open[0].ts, 100, "keeps when it was first seen");
+
+        // Once acknowledged, a fresh detection is a new entry.
+        s.dismiss_conflict(open[0].id).unwrap();
+        s.record_conflict("p", "a.txt", ConflictResolution::Skipped, None, 400)
+            .unwrap();
+        assert_eq!(s.conflicts(false, 10).unwrap().len(), 1);
+        assert_eq!(s.conflicts(true, 10).unwrap().len(), 2);
+
+        // Other resolutions are history, never deduped.
+        for ts in [1, 2] {
+            s.record_conflict("p", "b.txt", ConflictResolution::KeptBoth, Some("c"), ts)
+                .unwrap();
+        }
+        assert_eq!(s.conflicts(false, 10).unwrap().len(), 3);
+    }
+
+    fn entry(rel: &str) -> Entry {
+        Entry {
+            path: rel.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_skipped_conflict_clears_when_its_file_finally_syncs() {
+        let s = Stats::memory().unwrap();
+        s.record_conflict("p", "a.txt", ConflictResolution::Skipped, None, 1)
+            .unwrap();
+        s.record_conflict("p", "gone.txt", ConflictResolution::Skipped, None, 2)
+            .unwrap();
+        s.record_conflict("p", "other.txt", ConflictResolution::Skipped, None, 3)
+            .unwrap();
+        s.record_conflict("p", "kept.txt", ConflictResolution::KeptBoth, None, 4)
+            .unwrap();
+        s.record_conflict("q", "a.txt", ConflictResolution::Skipped, None, 5)
+            .unwrap();
+
+        // A commit that writes a.txt and removes gone.txt settles those two -
+        // but not other.txt (untouched), another pair's a.txt, or the
+        // already-applied keep-both history entry.
+        let mut entries = BTreeMap::new();
+        entries.insert("a.txt".to_string(), entry("a.txt"));
+        entries.insert("kept.txt".to_string(), entry("kept.txt"));
+        let removed: HashSet<String> = ["gone.txt".to_string()].into();
+        s.commit_baseline("p", &entries, &removed).unwrap();
+
+        let mut open: Vec<(String, String)> = s
+            .conflicts(false, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.pair, c.rel))
+            .collect();
+        open.sort();
+        assert_eq!(
+            open,
+            [
+                ("p".to_string(), "kept.txt".to_string()),
+                ("p".to_string(), "other.txt".to_string()),
+                ("q".to_string(), "a.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pruning_conflicts_never_drops_open_ones() {
+        let s = Stats::memory().unwrap();
+        for i in 0..5 {
+            s.record_conflict("p", &format!("f{i}"), ConflictResolution::KeptBoth, None, i)
+                .unwrap();
+        }
+        // f0..f2 acknowledged, f3/f4 still open.
+        for c in s.conflicts(true, 10).unwrap() {
+            if ["f0", "f1", "f2"].contains(&c.rel.as_str()) {
+                s.dismiss_conflict(c.id).unwrap();
+            }
+        }
+        s.prune_conflicts(1).unwrap();
+        let rels: Vec<String> = s
+            .conflicts(true, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.rel)
+            .collect();
+        assert!(rels.contains(&"f3".to_string()) && rels.contains(&"f4".to_string()));
+        assert!(
+            rels.contains(&"f2".to_string()),
+            "newest dismissed row kept"
+        );
+        assert!(!rels.contains(&"f0".to_string()) && !rels.contains(&"f1".to_string()));
+    }
+
+    #[test]
+    fn forgetting_a_pair_clears_its_conflicts_and_retry_state() {
+        let s = Stats::memory().unwrap();
+        s.record_conflict("gone", "a.txt", ConflictResolution::Skipped, None, 1)
+            .unwrap();
+        s.record_conflict("stays", "a.txt", ConflictResolution::Skipped, None, 1)
+            .unwrap();
+        s.apply_retry_updates("gone", &[("a.txt".into(), 1, 10)], &[])
+            .unwrap();
+        s.forget_pair("gone").unwrap();
+        assert_eq!(s.conflicts(true, 10).unwrap().len(), 1);
+        assert!(s.retry_state("gone").unwrap().is_empty());
+
+        s.apply_retry_updates("stays", &[("a.txt".into(), 1, 10)], &[])
+            .unwrap();
+        s.wipe().unwrap();
+        assert_eq!(s.conflict_count().unwrap(), 0);
+        assert!(s.retry_state("stays").unwrap().is_empty());
     }
 
     #[test]

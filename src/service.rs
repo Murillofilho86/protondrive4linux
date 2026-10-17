@@ -20,6 +20,7 @@ use crate::engine::run_sync_with;
 use crate::events::{EventSink, SyncEvent};
 use crate::logger::Logger;
 use crate::protoncli::{ProtonCli, Remote};
+pub use crate::stats::ConflictRecord;
 use crate::stats::Stats;
 use crate::watcher;
 
@@ -472,6 +473,18 @@ impl EventSink for StateSink {
                 // Banner-only: auth state is not a file operation and clutters
                 // the activity feed if logged here.
             }
+            SyncEvent::Conflict {
+                pair,
+                path,
+                resolution,
+                copy,
+            } => {
+                drop(s);
+                if let Some(st) = &self.stats {
+                    let _ =
+                        st.record_conflict(pair, path, *resolution, copy.as_deref(), now_epoch());
+                }
+            }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
             SyncEvent::Error { pair, text } => {
                 if let Some(name) = pair {
@@ -522,6 +535,7 @@ impl Controller {
         let mut activity: VecDeque<ActivityItem> = VecDeque::new();
         if let Some(st) = &stats {
             let _ = st.prune_ops(1000);
+            let _ = st.prune_conflicts(500);
             if let Ok(recs) = st.recent_ops(100) {
                 for r in recs.into_iter().rev() {
                     let kind = if r.ok {
@@ -737,6 +751,39 @@ impl Controller {
         self.state.lock().unwrap().watching = false;
     }
 
+    /// The conflict inbox (M1-005), newest first: files that changed on both
+    /// sides and how each was settled. Open ones only, unless
+    /// `include_dismissed` (the history view). Reads the shared stats DB, so a
+    /// window sees conflicts the background tray daemon recorded.
+    pub fn conflicts(&self, include_dismissed: bool, limit: usize) -> Vec<ConflictRecord> {
+        self.stats
+            .as_ref()
+            .and_then(|st| st.conflicts(include_dismissed, limit).ok())
+            .unwrap_or_default()
+    }
+
+    /// How many conflicts are still unresolved (the inbox badge).
+    pub fn conflict_count(&self) -> usize {
+        self.stats
+            .as_ref()
+            .and_then(|st| st.conflict_count().ok())
+            .unwrap_or(0)
+    }
+
+    /// Acknowledge one conflict; it moves to the history.
+    pub fn dismiss_conflict(&self, id: i64) {
+        if let Some(st) = &self.stats {
+            let _ = st.dismiss_conflict(id);
+        }
+    }
+
+    /// Acknowledge every open conflict.
+    pub fn dismiss_all_conflicts(&self) {
+        if let Some(st) = &self.stats {
+            let _ = st.dismiss_all_conflicts();
+        }
+    }
+
     /// Forget a folder's stored data (baseline, per-file state, stats, activity)
     /// so a later folder of the same name can't inherit stale state. The caller
     /// removes it from the config separately.
@@ -934,6 +981,40 @@ mod tests {
             s.status_line(100),
             "docs: 3 files failed, retrying automatically"
         );
+    }
+
+    #[test]
+    fn conflict_events_land_in_the_inbox() {
+        use crate::events::ConflictResolution;
+        let dir = std::env::temp_dir().join(format!(
+            "protondrive4linux-test-inbox-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stats = Arc::new(Stats::open(&dir).unwrap());
+        let sink = StateSink {
+            state: state_with(&["docs"]),
+            stats: Some(stats.clone()),
+        };
+        sink.emit(&SyncEvent::Conflict {
+            pair: "docs".into(),
+            path: "a.txt".into(),
+            resolution: ConflictResolution::KeptBoth,
+            copy: Some("a (conflict 20261016-120000).txt".into()),
+        });
+        let open = stats.conflicts(false, 10).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].pair, "docs");
+        assert_eq!(open[0].rel, "a.txt");
+        assert_eq!(open[0].resolution, ConflictResolution::KeptBoth);
+        assert_eq!(
+            open[0].copy_rel.as_deref(),
+            Some("a (conflict 20261016-120000).txt")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
