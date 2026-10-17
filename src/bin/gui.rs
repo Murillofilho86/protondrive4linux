@@ -23,6 +23,7 @@ use neutronsync::config::{
 };
 use neutronsync::events::ConflictResolution;
 use neutronsync::models::{Compare, Entry};
+use neutronsync::process_lock::{self, ProcessLock};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
     ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus, PairState, Phase,
@@ -574,70 +575,23 @@ fn tray_status_icons() -> Vec<(OverallStatus, tray_icon::Icon)> {
 // single-instance locks + process spawning (daemon <-> window coordination)
 // ---------------------------------------------------------------------------
 
-/// Advisory PID lock: a file under `state_dir` holding a PID, cross-checked
-/// against `/proc`. Removed on drop. Used so at most one daemon and one window
-/// run at a time.
-struct PidLock {
-    path: PathBuf,
-}
-
-impl PidLock {
-    /// Try to take the lock. Returns `None` if a live process already holds it.
-    fn acquire(state_dir: &std::path::Path, name: &str) -> Option<Self> {
-        let _ = std::fs::create_dir_all(state_dir);
-        let path = state_dir.join(name);
-        // Atomic fast path first (see watcher.rs's DaemonLock for why a plain
-        // check-then-write can't be trusted when two processes might start at
-        // the same instant).
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = f.write_all(std::process::id().to_string().as_bytes());
-            return Some(PidLock { path });
-        }
-        if pid_alive_from(&path) {
-            return None;
-        }
-        std::fs::write(&path, std::process::id().to_string()).ok()?;
-        Some(PidLock { path })
-    }
-}
-
-impl Drop for PidLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Last-modified time of a file, if it exists (used to detect config changes).
 fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Whether the PID recorded in `lock` names a currently-running process.
-fn pid_alive_from(lock: &std::path::Path) -> bool {
-    if let Ok(s) = std::fs::read_to_string(lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            return std::path::Path::new(&format!("/proc/{pid}")).exists();
-        }
-    }
-    false
-}
-
 const DAEMON_LOCK: &str = "tray-daemon.lock";
 const WINDOW_LOCK: &str = "window.lock";
 
-/// Is a headless tray daemon already running for this state dir?
+/// Is a headless tray daemon already running for this state dir? (Asks the lock
+/// who holds it - a live process, not merely a pid that still exists.)
 fn daemon_running(state_dir: &std::path::Path) -> bool {
-    pid_alive_from(&state_dir.join(DAEMON_LOCK))
+    process_lock::holder(&state_dir.join(DAEMON_LOCK)).is_some()
 }
 
 /// Is a GUI window already open for this state dir?
 fn window_running(state_dir: &std::path::Path) -> bool {
-    pid_alive_from(&state_dir.join(WINDOW_LOCK))
+    process_lock::holder(&state_dir.join(WINDOW_LOCK)).is_some()
 }
 
 /// Path of our own executable (falls back to the on-PATH name).
@@ -684,16 +638,14 @@ fn spawn_daemon() {
 /// exit path (closing the window alone still leaves the tray syncing). A killed
 /// window can't corrupt state: the baseline is only committed at the end of a
 /// completed sync, so an aborted transfer is simply retried next run.
+///
+/// Only the process the lock really names is signalled: a leftover `window.lock`
+/// whose pid has since gone to some other program must never get a SIGTERM.
 fn terminate_window(state_dir: &std::path::Path) {
-    let lock = state_dir.join(WINDOW_LOCK);
-    if let Ok(s) = std::fs::read_to_string(&lock) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status();
-            }
-        }
+    if let Some(pid) = process_lock::holder(&state_dir.join(WINDOW_LOCK)) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
     }
 }
 
@@ -766,7 +718,7 @@ struct App {
     // When true (run_in_tray), a headless daemon owns the tray + watcher; this
     // window just ensures one exists and exits on close (the daemon lives on).
     mode_daemon: bool,
-    _win_lock: Option<PidLock>,
+    _win_lock: Option<ProcessLock>,
 
     // conflict inbox (M1-005): polled from the shared stats DB about once a
     // second, since the background daemon (a separate process) writes to it.
@@ -804,7 +756,7 @@ impl App {
             if !daemon_running(&cfg.state_dir) {
                 spawn_daemon();
             }
-            PidLock::acquire(&cfg.state_dir, WINDOW_LOCK)
+            process_lock::acquire(&cfg.state_dir.join(WINDOW_LOCK)).ok()
         } else {
             None
         };
@@ -4309,9 +4261,9 @@ fn run_daemon() {
             return;
         }
     };
-    let _lock = match PidLock::acquire(&cfg.state_dir, DAEMON_LOCK) {
-        Some(l) => l,
-        None => {
+    let _lock = match process_lock::acquire(&cfg.state_dir.join(DAEMON_LOCK)) {
+        Ok(l) => l,
+        Err(_) => {
             eprintln!("protondrive4linux: a tray daemon is already running");
             return;
         }
@@ -4421,7 +4373,9 @@ fn run_daemon() {
             }
         }
         // Start the watcher once the previous one has released watch.lock.
-        if pending_restart && !pid_alive_from(&state_dir.join("watch.lock")) {
+        if pending_restart
+            && process_lock::holder(&state_dir.join(neutronsync::watcher::LOCK_FILE)).is_none()
+        {
             pending_restart = false;
             if want_watch {
                 let names = auto_names_of(&ctrl_cb.config());

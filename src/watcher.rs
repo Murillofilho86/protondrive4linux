@@ -118,53 +118,28 @@ fn is_content_change(kind: &notify_debouncer_full::notify::EventKind) -> bool {
 pub const LOCK_FILE: &str = "watch.lock";
 
 /// Single-instance lock so a watch daemon and, say, a systemd timer don't run
-/// the same pairs at once. Advisory: a PID file, checked against /proc.
+/// the same pairs at once. Held with a kernel file lock and described by a pid +
+/// start time + boot id record - see [`crate::process_lock`] for why a bare PID
+/// file wasn't enough (a pid outlives its process in the file, and gets reused).
 struct DaemonLock {
-    path: PathBuf,
+    _lock: crate::process_lock::ProcessLock,
 }
 
 impl DaemonLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
+        use crate::process_lock::{acquire, AcquireError};
         let path = state_dir.join(LOCK_FILE);
-        // Atomic fast path: create_new (O_CREAT|O_EXCL) can't race with
-        // another process doing the same, unlike a separate read-then-write -
-        // two things starting at the same instant (a systemd timer and a
-        // manual `protondrive4linux watch`) can't both win this.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(std::process::id().to_string().as_bytes())?;
-                return Ok(DaemonLock { path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-        // A lock file already exists: either a live daemon, or one left
-        // behind by a crash. Only reclaim it if the PID it names is dead.
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(pid) = s.trim().parse::<u32>() {
-                if Path::new(&format!("/proc/{pid}")).exists() {
-                    bail!(
-                        "a protondrive4linux watch is already running (pid {pid}); \
-                         lock file {}",
-                        path.display()
-                    );
-                }
+        match acquire(&path) {
+            Ok(lock) => Ok(DaemonLock { _lock: lock }),
+            Err(AcquireError::Held { pid }) => bail!(
+                "a protondrive4linux watch is already running{}; lock file {}",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default(),
+                path.display()
+            ),
+            Err(AcquireError::Io(e)) => {
+                Err(anyhow::Error::new(e).context(format!("taking {}", path.display())))
             }
         }
-        std::fs::write(&path, std::process::id().to_string())?;
-        Ok(DaemonLock { path })
-    }
-}
-
-impl Drop for DaemonLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 

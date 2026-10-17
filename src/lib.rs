@@ -24,6 +24,7 @@ pub mod logger;
 pub mod models;
 #[cfg(feature = "gui")]
 pub mod notify;
+pub mod process_lock;
 pub mod protoncli;
 pub mod ratelimit;
 pub mod service;
