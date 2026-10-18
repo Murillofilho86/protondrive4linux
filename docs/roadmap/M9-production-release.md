@@ -74,8 +74,11 @@ o arquivo) e um teste da guarda de pasta que nunca chegava ao código que deveri
       `sync --resync NOME` (trazer os arquivos de volta). Um walk completo conta os arquivos que
       ainda existem em disco antes da primeira deleção (HD desmontado / `rm -rf` não apaga
       nada), e todos os workers de um walk gastam uma única franquia.
-- [ ] Botões "Apagar mesmo" / "Restaurar" na janela e notificação do tray (hoje a CLI e o erro
-      do par já cobrem; a GUI mostra o erro e o comando).
+- [x] Na janela: faixa na página Atividade ("1.640 exclusões seguradas") com os botões **Restore them**
+      (`resync`: traz os arquivos de volta) e **Delete them** (pede confirmação; vai para a lixeira
+      do Proton / a sua), cartão da pasta em âmbar e uma notificação do tray por pasta. A trava só
+      cai quando uma execução sobre a pasta **inteira** não segura nada: uma passada sobre
+      poucas pastas editadas não a apaga, para a faixa não ir e vir enquanto se trabalha.
 - Limite que sobra: deleções fatiadas em várias execuções, cada uma abaixo da franquia.
 - Limites documentados em `docs/DATA_LOSS_REVIEW.md` § Limits (timeout vs arquivo grande, timeout
   mata só o processo filho, duas execuções ao mesmo tempo não são impedidas, nomes de arquivo

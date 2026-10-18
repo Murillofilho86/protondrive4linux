@@ -19,6 +19,12 @@
 //! - a keyring the CLI can't reach is, at login, usually one its owner is about
 //!   to unlock, so that only notifies once it has lasted [`KEYRING_GRACE_SECS`],
 //!   then once per episode;
+//! - deletions the mass-deletion guard holds back notify at once (they need a
+//!   decision, and nothing else will say so), once per folder pair for as long
+//!   as the same deletions stay held; a count that keeps changing (a folder
+//!   still being emptied) is told again no sooner than [`HELD_COOLDOWN_SECS`],
+//!   and the generic sync-problem notice stays quiet about what this one
+//!   already said ([`without_held`]);
 //! - the tray supervisor giving up on a tray that keeps dying notifies at most
 //!   once an hour ([`announce_give_up`]).
 
@@ -27,7 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::events::ConflictResolution;
-use crate::service::OverallStatus;
+use crate::service::{HeldDeletes, OverallStatus};
 use crate::stats::ConflictRecord;
 
 /// How long a sync problem must persist before it's worth a notification.
@@ -41,6 +47,9 @@ pub const CONFLICT_COOLDOWN_SECS: i64 = 30;
 /// How long the keyring must stay out of reach before it's worth a notification:
 /// well past the minute it takes to type a password into the unlock prompt.
 pub const KEYRING_GRACE_SECS: i64 = 300;
+/// Minimum gap before deletions held back for a folder pair are announced again
+/// because their number changed (the same number is never announced twice).
+pub const HELD_COOLDOWN_SECS: i64 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeKind {
@@ -49,6 +58,8 @@ pub enum NoticeKind {
     SignedOut,
     /// The CLI has been unable to reach its keyring for a while.
     WaitingForKeyring,
+    /// The mass-deletion guard is holding deletions back until the user decides.
+    DeletesHeld,
     /// The tray supervisor stopped restarting a tray that keeps failing.
     BackgroundSyncStopped,
 }
@@ -72,6 +83,9 @@ pub struct Notifier {
     pending: Vec<ConflictRecord>,
     pending_since: Option<i64>,
     last_conflict_notice: Option<i64>,
+    /// For each folder pair with deletions held back that was announced: how
+    /// many (remote, local), and when.
+    told_held: HashMap<String, ((usize, usize), i64)>,
 }
 
 impl Notifier {
@@ -88,6 +102,37 @@ impl Notifier {
             pending: Vec::new(),
             pending_since: None,
             last_conflict_notice: None,
+            told_held: HashMap::new(),
+        }
+    }
+
+    /// Announce deletions the guard is holding back. `held` is every folder pair
+    /// that has some right now: a pair is announced when it first has some (and
+    /// again, no sooner than [`HELD_COOLDOWN_SECS`] later, only if their number
+    /// changed), never while the same ones stay held - however many passes
+    /// report them. A pair that no longer has any is forgotten, so the next time
+    /// is news again. Pairs that become news together share one notice.
+    pub fn held(&mut self, now: i64, held: &[(String, HeldDeletes)]) -> Vec<Notification> {
+        self.told_held
+            .retain(|pair, _| held.iter().any(|(p, _)| p == pair));
+        let news: Vec<(String, HeldDeletes)> = held
+            .iter()
+            .filter(|(pair, h)| match self.told_held.get(pair) {
+                None => true,
+                Some(&(counts, at)) => {
+                    counts != (h.remote, h.local) && now - at >= HELD_COOLDOWN_SECS
+                }
+            })
+            .cloned()
+            .collect();
+        for (pair, h) in &news {
+            self.told_held
+                .insert(pair.clone(), ((h.remote, h.local), now));
+        }
+        if news.is_empty() {
+            Vec::new()
+        } else {
+            vec![held_notice(&news)]
         }
     }
 
@@ -167,6 +212,53 @@ impl Notifier {
 
         self.prev = status;
         out
+    }
+}
+
+/// The status [`Notifier::tick`] should be given: `status`, except that an error
+/// which is only deletions held back (`only_held`, see
+/// [`crate::service::AppState::only_held_problems`]) is not announced a second
+/// time as a generic sync problem - [`Notifier::held`] has already said it, and
+/// better.
+pub fn without_held(status: OverallStatus, only_held: bool) -> OverallStatus {
+    if status == OverallStatus::Error && only_held {
+        OverallStatus::Synced
+    } else {
+        status
+    }
+}
+
+/// One notification for the folder pairs whose held-back deletions are news.
+fn held_notice(news: &[(String, HeldDeletes)]) -> Notification {
+    const NEXT: &str = "Open protondrive4linux to delete them or get the files back.";
+    if let [(pair, h)] = news {
+        return Notification {
+            kind: NoticeKind::DeletesHeld,
+            summary: format!("{} held back", h.deletions()),
+            body: format!(
+                "In {pair}, they would remove {}% of its {} {}. That looks like a mistake, \
+                 so nothing was deleted. {NEXT}",
+                h.percent(),
+                crate::datefmt::counted(h.tracked, "file", "files"),
+                h.removed_from(),
+            ),
+        };
+    }
+
+    const SHOWN: usize = 3;
+    let mut lines: Vec<String> = news
+        .iter()
+        .take(SHOWN)
+        .map(|(pair, h)| format!("{pair}: {}", h.deletions()))
+        .collect();
+    if news.len() > SHOWN {
+        lines.push(format!("…and {} more", news.len() - SHOWN));
+    }
+    lines.push(format!("Nothing was deleted. {NEXT}"));
+    Notification {
+        kind: NoticeKind::DeletesHeld,
+        summary: format!("Deletions held back in {} folders", news.len()),
+        body: lines.join("\n"),
     }
 }
 
@@ -875,5 +967,136 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    fn held(remote: usize, local: usize, tracked: usize) -> HeldDeletes {
+        HeldDeletes {
+            remote,
+            local,
+            tracked,
+            at: 0,
+        }
+    }
+
+    fn pairs(v: &[(&str, HeldDeletes)]) -> Vec<(String, HeldDeletes)> {
+        v.iter().map(|(n, h)| (n.to_string(), *h)).collect()
+    }
+
+    #[test]
+    fn held_deletions_are_announced_at_once_and_only_once_while_they_stand() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        let h = pairs(&[("docs", held(300, 0, 400))]);
+        let out = n.held(100, &h);
+        assert_eq!(kinds(&out), [NoticeKind::DeletesHeld]);
+        assert_eq!(out[0].summary, "300 deletions held back");
+        let body = &out[0].body;
+        for part in [
+            "docs",
+            "75%",
+            "400 files",
+            "from Proton Drive",
+            "nothing was deleted",
+        ] {
+            assert!(body.contains(part), "{part:?} missing from: {body}");
+        }
+        // Every pass that runs into them again says the same: not news.
+        for t in 101..5_000 {
+            assert!(n.held(t, &h).is_empty(), "t={t}");
+        }
+    }
+
+    #[test]
+    fn a_count_that_keeps_changing_is_told_again_only_after_the_cooldown() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        assert_eq!(n.held(0, &pairs(&[("docs", held(120, 0, 400))])).len(), 1);
+        // The folder is still being emptied: 130, 140, ... within the cooldown.
+        for (t, files) in [(10, 130), (60, 140), (HELD_COOLDOWN_SECS - 1, 150)] {
+            assert!(
+                n.held(t, &pairs(&[("docs", held(files, 0, 400))]))
+                    .is_empty(),
+                "t={t}"
+            );
+        }
+        // Past it, the number it reached is news; and then it is told.
+        let out = n.held(HELD_COOLDOWN_SECS, &pairs(&[("docs", held(150, 0, 400))]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].summary, "150 deletions held back");
+        assert!(n
+            .held(
+                HELD_COOLDOWN_SECS + 1,
+                &pairs(&[("docs", held(150, 0, 400))])
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn a_pair_that_is_settled_is_news_again_the_next_time() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        let h = pairs(&[("docs", held(300, 0, 400))]);
+        assert_eq!(n.held(0, &h).len(), 1);
+        // The user acted; the next whole run held nothing.
+        assert!(n.held(5, &[]).is_empty());
+        // The same number again, a minute later: a new episode, so it is said.
+        assert_eq!(n.held(65, &h).len(), 1);
+    }
+
+    #[test]
+    fn pairs_that_become_news_together_share_one_notice() {
+        let mut n = Notifier::new(OverallStatus::Synced);
+        let two = pairs(&[("docs", held(300, 0, 400)), ("photos", held(0, 50, 100))]);
+        let out = n.held(0, &two);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].summary, "Deletions held back in 2 folders");
+        assert!(
+            out[0].body.contains("docs: 300 deletions"),
+            "{}",
+            out[0].body
+        );
+        assert!(
+            out[0].body.contains("photos: 50 deletions"),
+            "{}",
+            out[0].body
+        );
+
+        // A third one arriving later is told on its own.
+        let three = pairs(&[
+            ("docs", held(300, 0, 400)),
+            ("photos", held(0, 50, 100)),
+            ("music", held(40, 0, 60)),
+        ]);
+        let out = n.held(30, &three);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].summary, "40 deletions held back");
+        assert!(out[0].body.contains("music"), "{}", out[0].body);
+    }
+
+    #[test]
+    fn the_notice_says_which_side_the_files_would_have_gone_from() {
+        let body = |h| held_notice(&pairs(&[("docs", h)])).body;
+        assert!(body(held(100, 0, 200)).contains("from Proton Drive"));
+        assert!(body(held(0, 100, 200)).contains("from this computer"));
+        assert!(body(held(60, 40, 200)).contains("from Proton Drive and this computer"));
+    }
+
+    #[test]
+    fn an_error_that_is_only_held_deletions_is_not_announced_twice() {
+        use OverallStatus::*;
+        assert_eq!(without_held(Error, true), Synced);
+        // Anything else wrong still is, and other states are untouched.
+        assert_eq!(without_held(Error, false), Error);
+        for s in [SignedOut, WaitingForKeyring, Syncing, Synced, Paused] {
+            assert_eq!(without_held(s, true), s);
+        }
+
+        // End to end: a held pair that stays in error for an hour says it once,
+        // as its own notice, and never as a "Sync problem" besides.
+        let mut n = Notifier::new(Synced);
+        let h = pairs(&[("docs", held(300, 0, 400))]);
+        let mut all = Vec::new();
+        for t in 0..3_600 {
+            all.extend(n.held(t, &h));
+            all.extend(n.tick(t, without_held(Error, true), "docs: held back", vec![]));
+        }
+        assert_eq!(kinds(&all), [NoticeKind::DeletesHeld]);
     }
 }

@@ -87,8 +87,12 @@ Decisions or work, not fixes - none of these is hidden by the tests above.
    remote being emptied is bounded to the allowance. What it does not do: a
    deletion *spread over many runs*, each under the allowance (a user deleting
    half a library over an afternoon, one debounced batch at a time), is not one
-   event to it. Tests: the `a_deletion_far_bigger_than_the_allowance_…` family
-   in `tests/data_loss.rs`.
+   event to it. The window shows a held run as a banner on the Activity page
+   with **Restore them** / **Delete them**, the tray sends one notification, and
+   the hold stands until a run over the whole folder finds nothing to hold (a
+   pass over a few edited folders does not clear it). Tests: the
+   `a_deletion_far_bigger_than_the_allowance_…` family in `tests/data_loss.rs`,
+   and `tests/controller_held.rs` for what a frontend sees and can do.
 2. **A listing that succeeds but is wrong is believed.** An empty folder
    listing is a real "everything was deleted there". If the CLI or the API ever
    returned one for a folder that is not empty, the local files go to the

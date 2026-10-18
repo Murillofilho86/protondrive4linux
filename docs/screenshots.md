@@ -48,6 +48,12 @@ When the CLI has a session but can't reach the keyring it is kept in (the keyrin
 
 ![Waiting for the keyring](screenshots/keyring.png)
 
+## Deletions held back
+
+When one run would delete far more than anyone deletes by hand - more than 100 files and more than 20 % of what a folder holds, by default - protondrive4linux deletes **nothing** and asks. That is almost always a mistake (a drive that wasn't mounted, a folder emptied by accident), and the banner says how many files, how much of the folder, which side they would have been removed from, and that nothing was deleted. **Restore them** brings the files back (both sides are merged afresh and nothing is deleted); **Delete them** is for when it was on purpose, asks first, and says the files go to Proton's trash or your own, where they can still be restored. The folder's card says "N deletions held back" in amber, and the tray sends one notification. The same two answers from a terminal: `protondrive4linux sync --resync NAME` and `protondrive4linux sync --allow-mass-delete NAME`.
+
+![Activity page with deletions held back](screenshots/held.png)
+
 ## Light theme
 
 Settings → Appearance → Theme is **System** (follows the desktop's light/dark setting), **Light**, **Dark**, or any theme file you add (see [THEMES.md](THEMES.md)).

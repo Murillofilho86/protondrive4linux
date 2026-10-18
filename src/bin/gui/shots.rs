@@ -24,7 +24,8 @@ use neutronsync::config::{self, Config, Pair, ThemePref};
 use neutronsync::datefmt::now_epoch;
 use neutronsync::events::ConflictResolution;
 use neutronsync::service::{
-    AccountState, ActivityItem, ActivityKind, ActivityOp, AppState, PairState, Phase, Progress,
+    AccountState, ActivityItem, ActivityKind, ActivityOp, AppState, HeldDeletes, PairState, Phase,
+    Progress,
 };
 use neutronsync::stats::ConflictRecord;
 use neutronsync::themes::Catalog;
@@ -83,6 +84,7 @@ fn pair(
         last_synced,
         tracked: files,
         retrying: 0,
+        held: None,
     }
 }
 
@@ -278,6 +280,27 @@ fn scenes(now: i64) -> Vec<Scene> {
     keyring.keyring_unreachable = true;
     keyring.watching = false;
 
+    // The mass-deletion guard held a deletion back: most of Photos is gone from
+    // this computer (a card pulled out, a folder emptied by accident), and the
+    // deletions that would have followed on Proton Drive wait for a decision.
+    let mut held = idle(now);
+    let hold = HeldDeletes {
+        remote: 1_640,
+        local: 0,
+        tracked: 2_118,
+        at: now - 20,
+    };
+    let text = neutronsync::events::held_deletes_text("Photos", 1_640, 0, 2_118);
+    held.pairs[1].phase = Phase::Error;
+    held.pairs[1].held = Some(hold);
+    held.pairs[1].last_error = Some(text.clone());
+    held.activity.push_back(ActivityItem {
+        ts: now - 20,
+        kind: ActivityKind::Error,
+        text: format!("Photos: {text}"),
+        op: None,
+    });
+
     let mut idle_folders = idle(now);
     idle_folders.pairs[2].retrying = 3;
 
@@ -296,6 +319,7 @@ fn scenes(now: i64) -> Vec<Scene> {
         scene("account", Nav::Account, false, idle(now), vec![]),
         scene("sign-in", Nav::Activity, false, signed_out, vec![]),
         scene("keyring", Nav::Activity, false, keyring, vec![]),
+        scene("held", Nav::Activity, false, held, vec![]),
         scene("activity-light", Nav::Activity, true, idle(now), vec![]),
         scene("folders-light", Nav::Folders, true, idle_folders, vec![]),
         scene(
@@ -636,6 +660,7 @@ mod tests {
             "account",
             "sign-in",
             "keyring",
+            "held",
         ] {
             assert!(names.contains(&want), "no scene named {want}");
         }
@@ -708,6 +733,22 @@ mod tests {
                 s.name
             );
             assert_eq!(s.state.signed_out, s.name == "sign-in", "{}", s.name);
+        }
+    }
+
+    #[test]
+    fn the_held_scene_is_a_hold_the_activity_page_asks_about() {
+        let none = std::collections::HashMap::new();
+        let held = scenes(NOW)
+            .into_iter()
+            .find(|s| s.name == "held")
+            .expect("a held scene");
+        let (pair, h, others) = crate::held_to_show(&held.state, &none).expect("a folder is held");
+        assert_eq!((pair, others), ("Photos", 0));
+        assert_eq!((h.files(), h.percent()), (1_640, 78));
+        // Every other scene is an ordinary one: nothing asks for a decision.
+        for s in scenes(NOW).into_iter().filter(|s| s.name != "held") {
+            assert!(crate::held_to_show(&s.state, &none).is_none(), "{}", s.name);
         }
     }
 
