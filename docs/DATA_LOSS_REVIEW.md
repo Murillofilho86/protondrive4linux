@@ -66,7 +66,7 @@ be argued from the code, not run.
 | **Network loss** | Every call fails, nothing is deleted or changed, local edits wait and go up when it is back, remote changes come down, and an edit on both sides becomes a conflict. A CLI call that hangs is killed at `cli_timeout_secs` | `offline_then_reconnect_reconciles_correctly`, `crashing_cli_does_not_corrupt_state`, `a_cli_that_hits_its_timeout_mid_download_leaves_no_partial_file_and_no_junk`, `tests/protoncli_timeout.rs` |
 | **Disk full** | A download that fails part way leaves the old local file as it was, no partial file, no conflict copy and no junk uploaded; the retry succeeds. A disk too full for the baseline to be written only means the next run re-detects (the file is then seen as equal on both sides and nothing is transferred) | `a_download_that_dies_half_way_leaves_nothing_under_the_final_name`, `a_download_that_dies_over_an_existing_file_keeps_the_old_copy`. The failure is simulated (a download that writes part of the file and errors); a real full disk was not created |
 | **Permission denied** | An unreadable folder never makes its files look deleted; an unreadable file is an error and the remote copy is untouched; an unwritable destination fails the download cleanly | `an_unreadable_local_folder_never_deletes_what_it_holds`, `a_file_that_cannot_be_read_is_an_error_and_never_touches_the_remote_copy`, `a_download_into_a_folder_that_cannot_be_written_fails_cleanly` (skipped when run as root) |
-| **Remote unavailable** | A failed listing, a missing remote base folder, and a missing subfolder all suppress deletes for the run | `incomplete_remote_scan_suppresses_delete`, `vanished_remote_base_suppresses_delete`, `shallow_remote_list_failure_suppresses_delete`, `shallow_remote_notfound_suppresses_delete`. **Not covered**: a listing that *succeeds* but is wrong (an empty array from an API glitch) is believed - see the limits below |
+| **Remote unavailable** | A failed listing, a missing remote base folder, and a missing subfolder all suppress deletes for the run; a remote that lists most of the tree as gone deletes at most the guard's allowance locally (to the desktop trash) and is reported | `incomplete_remote_scan_suppresses_delete`, `vanished_remote_base_suppresses_delete`, `shallow_remote_list_failure_suppresses_delete`, `shallow_remote_notfound_suppresses_delete`. **Not covered**: a listing that *succeeds* but is wrong (an empty array from an API glitch) is believed, now bounded by the mass-deletion guard - see the limits below |
 | **Local unavailable** | A missing root refuses the pair; an empty root with files on record holds deletions back; a folder that is now a symlink holds them back | `missing_local_root_refuses_delete`, `an_empty_local_root_never_deletes_the_remote`, `a_tracked_folder_replaced_by_a_symlink_is_not_a_deletion_and_is_never_followed` |
 | **Conflict** | Both versions are kept (the default); `newer` and `skip` are tested; a conflict copy never replaces anything; a conflict whose transfer fails half way loses nothing and converges. Equal sizes are no longer taken for equal content | the `conflict_*` tests of `tests/engine.rs`, `a_conflict_copy_never_overwrites_a_file_that_already_has_its_name`, `a_conflict_whose_download_fails_loses_nothing_and_converges`, `two_different_edits_of_the_same_size_are_a_conflict_not_metadata_drift` |
 | **Rename** | A real rename is a move (and not a re-upload); a look-alike (same size and second, other bytes) is not, when the remote lists a digest | `local_rename_becomes_remote_move`, `a_real_rename_is_still_a_move_even_with_digests`, `a_new_file_with_the_size_and_time_of_a_deleted_one_is_not_a_rename`. Only the batch scan detects renames; the watcher's shallow walk sees a delete and a create |
@@ -77,14 +77,18 @@ be argued from the code, not run.
 
 Decisions or work, not fixes - none of these is hidden by the tests above.
 
-1. **No mass-deletion circuit breaker.** With `propagate_deletes` on, a run that
-   would delete most of what it tracks does so. Every case found above is now
-   caught by a specific guard (an empty root, an unreadable folder, a symlink, a
-   moved pair, a failed listing), and both sides' deletes are recoverable, but a
-   case nobody thought of is not caught. The usual defence (rclone's
-   `--max-delete`) needs a threshold *and* a way to say "yes, I meant it" in the
-   CLI, the tray and the window; that is a product decision, not a bug fix, and
-   is left for the maintainer.
+1. ~~**No mass-deletion circuit breaker.**~~ **Added after the review** (the one
+   decision it left open): with `propagate_deletes` on, one run may delete at most
+   the larger of `max_delete_files` (100) and `max_delete_percent` (20 %) of the
+   files a pair tracks; more is held back whole - the transfers carry on - and
+   reported with both ways out (`sync --allow-mass-delete`, `sync --resync`). A
+   full walk counts the files on disk first, so a tree that has mostly gone
+   deletes nothing; a walk spends one allowance across all its folders; the
+   remote being emptied is bounded to the allowance. What it does not do: a
+   deletion *spread over many runs*, each under the allowance (a user deleting
+   half a library over an afternoon, one debounced batch at a time), is not one
+   event to it. Tests: the `a_deletion_far_bigger_than_the_allowance_…` family
+   in `tests/data_loss.rs`.
 2. **A listing that succeeds but is wrong is believed.** An empty folder
    listing is a real "everything was deleted there". If the CLI or the API ever
    returned one for a folder that is not empty, the local files go to the

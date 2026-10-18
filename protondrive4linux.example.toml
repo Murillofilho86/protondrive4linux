@@ -53,6 +53,16 @@ remote_root = "/my-files"
 # A missing/blank baseline never triggers deletes (first run unions both sides).
 propagate_deletes = true
 
+# The mass-deletion guard. With propagate_deletes on, one run may delete at most
+# the larger of max_delete_files files and max_delete_percent % of the files a
+# pair tracks. A run that would delete more deletes NOTHING (it still transfers)
+# and says so: that is far more often a mistake - an unmounted drive, a folder
+# emptied by accident - than intended. To go ahead anyway, run
+# `protondrive4linux sync --allow-mass-delete NAME`; to get the files back,
+# `protondrive4linux sync --resync NAME`. max_delete_percent = 100 turns it off.
+# max_delete_files = 100
+# max_delete_percent = 20
+
 # How a propagated deletion removes the LOCAL copy:
 #   trash   send it to the freedesktop trash via `gio` (recoverable)
 #   remove  unlink permanently (no recovery)

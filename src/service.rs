@@ -522,6 +522,29 @@ impl EventSink for StateSink {
                         st.record_conflict(pair, path, *resolution, copy.as_deref(), now_epoch());
                 }
             }
+            SyncEvent::DeletesHeld {
+                pair,
+                remote,
+                local,
+                tracked,
+            } => {
+                // Needs the user: shown as the pair's problem until a run no
+                // longer trips the guard (a run that finishes clean clears it).
+                // The same sentence again (every run re-plans the same deletions
+                // and holds them again) is the same news: one feed row, not one
+                // per run.
+                let text = crate::events::held_deletes_text(pair, *remote, *local, *tracked);
+                let repeat = s
+                    .pair_mut(pair)
+                    .is_some_and(|p| p.last_error.as_deref() == Some(text.as_str()));
+                if let Some(p) = s.pair_mut(pair) {
+                    p.phase = Phase::Error;
+                    p.last_error = Some(text.clone());
+                }
+                if !repeat {
+                    s.push(ActivityKind::Error, format!("{pair}: {text}"));
+                }
+            }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
             SyncEvent::Error { pair, text } => {
                 if let Some(name) = pair {
@@ -1006,6 +1029,36 @@ mod tests {
             s.status_line(now),
             "Signed out of Proton — sign in to resume"
         );
+    }
+
+    #[test]
+    fn held_deletions_show_as_the_pairs_problem_once() {
+        let sink = StateSink {
+            state: state_with(&["docs"]),
+            stats: None,
+        };
+        let held = SyncEvent::DeletesHeld {
+            pair: "docs".into(),
+            remote: 300,
+            local: 0,
+            tracked: 400,
+        };
+        sink.emit(&held);
+        sink.emit(&held); // the next run holds the same deletions again
+        let s = sink.state.lock().unwrap();
+        let p = &s.pairs[0];
+        assert_eq!(p.phase, Phase::Error);
+        let msg = p.last_error.as_deref().unwrap();
+        assert!(
+            msg.contains("held back 300 deletions on Proton Drive") && msg.contains("75%"),
+            "{msg}"
+        );
+        assert_eq!(
+            s.activity.len(),
+            1,
+            "the same news twice is one row in the feed"
+        );
+        assert_eq!(s.overall(), OverallStatus::Error);
     }
 
     #[test]

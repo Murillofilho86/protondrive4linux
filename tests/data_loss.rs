@@ -9,7 +9,8 @@
 //! - a staging folder from a download that was killed;
 //! - deletions that must not happen because the engine's view of one side is
 //!   blind or suspicious (an unreadable folder, an empty root, a symlink, a
-//!   pair pointed at another folder).
+//!   pair pointed at another folder);
+//! - a deletion too big to be believed (the mass-deletion guard).
 //!
 //! The sync semantics themselves (the decision table, the baseline) are in
 //! `tests/engine.rs`; the processes-and-signals scenarios are in
@@ -1266,4 +1267,362 @@ fn a_large_tree_converges_in_both_directions_with_both_walks_and_then_does_nothi
         "a 3000-file tree took {:?}",
         started.elapsed()
     );
+}
+
+// --- the mass-deletion guard ----------------------------------------------------------
+
+/// Remembers every event as its `Debug` text.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<String>>);
+
+impl neutronsync::events::EventSink for Recorder {
+    fn emit(&self, ev: &neutronsync::events::SyncEvent) {
+        self.0.lock().unwrap().push(format!("{ev:?}"));
+    }
+}
+
+impl Recorder {
+    fn held(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("DeletesHeld"))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A pair of `folders` folders holding `per` files each, synced, with deletes
+/// propagating and the default allowance (the larger of 100 files and 20%).
+fn synced_tree(
+    tag: &str,
+    folders: usize,
+    per: usize,
+) -> (
+    Tmp,
+    neutronsync::config::Config,
+    std::rc::Rc<std::cell::RefCell<Store>>,
+) {
+    let t = Tmp::new(tag);
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    c.local_delete = neutronsync::config::LocalDelete::Remove;
+    let (fake, store) = FakeRemote::new();
+    for d in 0..folders {
+        for i in 0..per {
+            write(
+                &t.path().join(format!("local/d{d:03}/f{i:03}.txt")),
+                &format!("content {d} {i}"),
+            );
+        }
+    }
+    run(&c, fake, false);
+    assert_eq!(store.borrow().files.len(), folders * per);
+    (t, c, store)
+}
+
+/// One run, batch or streaming, with a recorder; returns the result's errors.
+fn run_with_events(
+    c: &neutronsync::config::Config,
+    store: &std::rc::Rc<std::cell::RefCell<Store>>,
+    streaming: bool,
+    resync: bool,
+) -> (Vec<String>, Recorder) {
+    let rec = Recorder::default();
+    let (f, _s) = reuse(store);
+    let log = Logger::silent();
+    let mut eng = Engine::new(c, f, &log, false);
+    eng.set_observer(Some(&rec), None);
+    let r = if streaming {
+        eng.sync_pair_streaming(&c.pairs[0]).unwrap()
+    } else {
+        eng.sync_pair(&c.pairs[0], resync).unwrap()
+    };
+    (r.errors, rec)
+}
+
+#[test]
+fn a_deletion_far_bigger_than_the_allowance_is_held_back_and_says_how_to_go_on() {
+    for streaming in [false, true] {
+        let (t, c, store) = synced_tree("guard-big", 4, 100); // 400 files
+                                                              // 300 of the 400 are deleted here: 75%, far over max(100, 20%)
+        for d in 0..3 {
+            std::fs::remove_dir_all(t.path().join(format!("local/d{d:03}"))).unwrap();
+        }
+        let (errors, rec) = run_with_events(&c, &store, streaming, false);
+        assert_eq!(
+            store.borrow().files.len(),
+            400,
+            "streaming={streaming}: the remote lost files it should have kept"
+        );
+        assert_eq!(
+            rec.held().len(),
+            1,
+            "streaming={streaming}: {:?}",
+            rec.held()
+        );
+        assert!(
+            rec.held()[0].contains("remote: 300, local: 0, tracked: 400"),
+            "{:?}",
+            rec.held()
+        );
+        // It is a problem, not a quiet success, and it tells the user the way on.
+        assert!(
+            errors.iter().any(|e| e.contains("held back 300 deletions")
+                && e.contains("--allow-mass-delete")
+                && e.contains("--resync")),
+            "streaming={streaming}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn a_held_deletion_is_not_forgotten_and_goes_ahead_when_the_user_says_so() {
+    for streaming in [false, true] {
+        let (t, mut c, store) = synced_tree("guard-confirm", 4, 100);
+        for d in 0..3 {
+            std::fs::remove_dir_all(t.path().join(format!("local/d{d:03}"))).unwrap();
+        }
+        // Held, and held again on the next run: nothing is decided by waiting.
+        for _ in 0..2 {
+            let (errors, _rec) = run_with_events(&c, &store, streaming, false);
+            assert!(errors.iter().any(|e| e.contains("held back")), "{errors:?}");
+            assert_eq!(store.borrow().files.len(), 400);
+        }
+        // `sync --allow-mass-delete`: it was meant.
+        c.allow_mass_delete = true;
+        let (errors, rec) = run_with_events(&c, &store, streaming, false);
+        assert!(errors.is_empty(), "streaming={streaming}: {errors:?}");
+        assert!(rec.held().is_empty());
+        assert_eq!(
+            store.borrow().files.len(),
+            100,
+            "streaming={streaming}: the confirmed deletion did not happen"
+        );
+        // ...and it is settled: the next ordinary run has nothing left to do.
+        c.allow_mass_delete = false;
+        let (errors, rec) = run_with_events(&c, &store, streaming, false);
+        assert!(errors.is_empty() && rec.held().is_empty(), "{errors:?}");
+        assert_eq!(store.borrow().files.len(), 100);
+    }
+}
+
+#[test]
+fn resync_gets_the_files_back_instead_of_deleting_them() {
+    let (t, c, store) = synced_tree("guard-resync", 4, 100);
+    for d in 0..3 {
+        std::fs::remove_dir_all(t.path().join(format!("local/d{d:03}"))).unwrap();
+    }
+    let (errors, _rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.iter().any(|e| e.contains("held back")));
+    // `sync --resync`: both sides are merged afresh - the missing files come down.
+    let (errors, rec) = run_with_events(&c, &store, false, true);
+    assert!(errors.is_empty() && rec.held().is_empty(), "{errors:?}");
+    assert_eq!(store.borrow().files.len(), 400);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("local/d001/f042.txt")).unwrap(),
+        "content 1 42"
+    );
+    // and the pair is healthy again
+    let (errors, rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.is_empty() && rec.held().is_empty());
+}
+
+#[test]
+fn a_deletion_within_the_allowance_goes_through_untouched() {
+    for streaming in [false, true] {
+        let (t, c, store) = synced_tree("guard-small", 4, 100); // allowed: max(100, 80) = 100
+                                                                // 60 files, 15%: an ordinary clean-up
+        for i in 0..60 {
+            std::fs::remove_file(t.path().join(format!("local/d003/f{i:03}.txt"))).unwrap();
+        }
+        let (errors, rec) = run_with_events(&c, &store, streaming, false);
+        assert!(errors.is_empty(), "streaming={streaming}: {errors:?}");
+        assert!(rec.held().is_empty());
+        assert_eq!(store.borrow().files.len(), 340, "streaming={streaming}");
+    }
+}
+
+#[test]
+fn the_allowance_is_the_larger_of_the_count_and_the_percentage() {
+    // 1000 files: 20% is 200, more than the 100-file floor.
+    let (t, c, store) = synced_tree("guard-percent", 10, 100);
+    for i in 0..100 {
+        std::fs::remove_file(t.path().join(format!("local/d009/f{i:03}.txt"))).unwrap();
+    }
+    for i in 0..90 {
+        std::fs::remove_file(t.path().join(format!("local/d008/f{i:03}.txt"))).unwrap();
+    }
+    // 190 deletions: over the floor, under 20%
+    let (errors, _rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(store.borrow().files.len(), 810);
+    // The pair now tracks 810 files, so a run may delete 162 (20%): 180 is too many
+    for i in 0..100 {
+        std::fs::remove_file(t.path().join(format!("local/d007/f{i:03}.txt"))).unwrap();
+    }
+    for i in 0..80 {
+        std::fs::remove_file(t.path().join(format!("local/d006/f{i:03}.txt"))).unwrap();
+    }
+    let (errors, rec) = run_with_events(&c, &store, false, false);
+    assert!(
+        errors.iter().any(|e| e.contains("held back 180")),
+        "{errors:?}"
+    );
+    assert_eq!(rec.held().len(), 1);
+    assert_eq!(
+        store.borrow().files.len(),
+        810,
+        "nothing of the 180 was deleted"
+    );
+}
+
+#[test]
+fn a_small_pair_can_never_trip_it() {
+    let (t, c, store) = synced_tree("guard-tiny", 1, 50);
+    // 40 of 50 deleted (80%) - but a run may always delete 100, and there are only 50
+    for i in 0..40 {
+        std::fs::remove_file(t.path().join(format!("local/d000/f{i:03}.txt"))).unwrap();
+    }
+    let (errors, _rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(store.borrow().files.len(), 10);
+}
+
+#[test]
+fn deletions_that_the_remote_makes_are_held_back_too() {
+    // The other direction: the remote suddenly lists most of the tree as gone.
+    for streaming in [false, true] {
+        let (t, c, store) = synced_tree("guard-remote", 4, 100);
+        {
+            let mut s = store.borrow_mut();
+            s.files.retain(|k, _| k.contains("/d003/"));
+            s.dirs
+                .retain(|d| !(d.contains("/d000") || d.contains("/d001") || d.contains("/d002")));
+        }
+        let (errors, rec) = run_with_events(&c, &store, streaming, false);
+        let kept = walkdir::WalkDir::new(t.path().join("local"))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .count();
+        assert_eq!(
+            kept, 400,
+            "streaming={streaming}: local files were deleted on the strength of an emptied remote"
+        );
+        assert_eq!(
+            rec.held().len(),
+            1,
+            "streaming={streaming}: {:?}",
+            rec.held()
+        );
+        // the files would have gone from THIS computer, and the message says so
+        assert!(
+            rec.held()[0].contains("remote: 0, local: 300"),
+            "{:?}",
+            rec.held()
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("held back 300 deletions on this computer")),
+            "streaming={streaming}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn a_walk_spends_one_allowance_not_one_per_folder() {
+    // 60 folders of 10 files. 3 files are deleted from every folder - 180, over
+    // the 120 allowed - and 3 new ones made in each, so a count of the files
+    // still on disk (which the walk takes first) cannot tell anything is wrong.
+    // Each folder alone deletes only 3; together they must not exceed 120.
+    let (t, c, store) = synced_tree("guard-shared", 60, 10);
+    for d in 0..60 {
+        for i in 0..3 {
+            std::fs::remove_file(t.path().join(format!("local/d{d:03}/f{i:03}.txt"))).unwrap();
+            write(
+                &t.path().join(format!("local/d{d:03}/new{i}.txt")),
+                &format!("new {d} {i}"),
+            );
+        }
+    }
+    let (errors, rec) = run_with_events(&c, &store, true, false);
+    let deleted = 600 + 180 - store.borrow().files.len();
+    assert_eq!(
+        deleted, 120,
+        "the walk deleted {deleted} files, not exactly its allowance"
+    );
+    assert_eq!(rec.held().len(), 1, "{:?}", rec.held());
+    assert!(
+        errors.iter().any(|e| e.contains("held back 60 deletions")),
+        "{errors:?}"
+    );
+    // the uploads were not held with them
+    assert!(store
+        .borrow()
+        .files
+        .contains_key("/my-files/docs/d059/new2.txt"));
+}
+
+#[test]
+fn a_walk_that_finds_most_of_the_tree_gone_deletes_nothing_at_all() {
+    // The same 60 folders, with 7 files gone from each: 420 files, spread so thin
+    // that no folder trips anything alone. The count of files on disk says it
+    // before the first deletion, not after the first 120.
+    let (t, c, store) = synced_tree("guard-census", 60, 10);
+    for d in 0..60 {
+        for i in 0..7 {
+            std::fs::remove_file(t.path().join(format!("local/d{d:03}/f{i:03}.txt"))).unwrap();
+        }
+    }
+    let (errors, rec) = run_with_events(&c, &store, true, false);
+    assert_eq!(
+        store.borrow().files.len(),
+        600,
+        "the walk deleted files before noticing the tree was gone"
+    );
+    assert_eq!(rec.held().len(), 1, "{:?}", rec.held());
+    assert!(errors.iter().any(|e| e.contains("held back")), "{errors:?}");
+}
+
+#[test]
+fn nothing_is_held_when_deletes_are_not_propagated_anyway() {
+    let (t, mut c, store) = synced_tree("guard-off", 4, 100);
+    c.propagate_deletes = false;
+    for d in 0..3 {
+        std::fs::remove_dir_all(t.path().join(format!("local/d{d:03}"))).unwrap();
+    }
+    let (errors, rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.is_empty() && rec.held().is_empty(), "{errors:?}");
+    assert_eq!(store.borrow().files.len(), 400);
+}
+
+#[test]
+fn the_guard_can_be_turned_down_or_off() {
+    // max_delete_percent = 100: a run can never delete more than everything.
+    let (t, mut c, store) = synced_tree("guard-config", 4, 100);
+    c.max_delete_files = 0;
+    c.max_delete_percent = 100;
+    for d in 0..3 {
+        std::fs::remove_dir_all(t.path().join(format!("local/d{d:03}"))).unwrap();
+    }
+    let (errors, _rec) = run_with_events(&c, &store, false, false);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(store.borrow().files.len(), 100);
+
+    // a stricter guard holds back what the default would have allowed
+    let (t, mut c, store) = synced_tree("guard-config-strict", 4, 100);
+    c.max_delete_files = 10;
+    c.max_delete_percent = 5;
+    for i in 0..60 {
+        std::fs::remove_file(t.path().join(format!("local/d003/f{i:03}.txt"))).unwrap();
+    }
+    let (errors, _rec) = run_with_events(&c, &store, false, false);
+    assert!(
+        errors.iter().any(|e| e.contains("held back 60")),
+        "{errors:?}"
+    );
+    assert_eq!(store.borrow().files.len(), 400);
 }
