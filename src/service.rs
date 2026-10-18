@@ -1568,6 +1568,27 @@ mod tests {
     }
 
     #[test]
+    fn a_held_pair_survives_the_status_file_the_window_reads_and_an_old_one_has_none() {
+        // In tray mode the window knows what is held only from status.json.
+        let mut now = AppState::default();
+        now.pairs.push(pair("docs", Phase::Error));
+        now.pairs[0].held = Some(HeldDeletes {
+            remote: 300,
+            local: 20,
+            tracked: 400,
+            at: 1_700_000_000,
+        });
+        let back: AppState = serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
+        assert_eq!(back.pairs[0].held, now.pairs[0].held);
+
+        // One written by a tray from before the guard has no such field.
+        let mut value = serde_json::to_value(&now).unwrap();
+        value["pairs"][0].as_object_mut().unwrap().remove("held");
+        let old: AppState = serde_json::from_value(value).unwrap();
+        assert_eq!(old.pairs[0].held, None);
+    }
+
+    #[test]
     fn files_waiting_to_retry_keep_the_pair_in_error() {
         // A pair whose last run merely SKIPPED backed-off files finishes with
         // zero errors (phase Synced), but those files are still failing - it
