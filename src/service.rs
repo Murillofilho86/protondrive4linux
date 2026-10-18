@@ -52,6 +52,59 @@ impl Progress {
     }
 }
 
+/// Deletions the mass-deletion guard is holding back for a pair (see
+/// [`crate::engine::DeleteBudget`]): files that would be removed from Proton
+/// Drive and from this computer, of the `tracked` the pair holds. Nothing has
+/// been deleted; the user decides - delete them, or get the files back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldDeletes {
+    pub remote: usize,
+    pub local: usize,
+    pub tracked: usize,
+    /// When a run last held them back (epoch seconds): every run that still
+    /// finds them re-reports them. A frontend that has acted on them can tell
+    /// from this whether the state it is still shown predates what it did.
+    pub at: i64,
+}
+
+impl HeldDeletes {
+    /// How many files in all.
+    pub fn files(&self) -> usize {
+        self.remote + self.local
+    }
+
+    /// What share of the pair's files that is, in whole percent (rounded up,
+    /// never above 100).
+    pub fn percent(&self) -> usize {
+        if self.tracked == 0 {
+            0
+        } else {
+            (self.files() * 100).div_ceil(self.tracked).min(100)
+        }
+    }
+
+    /// "300 deletions" - what is held back, as a phrase.
+    pub fn deletions(&self) -> String {
+        crate::datefmt::counted(self.files(), "deletion", "deletions")
+    }
+
+    /// Which side they would have happened on, as a phrase: "on Proton Drive",
+    /// "on this computer", or how many on each.
+    pub fn where_(&self) -> String {
+        crate::events::held_deletes_where(self.remote, self.local)
+    }
+
+    /// Where the files would have been removed from, as a phrase: "from Proton
+    /// Drive", "from this computer" or "from both".
+    pub fn removed_from(&self) -> &'static str {
+        match (self.remote, self.local) {
+            (_, 0) => "from Proton Drive",
+            (0, _) => "from this computer",
+            _ => "from Proton Drive and this computer",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PairState {
     pub name: String,
@@ -73,6 +126,13 @@ pub struct PairState {
     /// pair looks "Synced" on every run that merely skips them.
     #[serde(default)]
     pub retrying: usize,
+    /// The guard is holding this pair's deletions back (see [`HeldDeletes`]).
+    /// Set by the run that held them; cleared only by [`SyncEvent::DeletesReleased`],
+    /// which a run over the whole pair that holds nothing emits - so a pass over a
+    /// few folders, which says nothing about the ones it did not look at, leaves
+    /// it standing. It lasts as long as the situation does.
+    #[serde(default)]
+    pub held: Option<HeldDeletes>,
 }
 
 impl PairState {
@@ -89,6 +149,7 @@ impl PairState {
             last_synced: None,
             tracked: 0,
             retrying: 0,
+            held: None,
         }
     }
 }
@@ -187,6 +248,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The pairs whose deletions the guard is holding back, with what it holds.
+    pub fn held_pairs(&self) -> impl Iterator<Item = (&PairState, HeldDeletes)> {
+        self.pairs.iter().filter_map(|p| p.held.map(|h| (p, h)))
+    }
+
+    /// Whether every pair that has a problem has it only because the guard is
+    /// holding deletions back (and at least one does). Those get their own
+    /// notice, so the generic "sync problem" one stays quiet.
+    pub fn only_held_problems(&self) -> bool {
+        let mut any = false;
+        for p in &self.pairs {
+            if p.retrying > 0 {
+                return false;
+            }
+            if p.held.is_some() {
+                any = true;
+            } else if p.phase == Phase::Error {
+                return false;
+            }
+        }
+        any
+    }
+
     fn pair_mut(&mut self, name: &str) -> Option<&mut PairState> {
         self.pairs.iter_mut().find(|p| p.name == name)
     }
@@ -279,14 +363,26 @@ impl AppState {
                     .filter(|p| p.phase == Phase::Error || p.retrying > 0)
                     .collect();
                 match failing.as_slice() {
-                    [one] => match (&one.last_error, one.retrying) {
-                        (Some(e), _) => truncate(&format!("{}: {e}", one.name), 120),
-                        (None, n) => format!(
+                    [one] => match (&one.held, &one.last_error, one.retrying) {
+                        // Needs the user, and says what to do about it.
+                        (Some(h), _, _) => truncate(
+                            &format!(
+                                "{}: {} held back — open the app to review",
+                                one.name,
+                                h.deletions()
+                            ),
+                            120,
+                        ),
+                        (None, Some(e), _) => truncate(&format!("{}: {e}", one.name), 120),
+                        (None, None, n) => format!(
                             "{}: {n} file{} failed, retrying automatically",
                             one.name,
                             if n == 1 { "" } else { "s" }
                         ),
                     },
+                    many if many.iter().all(|p| p.held.is_some()) => {
+                        format!("{} folders have deletions held back", many.len())
+                    }
                     many => format!("{} folders have sync problems", many.len()),
                 }
             }
@@ -465,7 +561,12 @@ impl EventSink for StateSink {
             } => {
                 let (applied, errors, tracked) = (*applied, *errors, *tracked);
                 if let Some(p) = s.pair_mut(pair) {
-                    p.phase = if errors > 0 {
+                    // Deletions the guard held back stay held (and the pair stays
+                    // in error) through a run that finishes clean: only a run over
+                    // the whole pair says they are settled (`DeletesReleased`), and
+                    // a pass over a few folders - the ones just edited - does not.
+                    let held = p.held.is_some();
+                    p.phase = if errors > 0 || held {
                         Phase::Error
                     } else {
                         Phase::Synced
@@ -474,7 +575,7 @@ impl EventSink for StateSink {
                     p.current_op = None;
                     p.tracked = synced_files.unwrap_or(tracked);
                     p.retrying = retrying;
-                    if errors == 0 {
+                    if errors == 0 && !held {
                         p.last_synced = Some(now_epoch());
                         p.last_error = None;
                     }
@@ -540,9 +641,29 @@ impl EventSink for StateSink {
                 if let Some(p) = s.pair_mut(pair) {
                     p.phase = Phase::Error;
                     p.last_error = Some(text.clone());
+                    p.held = Some(HeldDeletes {
+                        remote: *remote,
+                        local: *local,
+                        tracked: *tracked,
+                        at: now_epoch(),
+                    });
                 }
                 if !repeat {
                     s.push(ActivityKind::Error, format!("{pair}: {text}"));
+                }
+            }
+            SyncEvent::DeletesReleased { pair } => {
+                // A run over the whole pair found nothing to hold: what was held
+                // is settled. The pair's error was that hold, so it goes with it -
+                // unless a later error has replaced it.
+                if let Some(p) = s.pair_mut(pair) {
+                    if let Some(h) = p.held.take() {
+                        let text =
+                            crate::events::held_deletes_text(pair, h.remote, h.local, h.tracked);
+                        if p.last_error.as_deref() == Some(text.as_str()) {
+                            p.last_error = None;
+                        }
+                    }
                 }
             }
             SyncEvent::Info { text } => s.push(ActivityKind::Info, text.clone()),
@@ -649,6 +770,17 @@ impl Controller {
         (s.overall(), s.status_line(now_epoch()))
     }
 
+    /// The folder pairs whose deletions the mass-deletion guard is holding back
+    /// right now, with what it holds, and whether those are the only problems
+    /// there are ([`AppState::only_held_problems`]) - read under one look at the
+    /// state, cheap enough to poll with [`Controller::status_summary`]. What the
+    /// desktop notifications for held deletions are decided from.
+    pub fn held_summary(&self) -> (Vec<(String, HeldDeletes)>, bool) {
+        let s = self.state.lock().unwrap();
+        let held = s.held_pairs().map(|(p, h)| (p.name.clone(), h)).collect();
+        (held, s.only_held_problems())
+    }
+
     /// Publish a compact live snapshot to `<state_dir>/status.json` so a
     /// separate process (an open GUI window) can display what THIS process is
     /// doing. Used by the headless tray daemon, which owns the watcher/sync
@@ -727,11 +859,58 @@ impl Controller {
 
     /// Reconcile the named pairs (empty = all) on a background thread.
     pub fn sync(&self, names: Vec<String>, dry_run: bool) {
+        self.run(
+            names,
+            RunMode {
+                dry_run,
+                ..RunMode::default()
+            },
+        );
+    }
+
+    /// Reconcile the named pairs and carry out the deletions the mass-deletion
+    /// guard held back from them ([`PairState::held`]): the user has seen how
+    /// many there are and means them. For this run only - the next one is
+    /// guarded again. Does nothing for an empty list: confirming is for folders
+    /// named one by one, never for "all of them".
+    pub fn sync_confirming_deletes(&self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        self.run(
+            names,
+            RunMode {
+                allow_mass_delete: true,
+                ..RunMode::default()
+            },
+        );
+    }
+
+    /// Reconcile the named pairs from scratch (`sync --resync`): both sides are
+    /// merged and nothing is deleted, so what was deleted on one side - what the
+    /// guard held back - comes back from the other. The way out of a held-back
+    /// mass deletion that was a mistake. Does nothing for an empty list.
+    pub fn resync(&self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        self.run(
+            names,
+            RunMode {
+                resync: true,
+                ..RunMode::default()
+            },
+        );
+    }
+
+    fn run(&self, names: Vec<String>, mode: RunMode) {
         if self.busy.swap(true, Ordering::SeqCst) {
             return; // already running
         }
         self.cancel.store(false, Ordering::SeqCst);
-        let cfg = self.cfg.lock().unwrap().clone();
+        let mut cfg = self.cfg.lock().unwrap().clone();
+        // Only this run's copy of the config says so; it is never saved.
+        cfg.allow_mass_delete = mode.allow_mass_delete;
         let pairs = select_pairs(&cfg, &names);
         {
             let mut s = self.state.lock().unwrap();
@@ -758,8 +937,8 @@ impl Controller {
             run_sync_with(
                 &cfg,
                 &pairs,
-                dry_run,
-                false,
+                mode.dry_run,
+                mode.resync,
                 &log,
                 Some(&sink),
                 Some(&cancel),
@@ -925,6 +1104,17 @@ impl Controller {
     }
 }
 
+/// What one background run of the [`Controller`] is asked to do.
+#[derive(Clone, Copy, Default)]
+struct RunMode {
+    dry_run: bool,
+    /// Merge both sides from scratch instead of trusting the record of what was
+    /// in sync.
+    resync: bool,
+    /// Carry out the deletions the mass-deletion guard would hold back.
+    allow_mass_delete: bool,
+}
+
 fn select_pairs(cfg: &Config, names: &[String]) -> Vec<Pair> {
     if names.is_empty() {
         cfg.pairs.clone()
@@ -956,6 +1146,7 @@ mod tests {
                 last_synced: None,
                 tracked: 0,
                 retrying: 0,
+                held: None,
             })
             .collect();
         Arc::new(Mutex::new(AppState {
@@ -977,6 +1168,7 @@ mod tests {
             last_synced: None,
             tracked: 0,
             retrying: 0,
+            held: None,
         }
     }
 
@@ -1031,6 +1223,237 @@ mod tests {
         );
     }
 
+    fn held_event(pair: &str, remote: usize, local: usize, tracked: usize) -> SyncEvent {
+        SyncEvent::DeletesHeld {
+            pair: pair.into(),
+            remote,
+            local,
+            tracked,
+        }
+    }
+
+    fn released(pair: &str) -> SyncEvent {
+        SyncEvent::DeletesReleased { pair: pair.into() }
+    }
+
+    fn finished(pair: &str, errors: usize) -> SyncEvent {
+        SyncEvent::PairFinished {
+            pair: pair.into(),
+            applied: 0,
+            errors,
+            tracked: 10,
+        }
+    }
+
+    fn scanning(pair: &str) -> SyncEvent {
+        SyncEvent::ScanStarted { pair: pair.into() }
+    }
+
+    #[test]
+    fn a_hold_stands_until_a_run_over_the_whole_pair_releases_it() {
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: None,
+        };
+
+        // A walk over the whole pair holds deletions back, and counts as a problem.
+        sink.emit(&scanning("docs"));
+        sink.emit(&held_event("docs", 300, 0, 400));
+        sink.emit(&finished("docs", 1));
+        {
+            let s = st.lock().unwrap();
+            let h = s.pairs[0].held.expect("the pair is held");
+            assert_eq!((h.remote, h.local, h.tracked), (300, 0, 400));
+            assert_eq!(s.pairs[0].phase, Phase::Error);
+        }
+
+        // Passes over the folders somebody just edited never looked at what is
+        // held, and say so by not releasing it. Finishing clean changes nothing:
+        // it stands, the pair does not read as synced, and its sentence is still
+        // there to show.
+        for _ in 0..3 {
+            sink.emit(&scanning("docs"));
+            sink.emit(&finished("docs", 0));
+        }
+        {
+            let s = st.lock().unwrap();
+            assert!(s.pairs[0].held.is_some());
+            assert_eq!(s.pairs[0].phase, Phase::Error);
+            assert_eq!(s.overall(), OverallStatus::Error);
+            assert!(s.pairs[0].last_error.is_some());
+            assert!(
+                s.pairs[0].last_synced.is_none(),
+                "a pair with deletions held back is not 'synced just now'"
+            );
+        }
+
+        // A whole run that runs into them again keeps them (and re-dates them).
+        sink.emit(&scanning("docs"));
+        sink.emit(&held_event("docs", 300, 0, 400));
+        sink.emit(&finished("docs", 1));
+        assert!(st.lock().unwrap().pairs[0].held.is_some());
+
+        // A whole run that holds nothing releases them, and the error that was
+        // the hold goes with it.
+        sink.emit(&scanning("docs"));
+        sink.emit(&released("docs"));
+        sink.emit(&finished("docs", 0));
+        let s = st.lock().unwrap();
+        assert_eq!(s.pairs[0].held, None);
+        assert_eq!(s.pairs[0].phase, Phase::Synced);
+        assert_eq!(s.pairs[0].last_error, None);
+        assert!(s.pairs[0].last_synced.is_some());
+        assert_ne!(s.overall(), OverallStatus::Error);
+    }
+
+    #[test]
+    fn a_release_clears_the_holds_error_but_not_a_later_one() {
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: None,
+        };
+        sink.emit(&held_event("docs", 300, 0, 400));
+        assert!(st.lock().unwrap().pairs[0].last_error.is_some());
+
+        // Released at once: the error that was the hold goes with it, before the
+        // run has even finished.
+        sink.emit(&released("docs"));
+        {
+            let s = st.lock().unwrap();
+            assert_eq!(s.pairs[0].held, None);
+            assert_eq!(s.pairs[0].last_error, None);
+        }
+
+        // Another error has since taken its place: that one is not the hold's to
+        // clear.
+        sink.emit(&held_event("docs", 300, 0, 400));
+        sink.emit(&SyncEvent::OpFinished {
+            pair: "docs".into(),
+            action: "upload".into(),
+            path: "b".into(),
+            ok: false,
+            error: Some("boom".into()),
+        });
+        sink.emit(&released("docs"));
+        let s = st.lock().unwrap();
+        assert_eq!(s.pairs[0].held, None);
+        assert_eq!(s.pairs[0].last_error.as_deref(), Some("upload b: boom"));
+    }
+
+    #[test]
+    fn releasing_a_pair_that_was_not_held_changes_nothing() {
+        // Every whole run says so, held or not.
+        let st = state_with(&["docs"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: None,
+        };
+        sink.emit(&SyncEvent::OpFinished {
+            pair: "docs".into(),
+            action: "upload".into(),
+            path: "b".into(),
+            ok: false,
+            error: Some("boom".into()),
+        });
+        let before = st.lock().unwrap().pairs[0].clone();
+        sink.emit(&released("docs"));
+        sink.emit(&released("nobody"));
+        let s = st.lock().unwrap();
+        assert_eq!(s.pairs[0].held, None);
+        assert_eq!(s.pairs[0].last_error.as_deref(), Some("upload b: boom"));
+        assert_eq!(s.pairs[0].phase, before.phase);
+        assert_eq!(s.pairs.len(), 1);
+    }
+
+    #[test]
+    fn a_hold_belongs_to_its_pair() {
+        let st = state_with(&["docs", "photos"]);
+        let sink = StateSink {
+            state: st.clone(),
+            stats: None,
+        };
+        sink.emit(&scanning("docs"));
+        sink.emit(&held_event("docs", 300, 0, 400));
+        sink.emit(&finished("docs", 1));
+        // Another pair running clean, and releasing what it never held, does not
+        // touch it.
+        sink.emit(&scanning("photos"));
+        sink.emit(&released("photos"));
+        sink.emit(&finished("photos", 0));
+        let s = st.lock().unwrap();
+        assert!(s.pairs[0].held.is_some());
+        assert_eq!(s.pairs[1].held, None);
+        assert_eq!(s.pairs[1].phase, Phase::Synced);
+        assert_eq!(s.held_pairs().count(), 1);
+        assert!(s.only_held_problems());
+    }
+
+    #[test]
+    fn the_hold_is_only_the_problem_when_nothing_else_is_wrong() {
+        let mut s = AppState::default();
+        assert!(!s.only_held_problems(), "nothing held, nothing to say");
+        s.pairs.push(pair("docs", Phase::Error));
+        s.pairs[0].held = Some(HeldDeletes {
+            remote: 5,
+            local: 0,
+            tracked: 9,
+            at: 1,
+        });
+        assert!(s.only_held_problems());
+        // Another folder failing for its own reasons: the generic notice is due.
+        s.pairs.push(pair("photos", Phase::Error));
+        assert!(!s.only_held_problems());
+        s.pairs[1].phase = Phase::Synced;
+        assert!(s.only_held_problems());
+        // Files waiting out a retry, on the held pair or another: same.
+        s.pairs[1].retrying = 2;
+        assert!(!s.only_held_problems());
+        s.pairs[1].retrying = 0;
+        s.pairs[0].retrying = 1;
+        assert!(!s.only_held_problems());
+    }
+
+    #[test]
+    fn the_tray_line_for_held_deletions_says_what_to_do() {
+        let now = 10_000;
+        let held = |remote, local| {
+            Some(HeldDeletes {
+                remote,
+                local,
+                tracked: 400,
+                at: 1,
+            })
+        };
+        let mut s = AppState::default();
+        s.pairs.push(pair("docs", Phase::Error));
+        s.pairs[0].held = held(300, 0);
+        s.pairs[0].last_error = Some("held back 300 deletions on Proton Drive, 75% ...".into());
+        assert_eq!(
+            s.status_line(now),
+            "docs: 300 deletions held back — open the app to review"
+        );
+
+        // The sentence is still right when the text of the error is gone (a later
+        // pass cleared it) and when it is one deletion.
+        s.pairs[0].last_error = None;
+        s.pairs[0].held = held(0, 1);
+        assert_eq!(
+            s.status_line(now),
+            "docs: 1 deletion held back — open the app to review"
+        );
+
+        // Two folders held: counted, not listed.
+        s.pairs.push(pair("photos", Phase::Error));
+        s.pairs[1].held = held(40, 0);
+        assert_eq!(s.status_line(now), "2 folders have deletions held back");
+
+        // One of them failing for another reason too: the general line.
+        s.pairs[1].held = None;
+        assert_eq!(s.status_line(now), "2 folders have sync problems");
+    }
+
     #[test]
     fn held_deletions_show_as_the_pairs_problem_once() {
         let sink = StateSink {
@@ -1048,6 +1471,9 @@ mod tests {
         let s = sink.state.lock().unwrap();
         let p = &s.pairs[0];
         assert_eq!(p.phase, Phase::Error);
+        let h = p.held.expect("the pair is marked as held");
+        assert_eq!((h.remote, h.local, h.tracked), (300, 0, 400));
+        assert_eq!((h.files(), h.percent()), (300, 75));
         let msg = p.last_error.as_deref().unwrap();
         assert!(
             msg.contains("held back 300 deletions on Proton Drive") && msg.contains("75%"),
@@ -1139,6 +1565,27 @@ mod tests {
         };
         let back: AppState = serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
         assert!(back.keyring_unreachable && back.account.keyring_unreachable);
+    }
+
+    #[test]
+    fn a_held_pair_survives_the_status_file_the_window_reads_and_an_old_one_has_none() {
+        // In tray mode the window knows what is held only from status.json.
+        let mut now = AppState::default();
+        now.pairs.push(pair("docs", Phase::Error));
+        now.pairs[0].held = Some(HeldDeletes {
+            remote: 300,
+            local: 20,
+            tracked: 400,
+            at: 1_700_000_000,
+        });
+        let back: AppState = serde_json::from_str(&serde_json::to_string(&now).unwrap()).unwrap();
+        assert_eq!(back.pairs[0].held, now.pairs[0].held);
+
+        // One written by a tray from before the guard has no such field.
+        let mut value = serde_json::to_value(&now).unwrap();
+        value["pairs"][0].as_object_mut().unwrap().remove("held");
+        let old: AppState = serde_json::from_value(value).unwrap();
+        assert_eq!(old.pairs[0].held, None);
     }
 
     #[test]

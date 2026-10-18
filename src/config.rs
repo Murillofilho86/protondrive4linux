@@ -147,7 +147,8 @@ pub struct Config {
     /// Check for updates when the GUI launches (notify only; never installs).
     pub check_on_launch: bool,
     /// Send desktop notifications for conflicts, sync problems that persist,
-    /// and a signed-out session (GUI/tray only).
+    /// deletions held back by the mass-deletion guard, and a signed-out session
+    /// (GUI/tray only).
     pub notifications: bool,
     /// GUI theme: follow the desktop, or force light or dark.
     pub theme: ThemePref,

@@ -660,6 +660,70 @@ fn incomplete_remote_scan_suppresses_delete() {
     );
 }
 
+/// The events (by name, in order) one sync of the pair emits.
+fn events_of(c: &Config, fake: FakeRemote, scope: Option<&str>, cancelled: bool) -> Vec<String> {
+    let evs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = CapSink(evs.clone());
+    let cancel = AtomicBool::new(cancelled);
+    let log = Logger::silent();
+    let mut eng = Engine::new(c, fake, &log, false);
+    eng.set_observer(Some(&sink as &dyn EventSink), Some(&cancel));
+    eng.sync_pair_scoped(&c.pairs[0], false, scope).unwrap();
+    let names = evs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.split([' ', '{']).next().unwrap_or("").to_string())
+        .collect();
+    names
+}
+
+#[test]
+fn only_a_sync_that_saw_the_whole_pair_to_its_end_releases_a_hold() {
+    // A frontend keeps showing the deletions the guard held back until a run says
+    // they are settled. Only one that looked at everything can: not one scoped to
+    // a folder, not one that could not list part of the remote (it deleted
+    // nothing on that basis, which proves nothing), not one that was cancelled.
+    let t = Tmp::new("release");
+    let mut c = cfg(t.path());
+    c.propagate_deletes = true;
+    let (fake, store) = FakeRemote::new();
+    {
+        let mut s = store.borrow_mut();
+        s.dirs.insert("/my-files/docs".into());
+        s.dirs.insert("/my-files/docs/sub".into());
+        s.files
+            .insert("/my-files/docs/sub/a.txt".into(), b"hi".to_vec());
+    }
+    run(&c, fake, false);
+
+    let released = |evs: &[String]| evs.iter().position(|e| e == "DeletesReleased");
+    let finished = |evs: &[String]| evs.iter().position(|e| e == "PairFinished");
+
+    // The whole pair, seen whole: released, and before the run finishes.
+    let (fake, _s) = reuse(&store);
+    let evs = events_of(&c, fake, None, false);
+    assert!(released(&evs).is_some(), "{evs:?}");
+    assert!(released(&evs) < finished(&evs), "{evs:?}");
+
+    // One folder of it says nothing about the rest.
+    let (fake, _s) = reuse(&store);
+    let evs = events_of(&c, fake, Some("sub"), false);
+    assert!(released(&evs).is_none(), "scoped: {evs:?}");
+
+    // A folder that could not be listed: nothing was deleted, but nothing was seen.
+    store.borrow_mut().fail_dir = Some("/my-files/docs/sub".into());
+    let (fake, _s) = reuse(&store);
+    let evs = events_of(&c, fake, None, false);
+    assert!(released(&evs).is_none(), "incomplete: {evs:?}");
+    store.borrow_mut().fail_dir = None;
+
+    // A run told to stop did not get to look.
+    let (fake, _s) = reuse(&store);
+    let evs = events_of(&c, fake, None, true);
+    assert!(released(&evs).is_none(), "cancelled: {evs:?}");
+}
+
 #[test]
 fn downloads_many_new_remote_files() {
     // Several new remote files should all be pulled down (exercises the batch

@@ -653,7 +653,14 @@ pub fn run_sync_streaming(
     }
     let applied = applied.load(Ordering::Relaxed);
     let mut errors = errors.load(Ordering::Relaxed);
-    errors += report_if_tripped(log, events, pair, budget.as_deref());
+    let held = report_if_tripped(log, events, pair, budget.as_deref());
+    errors += held;
+    // A walk that went through the whole tree and held nothing back has settled
+    // whatever was held before: the files are back, or the user said to go ahead.
+    // One that was cancelled did not get to look, so it says nothing.
+    if held == 0 && !is_cancelled() {
+        release_held(events, pair);
+    }
     if let Some(sink) = events {
         sink.emit(&SyncEvent::PairFinished {
             pair: pair.name.clone(),
@@ -2533,6 +2540,12 @@ impl<'a, R: Remote> Engine<'a, R> {
             // problem (exit status, the pair's state) until the user settles it.
             report_held(self.log, self.events, pair, h);
             result.errors.push(held_error(pair, h));
+        } else if scope.is_none() && !incomplete && !self.cancelled() {
+            // The whole pair, seen whole, and nothing to hold back: whatever was
+            // held before is settled. (A scoped run says nothing about the rest,
+            // nor does one that could not see all of the remote - it deleted
+            // nothing on that basis - nor one that was cancelled.)
+            release_held(self.events, pair);
         }
         self.emit(SyncEvent::PairFinished {
             pair: pair.name.clone(),
@@ -2605,6 +2618,8 @@ impl<'a, R: Remote> Engine<'a, R> {
             };
             report_held(self.log, self.events, pair, held);
             errors.push(held_error(pair, held));
+        } else if !self.cancelled() {
+            release_held(self.events, pair);
         }
         if !self.dry_run && !self.cancelled() {
             let _ = crate::state::set_last_synced(
@@ -3051,6 +3066,16 @@ fn report_held(log: &Logger, events: Option<&dyn EventSink>, pair: &Pair, held: 
             remote: held.remote,
             local: held.local,
             tracked: held.tracked,
+        });
+    }
+}
+
+/// Say to the frontends that nothing is being held back for the pair any more:
+/// a run over the whole pair, to its end, found nothing to hold.
+fn release_held(events: Option<&dyn EventSink>, pair: &Pair) {
+    if let Some(sink) = events {
+        sink.emit(&SyncEvent::DeletesReleased {
+            pair: pair.name.clone(),
         });
     }
 }

@@ -136,6 +136,14 @@ pub enum SyncEvent {
         local: usize,
         tracked: usize,
     },
+    /// Nothing is being held back for the pair any more: a run over the whole
+    /// pair, to its end (not a pass over some of its folders, not one that was
+    /// cancelled or could not see all of the remote), found no deletions to
+    /// hold. Whatever [`SyncEvent::DeletesHeld`] reported earlier is settled -
+    /// the files are back, or the user said to go ahead. Emitted just before the
+    /// run's [`SyncEvent::PairFinished`], by every such run whether or not
+    /// anything was held before.
+    DeletesReleased { pair: String },
 }
 
 /// What to tell the user when the guard held deletions back - `remote` files'
@@ -151,18 +159,24 @@ pub fn held_deletes_text(pair: &str, remote: usize, local: usize, tracked: usize
         (files * 100).div_ceil(tracked).min(100)
     };
     let counted = crate::datefmt::counted(files, "deletion", "deletions");
-    let where_ = match (remote, local) {
-        (_, 0) => " on Proton Drive".to_string(),
-        (0, _) => " on this computer".to_string(),
-        _ => format!(" ({remote} on Proton Drive, {local} on this computer)"),
-    };
+    let where_ = held_deletes_where(remote, local);
     format!(
-        "held back {counted}{where_}, {percent}% of the {} this folder pair tracks - that looks \
+        "held back {counted} {where_}, {percent}% of the {} this folder pair tracks - that looks \
          like a mistake, such as an unmounted drive or a folder emptied by accident, so nothing \
          was deleted. If you meant it: `protondrive4linux sync --allow-mass-delete {pair}`. To \
          get the files back instead: `protondrive4linux sync --resync {pair}`.",
         crate::datefmt::counted(tracked, "file", "files"),
     )
+}
+
+/// On which side held-back deletions would have happened: "on Proton Drive", "on
+/// this computer", or - when it is both - how many on each.
+pub fn held_deletes_where(remote: usize, local: usize) -> String {
+    match (remote, local) {
+        (_, 0) => "on Proton Drive".to_string(),
+        (0, _) => "on this computer".to_string(),
+        _ => format!("({remote} on Proton Drive, {local} on this computer)"),
+    }
 }
 
 /// Receiver of [`SyncEvent`]s. Implementations must be cheap and thread-safe:

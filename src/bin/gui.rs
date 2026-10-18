@@ -27,8 +27,8 @@ use neutronsync::models::{Compare, Entry};
 use neutronsync::process_lock::{self, ProcessLock};
 use neutronsync::protoncli::{ProtonCli, Remote};
 use neutronsync::service::{
-    AccountState, ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, OverallStatus,
-    PairState, Phase,
+    AccountState, ActivityKind, ActivityOp, AppState, ConflictRecord, Controller, HeldDeletes,
+    OverallStatus, PairState, Phase,
 };
 use neutronsync::stats::Stats;
 use neutronsync::themes::{self, Base, Catalog, ThemeColors};
@@ -694,6 +694,13 @@ struct App {
     update: std::sync::Arc<std::sync::Mutex<UpdateState>>,
     confirm_logout: bool,
     confirm_reset: bool,
+    // Deletions the mass-deletion guard holds back: the folder the "Delete
+    // them" question is open for (by name, re-resolved every frame like the
+    // exclude editor), and when the user last answered for each folder - the
+    // background sync that holds them learns of the outcome on its next full
+    // pass, until when the state shown here predates what was done.
+    confirm_held_delete: Option<String>,
+    held_acted: std::collections::HashMap<String, i64>,
     // after launching browser login, poll the account until signed in (or deadline)
     login_poll_until: Option<f64>,
     last_account_poll: f64,
@@ -836,6 +843,8 @@ impl App {
             update: std::sync::Arc::new(std::sync::Mutex::new(UpdateState::Idle)),
             confirm_logout: false,
             confirm_reset: false,
+            confirm_held_delete: None,
+            held_acted: std::collections::HashMap::new(),
             login_poll_until: None,
             last_account_poll: 0.0,
             browser_open: false,
@@ -1531,6 +1540,7 @@ impl eframe::App for App {
         self.exclude_window(ctx);
         self.remove_local_dialog(ctx);
         self.logout_dialog(ctx);
+        self.held_delete_dialog(ctx, &snap);
         self.reset_dialog(ctx);
         self.toast_overlay(ctx);
 
@@ -1857,14 +1867,28 @@ impl App {
         let never_synced = snap.pairs.iter().any(|p| {
             matches!(p.phase, Phase::Scanning | Phase::Syncing) && p.last_synced.is_none()
         });
+        // Deletions the guard is holding back wait on a decision, so they
+        // outrank the passes that keep running around them: a banner that came
+        // and went with every pass could not be clicked. Not while this window
+        // is running something itself - that run is what to watch then.
+        let held = if self.ctrl.is_busy() {
+            None
+        } else {
+            held_to_show(snap, &self.held_acted)
+        };
+        let held_text = held.map(|(name, h, others)| held_banner_text(name, &h, others));
+        let session = session_banner(snap);
+        let held_on_screen = held.is_some() && self.daemon_banner.is_none() && session.is_none();
         let (bcol, bicon, btitle, bsub) = if let Some(b) = self.daemon_banner {
             // Background sync itself is down: nothing below is current.
             daemon_banner_text(b)
-        } else if let Some((tone, title, sub)) = session_banner(snap) {
+        } else if let Some((tone, title, sub)) = session {
             // A session that can't be used is surfaced explicitly — everything
             // else is blocked on it, so it takes priority over scan/sync/idle
             // states.
             (tone.color(), Icon::Info, title, sub.into())
+        } else if let Some((title, sub)) = &held_text {
+            (th().warn, Icon::Info, title.as_str(), sub.clone())
         } else if active {
             (
                 th().accent,
@@ -1928,6 +1952,33 @@ impl App {
                 self.daemon_spawned_at = None;
                 self.daemon_checked_at = None;
             }
+        }
+        if let (true, Some((name, _, _))) = (held_on_screen, held) {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                // The safe answer first: the guard thinks it was a mistake.
+                if button(
+                    ui,
+                    Some(Icon::Sync),
+                    "Restore them",
+                    Btn::Primary,
+                    false,
+                    true,
+                )
+                .on_hover_text("Bring the files back: both sides are merged and nothing is deleted")
+                .clicked()
+                {
+                    self.commit();
+                    self.held_acted.insert(name.to_string(), now_secs());
+                    self.ctrl.resync(vec![name.to_string()]);
+                }
+                if button(ui, None, "Delete them", Btn::Danger, false, true)
+                    .on_hover_text("It was on purpose: carry the deletions out")
+                    .clicked()
+                {
+                    self.confirm_held_delete = Some(name.to_string());
+                }
+            });
         }
 
         ui.add_space(14.0);
@@ -2518,9 +2569,9 @@ impl App {
                     if setting_row(
                         ui,
                         "Desktop notifications",
-                        "Tell me when a file conflicts, a sync problem lasts, I get \
-                         signed out, or background sync stops for good. Sent by the tray, \
-                         so it needs \"Run in system tray\".",
+                        "Tell me when a file conflicts, a sync problem lasts, deletions \
+                         are held back, I get signed out, or background sync stops for \
+                         good. Sent by the tray, so it needs \"Run in system tray\".",
                         |ui| switch(ui, notes),
                     ) {
                         self.cfg.notifications = !notes;
@@ -3267,6 +3318,66 @@ impl App {
             });
     }
 
+    /// The question behind "Delete them": what will be deleted and where it goes,
+    /// asked in a dialog so a click on a banner never deletes by itself.
+    fn held_delete_dialog(&mut self, ctx: &egui::Context, snap: &AppState) {
+        let Some(name) = self.confirm_held_delete.clone() else {
+            return;
+        };
+        // Found again by name every frame: if nothing is held for it any more
+        // (settled elsewhere), there is nothing left to ask.
+        let Some(h) = snap
+            .pairs
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.held)
+        else {
+            self.confirm_held_delete = None;
+            return;
+        };
+        let (title, body) = held_delete_question(&name, &h, self.cfg.local_delete);
+        let idle = !self.ctrl.is_busy();
+        let mut answer: Option<bool> = None;
+        egui::Window::new("Delete held back files")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(card_frame().inner_margin(egui::Margin::same(18)))
+            .title_bar(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::new(15.0, ff_bold()))
+                        .color(th().text),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(body).size(12.5).color(th().dim));
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let label = format!("Delete {}", counted(h.files(), "file", "files"));
+                        if button(ui, None, &label, Btn::Danger, false, idle).clicked() {
+                            answer = Some(true);
+                        }
+                        if button(ui, None, "Cancel", Btn::Secondary, false, true).clicked() {
+                            answer = Some(false);
+                        }
+                    });
+                });
+            });
+        match answer {
+            Some(true) => {
+                self.confirm_held_delete = None;
+                self.commit();
+                self.held_acted.insert(name.clone(), now_secs());
+                self.ctrl.sync_confirming_deletes(vec![name]);
+            }
+            Some(false) => self.confirm_held_delete = None,
+            None => {}
+        }
+    }
+
     fn reset_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_reset {
             return;
@@ -3870,6 +3981,73 @@ fn session_banner(snap: &AppState) -> Option<(Tone, &'static str, &'static str)>
     }
 }
 
+/// The folder whose held-back deletions the Activity page asks about: the first
+/// that has some the user has not already answered for, and how many other
+/// folders are waiting besides. `acted` is when (epoch seconds) the user last
+/// chose "Delete them" or "Restore them" for each folder: a hold the guard last
+/// reported before then is the state as it was, not a new problem - whatever
+/// holds it learns the outcome on its next full pass - while one reported since
+/// is the problem still being there.
+fn held_to_show<'a>(
+    snap: &'a AppState,
+    acted: &std::collections::HashMap<String, i64>,
+) -> Option<(&'a str, HeldDeletes, usize)> {
+    let mut waiting = snap
+        .held_pairs()
+        .filter(|(p, h)| acted.get(&p.name).is_none_or(|&t| h.at > t));
+    let (first, h) = waiting.next()?;
+    Some((first.name.as_str(), h, waiting.count()))
+}
+
+/// What the Activity banner says about deletions held back: a title, and a line
+/// that says how much of the folder it is, where from, and that nothing was
+/// deleted.
+fn held_banner_text(pair: &str, h: &HeldDeletes, others: usize) -> (String, String) {
+    let mut sub = format!(
+        "In {pair}, they would remove {}% of its {} {}. That looks like a mistake, so \
+         nothing was deleted.",
+        h.percent(),
+        counted(h.tracked, "file", "files"),
+        h.removed_from(),
+    );
+    if others > 0 {
+        sub.push_str(&format!(
+            " {} also waiting.",
+            counted(others, "other folder", "other folders")
+        ));
+    }
+    (format!("{} held back", h.deletions()), sub)
+}
+
+/// The question asked before the guard is overruled: its title, and what will
+/// happen to the files - where they go, which is the only way back.
+fn held_delete_question(
+    pair: &str,
+    h: &HeldDeletes,
+    local_delete: LocalDelete,
+) -> (String, String) {
+    let mut lines = Vec::new();
+    if h.remote > 0 {
+        lines.push(format!(
+            "{} in {pair} will be moved to Proton Drive's trash, where you can still restore \
+             them.",
+            counted(h.remote, "file", "files")
+        ));
+    }
+    if h.local > 0 {
+        let files = counted(h.local, "file", "files");
+        lines.push(match local_delete {
+            LocalDelete::Trash => format!("{files} on this computer will be moved to your trash."),
+            LocalDelete::Remove => format!("{files} on this computer will be deleted for good."),
+        });
+    }
+    lines.push("If this wasn't on purpose, choose Restore them instead.".to_string());
+    (
+        format!("Delete {}?", counted(h.files(), "file", "files")),
+        lines.join("\n"),
+    )
+}
+
 /// Files across every pair that failed and are waiting out a retry backoff.
 fn retrying_total(snap: &AppState) -> usize {
     snap.pairs.iter().map(|p| p.retrying).sum()
@@ -3934,11 +4112,19 @@ fn pair_status_text(ps: Option<&PairState>, watching: bool, now: i64) -> (Tone, 
             };
             (Tone::Accent, text)
         }
-        Some(Phase::Error) => (
-            Tone::Danger,
-            ps.and_then(|p| p.last_error.clone())
-                .unwrap_or_else(|| "Error".into()),
-        ),
+        Some(Phase::Error) => match ps.and_then(|p| p.held) {
+            // Waiting on a decision, not broken: the warm tone, and the count
+            // rather than a paragraph.
+            Some(h) => (
+                Tone::Warn,
+                format!("{} held back · see Activity", h.deletions()),
+            ),
+            None => (
+                Tone::Danger,
+                ps.and_then(|p| p.last_error.clone())
+                    .unwrap_or_else(|| "Error".into()),
+            ),
+        },
         Some(Phase::Synced) | Some(Phase::Idle) | None => {
             let retrying = ps.map_or(0, |p| p.retrying);
             if retrying > 0 {
@@ -4000,6 +4186,7 @@ mod status_text_tests {
             last_synced: Some(10_000 - 300),
             tracked: 0,
             retrying: 0,
+            held: None,
         }
     }
 
@@ -4013,6 +4200,159 @@ mod status_text_tests {
             keyring_unreachable,
             ..AccountState::default()
         }
+    }
+
+    fn held(remote: usize, local: usize, tracked: usize, at: i64) -> HeldDeletes {
+        HeldDeletes {
+            remote,
+            local,
+            tracked,
+            at,
+        }
+    }
+
+    fn held_pair(name: &str, h: HeldDeletes) -> PairState {
+        PairState {
+            name: name.into(),
+            phase: Phase::Error,
+            held: Some(h),
+            ..pair(Phase::Error)
+        }
+    }
+
+    fn state_of(pairs: Vec<PairState>) -> AppState {
+        AppState {
+            pairs,
+            ..AppState::default()
+        }
+    }
+
+    #[test]
+    fn the_banner_asks_about_the_first_folder_with_deletions_held_and_counts_the_rest() {
+        let none = std::collections::HashMap::new();
+        let mut snap = state_of(vec![pair(Phase::Synced)]);
+        assert!(held_to_show(&snap, &none).is_none());
+
+        snap.pairs.push(held_pair("photos", held(0, 50, 100, 7)));
+        let (name, h, others) = held_to_show(&snap, &none).expect("one is held");
+        assert_eq!((name, h.local, others), ("photos", 50, 0));
+
+        snap.pairs.push(held_pair("music", held(300, 0, 400, 8)));
+        let (name, _, others) = held_to_show(&snap, &none).unwrap();
+        assert_eq!(
+            (name, others),
+            ("photos", 1),
+            "the first, and one more waiting"
+        );
+    }
+
+    #[test]
+    fn what_the_user_already_answered_is_not_asked_again_until_it_comes_back() {
+        let snap = state_of(vec![
+            held_pair("photos", held(0, 50, 100, 1_000)),
+            held_pair("music", held(300, 0, 400, 1_000)),
+        ]);
+        let mut acted = std::collections::HashMap::new();
+
+        // "Restore them" for photos at t=1000, and the hold on it still dated 1000:
+        // that is the state before the answer. The next folder is asked about.
+        acted.insert("photos".to_string(), 1_000);
+        let (name, _, others) = held_to_show(&snap, &acted).unwrap();
+        assert_eq!((name, others), ("music", 0));
+
+        // Answered for both: nothing to ask.
+        acted.insert("music".to_string(), 1_005);
+        assert!(held_to_show(&snap, &acted).is_none());
+
+        // The guard reports photos again after the answer (the answer did not
+        // settle it): it is asked about again, and music still is not.
+        let snap = state_of(vec![
+            held_pair("photos", held(0, 50, 100, 1_030)),
+            held_pair("music", held(300, 0, 400, 1_000)),
+        ]);
+        let (name, _, others) = held_to_show(&snap, &acted).unwrap();
+        assert_eq!((name, others), ("photos", 0));
+    }
+
+    #[test]
+    fn the_banner_says_how_much_where_from_and_that_nothing_was_deleted() {
+        let (title, sub) = held_banner_text("docs", &held(300, 0, 400, 1), 0);
+        assert_eq!(title, "300 deletions held back");
+        for part in [
+            "In docs",
+            "75%",
+            "400 files",
+            "from Proton Drive",
+            "nothing was deleted",
+        ] {
+            assert!(sub.contains(part), "{part:?} missing from: {sub}");
+        }
+        assert!(!sub.contains("also waiting"), "{sub}");
+
+        let (title, sub) = held_banner_text("docs", &held(0, 1, 5, 1), 0);
+        assert_eq!(title, "1 deletion held back");
+        assert!(sub.contains("from this computer"), "{sub}");
+        assert!(sub.contains("20%"), "{sub}");
+
+        let (_, sub) = held_banner_text("docs", &held(60, 40, 200, 1), 2);
+        assert!(sub.contains("from Proton Drive and this computer"), "{sub}");
+        assert!(sub.ends_with("2 other folders also waiting."), "{sub}");
+        let (_, sub) = held_banner_text("docs", &held(60, 40, 200, 1), 1);
+        assert!(sub.ends_with("1 other folder also waiting."), "{sub}");
+    }
+
+    #[test]
+    fn the_question_says_where_the_deleted_files_go() {
+        let (title, body) = held_delete_question("docs", &held(300, 0, 400, 1), LocalDelete::Trash);
+        assert_eq!(title, "Delete 300 files?");
+        assert!(body.contains("300 files in docs"), "{body}");
+        assert!(body.contains("Proton Drive's trash"), "{body}");
+        assert!(body.contains("restore"), "{body}");
+        assert!(!body.contains("this computer"), "{body}");
+        assert!(body.contains("choose Restore them instead"), "{body}");
+
+        // The local side: the desktop trash, unless the user asked for permanent.
+        let (title, body) = held_delete_question("docs", &held(0, 1, 5, 1), LocalDelete::Trash);
+        assert_eq!(title, "Delete 1 file?");
+        assert!(
+            body.contains("1 file on this computer will be moved to your trash"),
+            "{body}"
+        );
+        let (_, body) = held_delete_question("docs", &held(0, 40, 90, 1), LocalDelete::Remove);
+        assert!(
+            body.contains("40 files on this computer will be deleted for good"),
+            "{body}"
+        );
+        assert!(!body.contains("trash"), "{body}");
+
+        // Both sides: both sentences, and the total in the title.
+        let (title, body) = held_delete_question("docs", &held(60, 40, 200, 1), LocalDelete::Trash);
+        assert_eq!(title, "Delete 100 files?");
+        assert!(
+            body.contains("60 files in docs") && body.contains("40 files on this computer"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_folder_card_shows_held_deletions_as_a_wait_not_a_failure() {
+        let p = held_pair("docs", held(300, 0, 400, 1));
+        let (tone, text) = pair_status_text(Some(&p), false, NOW);
+        assert_eq!(tone, Tone::Warn);
+        assert_eq!(text, "300 deletions held back · see Activity");
+
+        // While a run is under way the card says so; the hold comes back after.
+        let mut busy = p.clone();
+        busy.phase = Phase::Scanning;
+        assert_eq!(pair_status_text(Some(&busy), false, NOW).0, Tone::Accent);
+
+        // An ordinary failure is still one.
+        let mut failed = pair(Phase::Error);
+        failed.last_error = Some("boom".into());
+        assert_eq!(
+            pair_status_text(Some(&failed), false, NOW),
+            (Tone::Danger, "boom".to_string())
+        );
     }
 
     #[test]
@@ -4741,10 +5081,16 @@ impl NoticeFeed {
     }
 
     /// What to announce right now (usually nothing). Cheap to call every tick.
+    /// `held` is every folder pair whose deletions the guard is holding back,
+    /// and `only_held` whether those are the only problems (see
+    /// [`Controller::held_summary`]): they are announced on their own, so the
+    /// generic sync-problem notice stays quiet about them.
     fn poll(
         &mut self,
         status: OverallStatus,
         line: &str,
+        held: &[(String, neutronsync::service::HeldDeletes)],
+        only_held: bool,
     ) -> Vec<neutronsync::notify::Notification> {
         if self.polled_at.elapsed() < std::time::Duration::from_secs(1) {
             return Vec::new();
@@ -4758,7 +5104,11 @@ impl NoticeFeed {
         if let Some(last) = new.last() {
             self.last_conflict_id = last.id;
         }
-        self.notifier.tick(now_secs(), status, line, new)
+        let now = now_secs();
+        let mut out = self.notifier.held(now, held);
+        let status = neutronsync::notify::without_held(status, only_held);
+        out.extend(self.notifier.tick(now, status, line, new));
+        out
     }
 }
 
@@ -5118,9 +5468,10 @@ fn run_daemon() -> i32 {
         // status line follows too, but it changes with every file during a big
         // sync, so text-only changes are throttled to once a second.
         let (status, line) = ctrl_cb.status_summary();
+        let (held, only_held) = ctrl_cb.held_summary();
         // Desktop notifications. Polled even when switched off, so turning them
         // on later doesn't replay whatever piled up meanwhile.
-        for note in feed.poll(status, &line) {
+        for note in feed.poll(status, &line, &held, only_held) {
             if notify_on {
                 neutronsync::notify::send_async(note);
             }

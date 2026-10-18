@@ -413,6 +413,7 @@ mod tests {
                     last_synced: Some(1),
                     tracked: 0,
                     retrying: 0,
+                    held: None,
                 })
                 .collect(),
             ..Default::default()
